@@ -3,3 +3,4 @@ rosezm-server
 rosezm-server-go
 rosezm-server-go.exe
 node_modules/
+blog.db
