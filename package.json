@@ -1,6 +1,6 @@
 {
   "name": "rosezm",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Modular extensible full-stack framework for web and embedded applications, crafted with extreme romance and polished developer experience.",
   "type": "module",
   "scripts": {
@@ -18,7 +18,8 @@
   "exports": {
     "./edge": "./dist-cli/edge.mjs",
     "./runtime": "./dist-cli/runtime.mjs",
-    "./compiler": "./dist-cli/compiler.mjs"
+    "./compiler": "./dist-cli/compiler.mjs",
+    "./test": "./dist-cli/test.mjs"
   },
   "files": [
     "dist-cli",
