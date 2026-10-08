@@ -1,0 +1,15 @@
+{
+  "name": "rosezm-blog-pg",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "rosezm dev",
+    "build": "rosezm build",
+    "preview": "rosezm preview",
+    "serve": "rosezm serve"
+  },
+  "dependencies": {
+    "pg": "^8.13.0",
+    "rosezm": "file:../.."
+  }
+}
