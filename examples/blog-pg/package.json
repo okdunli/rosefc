@@ -1,0 +1,15 @@
+{
+  "name": "rosefd-blog-pg",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "rosefd dev",
+    "build": "rosefd build",
+    "preview": "rosefd preview",
+    "serve": "rosefd serve"
+  },
+  "dependencies": {
+    "pg": "^8.13.0",
+    "rosefd": "file:../.."
+  }
+}
