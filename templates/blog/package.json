@@ -9,6 +9,6 @@
     "serve": "rosezm serve"
   },
   "dependencies": {
-    "rosezm": "file:../.."
+    "rosezm": "latest"
   }
 }
