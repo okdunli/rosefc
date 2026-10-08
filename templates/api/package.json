@@ -1,0 +1,14 @@
+{
+  "name": "rosezm-api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "rosezm dev",
+    "build": "rosezm build",
+    "preview": "rosezm preview",
+    "serve": "rosezm serve"
+  },
+  "dependencies": {
+    "rosezm": "latest"
+  }
+}
