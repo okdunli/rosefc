@@ -50,7 +50,13 @@ async function stopChild(p) {
   ]);
   if (p.exitCode !== null) return;
   p.kill('SIGKILL');
-  await new Promise((resolve) => p.once('close', resolve));
+  // Bound this wait too: on Windows the first kill can lose the race with
+  // 'close' (already emitted, or a pipe held by a grandchild), and an
+  // unbounded wait ended the suite on an unsettled top-level await.
+  await Promise.race([
+    new Promise((resolve) => p.once('close', resolve)),
+    new Promise((resolve) => setTimeout(resolve, 2000)),
+  ]);
 }
 
 async function rmTreeStable(dir) {

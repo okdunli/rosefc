@@ -31,3 +31,5 @@ tmp/
 .vfy/
 # captured sessions / local credentials
 cookies.txt
+.rosezm-build/
+.rosezm-dev/
