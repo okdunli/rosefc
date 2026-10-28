@@ -60,6 +60,33 @@
     "LICENSE"
   ],
   "license": "MIT",
+  "author": {
+    "name": "okdunli",
+    "url": "https://github.com/okdunli"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/okdunli/rosezm.git"
+  },
+  "homepage": "https://github.com/okdunli/rosezm#readme",
+  "bugs": {
+    "url": "https://github.com/okdunli/rosezm/issues"
+  },
+  "keywords": [
+    "framework",
+    "ssr",
+    "zero-hydration",
+    "compile-time-reactivity",
+    "fullstack",
+    "miniprogram",
+    "flutter",
+    "android",
+    "arkts",
+    "swiftui",
+    "electron",
+    "edge",
+    "esm"
+  ],
   "engines": {
     "node": ">=22"
   },
@@ -72,5 +99,9 @@
     "pg": "^8.23.0",
     "tsx": "^4.7.0",
     "typescript": "^5.6.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   }
 }
