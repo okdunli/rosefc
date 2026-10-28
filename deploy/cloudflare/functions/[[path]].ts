@@ -38,9 +38,6 @@
 import { createEdgeHandler } from '../src/cli/edge.ts';
 import * as server from '../dist/server.js';
 
-// Built on the first request this isolate serves, then cached: one cold
-// start, three internal asset fetches, and every later request is the
-// same single-request page.
 let handle: ((request: Request) => Promise<Response>) | null = null;
 
 export const onRequest = async (context: { request: Request }): Promise<Response> => {

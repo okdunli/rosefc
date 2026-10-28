@@ -26,9 +26,6 @@
 import { createEdgeHandler } from '../../src/cli/edge.ts';
 import { fileURLToPath } from 'node:url';
 
-// dist/ two levels up from netlify/functions/, whatever the working
-// directory is. Built on the first request (a cold start reads the files
-// once per isolate) and cached for the isolate's lifetime.
 let handle: ((request: Request) => Promise<Response>) | null = null;
 
 export default async function rosezm(request: Request): Promise<Response> {

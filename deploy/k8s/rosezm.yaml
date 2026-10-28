@@ -1,4 +1,4 @@
-# The hybrid deploy on Kubernetes (consultant P0 §3 方案B) - the same split
+# The hybrid deploy on Kubernetes - the same split
 # `docker-compose.yml` runs, as manifests:
 #
 #   static  -> the immutable half: the Go single binary serves prerendered

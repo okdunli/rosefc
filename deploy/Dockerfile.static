@@ -1,4 +1,4 @@
-# The static half of the hybrid deploy (innovation #34, consultant P0 §3 方案B).
+# The static half of the hybrid deploy.
 #
 # Build the site with Node, embed it into ONE Go binary, ship an image with
 # no runtime to install and nothing to configure:
