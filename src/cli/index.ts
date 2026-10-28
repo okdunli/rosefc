@@ -2126,11 +2126,12 @@ async function check(): Promise<void> {
   }
 
   let tsMod: typeof ts | null = null;
-  // Two roots, in order: the framework's own installation (a dev checkout has
-  // typescript next to the compiler), then the project's. A project without
-  // typescript must not silently resolve some unrelated global copy whose
-  // entry file lacks the compiler API - the shape check below rejects those.
-  for (const root of [import.meta.url, pathToFileURL(path.join(SRC_DIR, 'package.json')).href]) {
+  // Resolve from the project root only. `rosezm check` must fail loudly when
+  // the checked project has no local TypeScript, instead of borrowing one from
+  // the framework installation - a project that never installed typescript
+  // would silently get the framework's copy, and its scripts would be checked
+  // against a compiler the project does not know about.
+  for (const root of [pathToFileURL(path.join(SRC_DIR, 'package.json')).href]) {
     try {
       const req = createRequire(root);
       const mod = await import(pathToFileURL(req.resolve('typescript')).href) as typeof ts & { default?: typeof ts };

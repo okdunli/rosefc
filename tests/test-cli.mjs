@@ -173,10 +173,16 @@ assert(fs.existsSync(path.join(npmApp, 'rosezm-env.d.ts')), 'the npm-shaped scaf
 // Every shipped template must type-check: `rosezm new --template blog` used to
 // hand users a project that failed its own `rosezm check` (a state getter
 // called with an argument, an untyped context bag, a dangling import).
+// `check` resolves TypeScript from the PROJECT only - it never borrows the
+// framework's copy - so the fixture needs one. Linking the repo's own
+// typescript keeps the suite offline and instant.
+const tsPkgDir = path.join(REPO, 'node_modules', 'typescript');
 for (const t of ['blog', 'api', 'admin', 'site']) {
   const dir = path.join(tmp, `tpl-${t}`);
   const made = await run(['new', dir, '--template', t], REPO);
   assert(made.code === 0, `rosezm new --template ${t} exits 0 (stderr: ${made.err.slice(0, 200)})`);
+  fs.mkdirSync(path.join(dir, 'node_modules'), { recursive: true });
+  fs.symlinkSync(tsPkgDir, path.join(dir, 'node_modules', 'typescript'), 'junction');
   const checked = await run(['check', dir], REPO);
   assert(checked.code === 0, `the ${t} template type-checks (stderr: ${checked.err.slice(0, 300)})`);
   const tplPkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));

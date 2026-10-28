@@ -32,3 +32,10 @@ jobs:
         run: npm test
         env:
           SAFE_DELETE_ENABLED: "0"
+
+      - name: Universal export tests (0.2.0)
+        # Exports the demo to a mini-program project and EXECUTES the generated
+        # page JS in a sandbox; no platform SDK is needed.
+        run: npx tsx tests/test-export.ts
+        env:
+          SAFE_DELETE_ENABLED: "0"
