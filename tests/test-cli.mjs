@@ -2525,7 +2525,21 @@ export default [{
   const panelHtml = fs.readFileSync(path.join(dt, 'panel.html'), 'utf8');
   assert(panelHtml.includes('panel.js') && /Signal graph/.test(panelHtml) && /Prefetch/.test(panelHtml), 'the panel page mounts the script and names both sections');
   const pkgFiles = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8')).files;
-  assert(pkgFiles.includes('devtools') || pkgFiles.some((f) => f.startsWith('devtools/')), 'the npm package ships the extension (files)');
+  // The extension is a Chrome devtools panel, not a runtime dependency: it is
+  // a release asset, and shipping it inside every npm install would put a
+  // browser extension in everyone's node_modules for no reason.
+  assert(!pkgFiles.includes('devtools') && !pkgFiles.some((f) => f.startsWith('devtools/')), 'the npm package does not ship the browser extension');
+  // The templates are not shipped either: a user fetches them (git clone or
+  // the release download) and passes the path - `rosezm new x --template
+  // ./path` accepts any directory.
+  assert(!pkgFiles.includes('templates') && !pkgFiles.some((f) => f.startsWith('templates/')), 'the npm package does not ship the templates');
+  // What it DOES ship: the bundles, and exactly the src files the runtime
+  // reads (the compiler copies content.ts / prod-server.ts into the build
+  // dir and feeds src/runtime/index.ts to esbuild).
+  assert(pkgFiles.includes('dist-cli'), 'the npm package ships the built bundles');
+  for (const rel of ['src/FRAMEWORK_VERSION', 'src/types/rosezm.d.ts', 'src/cli/content.ts', 'src/cli/prod-server.ts', 'src/runtime/index.ts']) {
+    assert(pkgFiles.includes(rel), `the npm package ships ${rel} (the runtime reads it)`);
+  }
 }
 
 {

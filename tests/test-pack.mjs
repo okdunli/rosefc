@@ -63,10 +63,17 @@ assert(has('deploy/api/rosezm.ts') && has('deploy/vercel.json'), 'the tarball sh
 assert(has('deploy/netlify.toml') && has('deploy/netlify/functions/rosezm.ts'), 'the tarball ships the Netlify template');
 assert(has('deploy/cloudflare/wrangler.toml') && has('deploy/cloudflare/functions/[[path]].ts'), 'the tarball ships the Cloudflare Pages template');
 assert(has('LICENSE'), 'the tarball ships the license');
-for (const t of ['blog', 'api', 'admin', 'site']) {
-  assert(has(`templates/${t}/package.json`), `the tarball ships the ${t} template`);
+// The templates and the browser extension are NOT in the tarball: a user
+// fetches the templates (git clone or the release download) and passes the
+// path - `rosezm new x --template ./path` accepts any directory - and the
+// extension is a release asset, not a runtime dependency.
+assert(!packed.some((p) => p.startsWith('templates/')), 'the tarball ships no templates (the user passes a path)');
+assert(!packed.some((p) => p.startsWith('devtools/')), 'the tarball ships no browser extension');
+assert(!packed.some((p) => p.startsWith('src/compiler/') || p.startsWith('src/export/')), 'the tarball ships no compiler or exporter source (the bundles carry it)');
+// ...but it does ship exactly the src files the runtime reads.
+for (const rel of ['src/types/rosezm.d.ts', 'src/cli/content.ts', 'src/cli/prod-server.ts', 'src/runtime/lorawan.ts', 'src/hash.ts']) {
+  assert(has(rel), `the tarball ships ${rel} (the runtime reads it)`);
 }
-assert(has('devtools/manifest.json') && has('devtools/devtools.html') && has('devtools/devtools.js') && has('devtools/panel.html') && has('devtools/panel.js'), 'the tarball ships the devtools extension');
 const packedManifest = JSON.parse(fs.readFileSync(path.join(REPO, 'devtools', 'manifest.json'), 'utf8'));
 assert(packedManifest.devtools_page === 'devtools.html' && packedManifest.manifest_version === 3, 'the devtools manifest is a valid MV3 entry');
 assert(!packed.some((p) => p.startsWith('dist/') || p.startsWith('node_modules/') || p.startsWith('example/')), 'the tarball ships no demo, no build output, no deps');
