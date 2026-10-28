@@ -257,6 +257,14 @@ await bindMounted.click('input[value="pro"]');
 assert(bindMounted.text('#app').includes('Plan: pro'), 'bind:group (radio) holds the selected value');
 await bindMounted.click('input[value="red"]');
 assert(bindMounted.text('#app').includes('Colors: red'), 'bind:group (checkbox) accumulates an ARRAY of the checked values');
+// R120: the same three edits through a COMPONENT's own inputs - the value
+// rides in through the prop, the edit rides out through on<Prop>Change.
+bindMounted.fill('.bind-demo input[placeholder="through the component"]', 'Grace');
+assert(bindMounted.text('#app').includes('Hello Grace'), 'a component input rendering value={prop} reports its edit back to the parent state');
+await bindMounted.click('.check-field input.cf-on');
+assert(bindMounted.text('#app').includes('Not subscribed'), 'bind:checked through a component prop flips the parent state back');
+await bindMounted.click('.check-field input.cf-blue');
+assert(bindMounted.text('#app').includes('Colors: red, blue'), 'bind:group through a component prop merges into the parent array (red survives)');
 bindMounted.key('.key-probe', 'a');
 assert(bindMounted.text('#app').includes('Last key: a'), 'keydown is not one of the delegated four - wire() binds it directly on the input');
 bindMounted.key('.win-probe', 'Escape', 'keyup');

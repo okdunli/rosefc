@@ -8,7 +8,7 @@
  */
 
 import { JSDOM } from 'jsdom';
-import { readFileSync, readdirSync, existsSync, mkdtempSync, mkdirSync, cpSync, rmSync } from 'fs';
+import { readFileSync, readdirSync, existsSync, mkdtempSync, mkdirSync, cpSync, rmSync, writeFileSync } from 'fs';
 import { createHash } from 'crypto';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -543,8 +543,8 @@ assert(likesOf() === afterClick + 1, 'the server store advanced exactly once per
 // file is absent). Each document carries its own chain's rules, pre-scoped.
 const homeStyles = home.head.join('');
 const aboutStyles = (await renderPage('/about')).head.join('');
-assert(homeStyles.includes('[data-rosezm-c="index"] .rcard{'), "index's card rule is scoped to its component in the route head", homeStyles);
-assert(aboutStyles.includes('[data-rosezm-c="about"] .rcard{'), "about's card rule is scoped to its component in the route head", aboutStyles);
+assert(homeStyles.includes('[data-rosezm-c="index"] .rcard'), "index's card rule is scoped to its component in the route head", homeStyles);
+assert(aboutStyles.includes('[data-rosezm-c="about"] .rcard'), "about's card rule is scoped to its component in the route head", aboutStyles);
 const stripped = (homeStyles + aboutStyles).replace(/\[data-rosezm-c="[^"]+"\]\s*\.rcard/g, '');
 assert(!/\.rcard\s*\{/.test(stripped), 'no unscoped .rcard rule survives scoping');
 assert(!existsSync('dist/styles.css'), 'no styles.css is emitted when no component carries CSS');
@@ -1405,6 +1405,23 @@ assert(shell.status === 200 && shell.html.includes('Please sign in'), 'without a
   (boxes[0] as any).dispatchEvent(new (dom.window as any).Event('change', { bubbles: true }));
   await tick();
   assert(appEl.textContent!.includes('Colors: green'), 'F1: uncheck filters the array');
+  // R120: component two-way props - the same three edits through the
+  // component's own inputs, reporting out through on<Prop>Change.
+  const cfVal = appEl.querySelector('.bind-demo input[placeholder="through the component"]')! as any;
+  cfVal.value = 'Grace';
+  cfVal.dispatchEvent(new (dom.window as any).Event('input', { bubbles: true }));
+  await tick();
+  assert(appEl.textContent!.includes('Hello Grace!'), 'R120: a component input rendering value={prop} reports its edit back');
+  const cfOn = appEl.querySelector('.check-field input.cf-on')! as any;
+  cfOn.checked = false;
+  cfOn.dispatchEvent(new (dom.window as any).Event('change', { bubbles: true }));
+  await tick();
+  assert(appEl.textContent!.includes('Not subscribed'), 'R120: bind:checked through a component prop flips the parent state');
+  const cfRed = appEl.querySelector('.check-field input.cf-red')! as any;
+  cfRed.checked = true;
+  cfRed.dispatchEvent(new (dom.window as any).Event('change', { bubbles: true }));
+  await tick();
+  assert(appEl.textContent!.includes('Colors: green, red'), 'R120: bind:group through a component prop merges into the parent array (green survives)');
 }
 
 {
@@ -1663,6 +1680,58 @@ assert(shell.status === 200 && shell.html.includes('Please sign in'), 'without a
     'without a context store, overlapping renders serialise (the shared mutex orders them)', order.join(','));
   assert(aSawOwnSignal, 'a render still sees its own signal after its await (the other render cannot swap the table out from under it)');
   assert(!bSawAsSignal, 'a render cannot see the previous render\'s isolated signals');
+}
+
+// ---- each reuse: a bare data-on state attribute must not forbid node reuse ----
+// An app list like DodoVim's layer view bakes the selected-row flag into each
+// item, so a selection change re-renders the whole {#each}. Rows whose html is
+// unchanged must keep their DOM nodes; forbidding bare `data-on` (an ordinary
+// state attribute with no closure attached) rebuilt every row on every click.
+{
+  const reuseRoot = join(tmpdir(), 'rosezm-reuse-src');
+  rmSync(reuseRoot, { recursive: true, force: true });
+  mkdirSync(join(reuseRoot, 'src', 'pages'), { recursive: true });
+  writeFileSync(join(reuseRoot, 'src', 'pages', 'index.rose'), `<script>
+const base = [{ id: 1 }, { id: 2 }, { id: 3 }];
+let sel = $state(0);
+function view() { return base.map((r) => ({ ...r, on: r.id === sel() ? '1' : '0' })); }
+function pick2(): void { $setState('sel', 2); }
+</script>
+
+{#each view() as row (row.id)}
+  <div class="lyr" data-on={row.on}>{row.id}</div>
+{/each}
+<button type="button" on:click={pick2}>pick 2</button>
+`);
+  const { buildProject } = await import('../src/compiler/index.js');
+  const reuseOut = join(tmpdir(), 'rosezm-reuse-dist');
+  rmSync(reuseOut, { recursive: true, force: true });
+  await buildProject(reuseRoot, reuseOut);
+  const reuseServer = await import(pathToFileURL(join(reuseOut, 'server.js')).href);
+  const reuseHome = await reuseServer.renderPage('/');
+  document.getElementById('__rosezm_state')?.remove();
+  const reuseState = document.createElement('script');
+  reuseState.id = '__rosezm_state';
+  reuseState.textContent = reuseHome.state;
+  document.body.appendChild(reuseState);
+  appEl.innerHTML = reuseHome.html;
+  const reuseClient = await import(pathToFileURL(join(reuseOut, 'client.js')).href);
+  await reuseClient.start(appEl, '/', true);
+  const lyrEls = [...appEl.querySelectorAll('.lyr')];
+  assert(lyrEls.length === 3, 'each list rendered');
+  const row1Before = lyrEls[0];
+  const row3Before = lyrEls[2];
+  (appEl.querySelector('[data-on-click="pick2"]')! as any).click();
+  await tick();
+  const after = [...appEl.querySelectorAll('.lyr')];
+  assert(after.length === 3, 'list still has 3 rows after the selection change');
+  assert(after[0] === row1Before, 'a data-on row whose html is unchanged keeps its node (reused, not rebuilt)');
+  assert(after[2] === row3Before, 'the last data-on row is reused too');
+  assert(after[1] !== lyrEls[1], 'the row whose data-on flipped is rebuilt (its html carries the value)');
+  assert(after[1].getAttribute('data-on') === '1', 'the selected row shows its new state');
+  assert(after[0].getAttribute('data-on') === '0', 'the untouched row keeps its old state');
+  rmSync(reuseRoot, { recursive: true, force: true });
+  rmSync(reuseOut, { recursive: true, force: true });
 }
 
 console.log(`\nAll client pipeline checks passed - ${checks} assertions.`);

@@ -5,7 +5,14 @@
  * zero-hydration adoption, fine-grained patching, {#if}/{#each}, and
  * client-side navigation - all without a page reload.
  *
- * Prereq: a server running (npm run dev, or npm run build && npm run preview).
+ * Prereq: a server running (npm run dev, or npm run build && npm run preview,
+ * or `rosezm serve`). The canonical count needs `rosezm serve`: it publishes an
+ * ETag on `/`, so the suite's one environment-guarded assertion
+ * (`if (streamedEtag)` - "a streamable route honours a validator it did
+ * publish") runs and the total is 335. Against preview it passes at 334 -
+ * preview answers `/` with no ETag under either encoding, so that guard skips.
+ * Never point it at the Go binary: mode A's SPA fallback answers unmatched
+ * paths with 200 and POSTs 405 without UPSTREAM.
  * Run: npx tsx tests/test-e2e.ts
  *
  * rosezm_E2E_BASE overrides the target, so the suite can run beside another
@@ -107,6 +114,13 @@ const assert = (cond: boolean, msg: string) => {
 const app = document.getElementById('app')!;
 assert(!!app, 'app container present');
 assert(app.textContent!.includes('Welcome to rosezm'), 'SSR content rendered by the real server');
+// R185: the dev bridge opens an EventSource. A browser always has the API, but a
+// non-browser embed (this jsdom suite, an older webview) does not - and an
+// unguarded `new EventSource` throws a ReferenceError that took the whole inline
+// bundle down, so the page that HAD rendered appeared empty. The runtime's own
+// store channel guards it; the bridge now does too. The guard is matched in either spelling - the shipped bundle is
+// minified (`typeof EventSource<"u"`) and the dev bridge is not.
+assert(/typeof EventSource\s*(?:===|==|<)/.test(html), 'the dev bridge guards EventSource before constructing it');
 assert(!app.textContent!.includes('\u27e6'), 'markers resolved after in-page boot');
 assert(document.querySelector('header')!.textContent!.includes('rosezm'), 'layout header rendered');
 
@@ -596,7 +610,12 @@ try {
 const apiGet = await fetch(BASE + '/api/hello');
 assert(apiGet.status === 200, 'GET /api/hello -> 200');
 assert((apiGet.headers.get('content-type') || '').includes('application/json'), 'the api response is application/json');
-assert(!apiGet.headers.get('etag'), 'the api path runs the handler, not the baked static file');
+// R197: the validator layer left the HTML lane, so a JSON API answers with a
+// content-derived weak tag - the handler's own bytes, never the baked file's
+// size/mtime pair. What this assertion actually pins is that the LIVE handler
+// answered: a static-file exit would publish the file's own validator, and the
+// body below proves the same.
+assert(/^W\/"-/.test(apiGet.headers.get('etag') ?? ''), 'the api path runs the handler and publishes a content-derived validator');
 const apiJson = await apiGet.json();
 assert(apiJson.hello === 'rosezm', 'the api GET body is the handler object');
 const apiPost = await fetch(BASE + '/api/hello', {
@@ -941,6 +960,26 @@ await tick();
   assert(buffered.status === 200, 'GET /buffered -> 200');
   assert(bufferedHtml.includes('data-hooked="1"'), 'P0-2: a buffer = true route goes through the buffered path, where onResponse CAN rewrite the body');
   assert(bufferedHtml.includes('buffered body'), 'the buffered route renders its content');
+}
+
+{
+  // 0.2.0: the native data channel - the JSON half of a render. A mini program
+  // (or any native client) cannot execute the route's render, so it asks the
+  // server for the state that render would have produced - including a zero-JS
+  // route's $data, which its document deliberately does not carry.
+  const data = await fetch(BASE + '/__rosezm/data?path=' + encodeURIComponent('/blog/1'));
+  assert(data.status === 200 && String(data.headers.get('content-type')).startsWith('application/json'), 'the data channel answers JSON');
+  assert(data.headers.get('access-control-allow-origin') === '*', 'the data channel is readable cross-origin (a native client has no same-origin)');
+  const payload = await data.json() as { path: string; status: number; state: Record<string, unknown> };
+  assert(payload.path === '/blog/1' && payload.state && typeof payload.state === 'object', 'the channel echoes the path and returns the state object');
+  assert(JSON.stringify(payload.state).includes('"post"'), 'the zero-JS route state carries the $data value a native client cannot compute');
+  const home = await (await fetch(BASE + '/__rosezm/data?path=/')).json() as { state: Record<string, unknown> };
+  assert(home.state.count === 0 && Array.isArray(home.state.links), 'an interactive route answers its full state (layout state included)');
+  const walled = await fetch(BASE + '/__rosezm/data?path=/vault', { redirect: 'manual' });
+  assert(walled.status === 302, 'a gated page answers its gate through the data channel too (no leak)');
+  const missing = await fetch(BASE + '/__rosezm/data?path=/definitely-not-a-route');
+  const missPayload = await missing.json() as { status: number };
+  assert(missing.status === 200 && missPayload.status === 404, 'an unknown path answers a JSON 404 envelope, never the HTML shell');
 }
 
 console.log(`\nAll end-to-end checks passed - one request, zero hydration, fine-grained DOM - ${checks} assertions.`);

@@ -12,6 +12,7 @@
 import { readFileSync, statSync } from 'fs';
 import { join } from 'path';
 import { gzipSync, gunzipSync, brotliCompressSync, brotliDecompressSync } from 'zlib';
+import { withResetRetry } from './reset-retry.ts';
 
 const ROOT = join(process.cwd(), 'dist');
 const START = Date.now();
@@ -136,7 +137,7 @@ const dynProc = spawn(process.execPath, ['node_modules/tsx/dist/cli.mjs', 'src/c
   stdio: 'ignore',
 });
 const dynAgent = new Agent({ keepAlive: true, maxSockets: 1 });
-const dynGet = (pathname: string) =>
+const dynGet = (pathname: string) => withResetRetry(() =>
   new Promise<{ ttfb: number; bytes: number; body: Buffer; enc: string | undefined }>((resolve, reject) => {
     const t0 = performance.now();
     const req = request(
@@ -147,11 +148,12 @@ const dynGet = (pathname: string) =>
         const chunks: Buffer[] = [];
         res.on('data', (c: Buffer) => { if (!first) first = performance.now() - t0; bytes += c.length; chunks.push(c); });
         res.on('end', () => resolve({ ttfb: first, bytes, body: Buffer.concat(chunks), enc: res.headers['content-encoding'] as string | undefined }));
+        res.on('error', reject);
       }
     );
     req.on('error', reject);
     req.end();
-  });
+  }));
 const dynDecode = (body: Buffer, enc: string | undefined) =>
   (enc === 'br' ? brotliDecompressSync(body) : enc === 'gzip' ? gunzipSync(body) : body).toString('utf-8');
 const dynTtfb = async (pathname: string, n = 200) => {
@@ -213,7 +215,7 @@ const goProc = spawn(join(process.cwd(), goBin), [], {
 });
 const goBase = `http://localhost:${GO_PORT}`;
 const goAgent = new Agent({ keepAlive: true, maxSockets: 8 });
-const wireGet = (pathname: string) =>
+const wireGet = (pathname: string) => withResetRetry(() =>
   new Promise<number>((resolve, reject) => {
     const req = request(
       { host: 'localhost', port: GO_PORT, path: pathname, agent: goAgent, headers: { 'accept-encoding': 'br, gzip' } },
@@ -221,11 +223,12 @@ const wireGet = (pathname: string) =>
         let bytes = 0;
         res.on('data', (c: Buffer) => { bytes += c.length; });
         res.on('end', () => resolve(bytes));
+        res.on('error', reject);
       }
     );
     req.on('error', reject);
     req.end();
-  });
+  }));
 try {
   let up = false;
   for (let i = 0; i < 100 && !up; i++) {
@@ -404,7 +407,7 @@ try {
     stdio: 'ignore',
   });
   const scaleAgent = new Agent({ keepAlive: true, maxSockets: 1 });
-  const scaleGet = (pathname: string) =>
+  const scaleGet = (pathname: string) => withResetRetry(() =>
     new Promise<{ ttfb: number; bytes: number; body: Buffer; enc: string | undefined }>((resolve, reject) => {
       const t0 = performance.now();
       const req = request(
@@ -415,11 +418,12 @@ try {
           const chunks: Buffer[] = [];
           res.on('data', (c: Buffer) => { if (!first) first = performance.now() - t0; bytes += c.length; chunks.push(c); });
           res.on('end', () => resolve({ ttfb: first, bytes, body: Buffer.concat(chunks), enc: res.headers['content-encoding'] as string | undefined }));
+          res.on('error', reject);
         }
       );
       req.on('error', reject);
       req.end();
-    });
+    }));
   try {
     let up = false;
     for (let i = 0; i < 100 && !up; i++) {

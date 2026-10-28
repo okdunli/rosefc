@@ -1,4 +1,4 @@
-﻿/**
+/**
  * test-cli.mjs - the CLI builds ANY project
  *
  * The gate that makes rosezm a framework instead of a demo: `rosezm
@@ -41,21 +41,26 @@ function run(args, cwd) {
   });
 }
 
+/** True when the child is gone: a clean exit (exitCode) or a signal death.
+ *  On Windows a kill() terminates the process outright, so a spawned server
+ *  dies with signalCode set and exitCode null - checking only exitCode made
+ *  this wait for a second 'close' that can never arrive. */
+function childDone(p) {
+  return p.exitCode !== null || p.signalCode !== null;
+}
+
 async function stopChild(p) {
-  if (!p || p.exitCode !== null) return;
+  if (!p || childDone(p)) return;
   p.kill();
   await Promise.race([
     new Promise((resolve) => p.once('close', resolve)),
     new Promise((resolve) => setTimeout(resolve, 1500)),
   ]);
-  if (p.exitCode !== null) return;
+  if (childDone(p)) return;
   p.kill('SIGKILL');
-  // Bound this wait too: on Windows the first kill can lose the race with
-  // 'close' (already emitted, or a pipe held by a grandchild), and an
-  // unbounded wait ended the suite on an unsettled top-level await.
   await Promise.race([
     new Promise((resolve) => p.once('close', resolve)),
-    new Promise((resolve) => setTimeout(resolve, 2000)),
+    new Promise((resolve) => setTimeout(resolve, 1500)),
   ]);
 }
 
@@ -149,6 +154,35 @@ assert((tsconfig.include ?? []).includes('rosezm-env.d.ts'), 'the tsconfig inclu
 const scaffoldPkg = JSON.parse(fs.readFileSync(path.join(scaffoldDir, 'package.json'), 'utf8'));
 assert(scaffoldPkg.scripts.check === 'rosezm check', 'the scaffold has a check script');
 assert(scaffoldPkg.devDependencies?.typescript, 'the scaffold depends on typescript (check needs the project\'s own copy)');
+
+// An installed package keeps its templates under node_modules/, so the copy
+// filter must judge the path RELATIVE to the template root. A filter on the
+// absolute path rejects the root itself, nothing is copied, and `rosezm new
+// --template` dies with ENOENT on the first written file - every npm install
+// was broken while the repo's own templates (no node_modules segment) worked.
+const npmTpl = path.join(tmp, 'node_modules', 'rosezm', 'templates', 'blog');
+fs.mkdirSync(path.join(npmTpl, 'src', 'pages'), { recursive: true });
+fs.writeFileSync(path.join(npmTpl, 'package.json'), JSON.stringify({ name: 'blog', dependencies: { rosezm: '^0.0.0' } }));
+fs.writeFileSync(path.join(npmTpl, 'src', 'pages', 'index.rose'), '<h1>npm template</h1>\n');
+const npmApp = path.join(tmp, 'npm-app');
+const npmScaffold = await run(['new', npmApp, '--template', npmTpl], REPO);
+assert(npmScaffold.code === 0, `rosezm new --template copies a template under node_modules (stderr: ${npmScaffold.err.slice(0, 200)})`);
+assert(fs.existsSync(path.join(npmApp, 'src', 'pages', 'index.rose')), 'the npm-shaped template lands in the new project');
+assert(fs.existsSync(path.join(npmApp, 'rosezm-env.d.ts')), 'the npm-shaped scaffold still gets the env reference');
+
+// Every shipped template must type-check: `rosezm new --template blog` used to
+// hand users a project that failed its own `rosezm check` (a state getter
+// called with an argument, an untyped context bag, a dangling import).
+for (const t of ['blog', 'api', 'admin', 'site']) {
+  const dir = path.join(tmp, `tpl-${t}`);
+  const made = await run(['new', dir, '--template', t], REPO);
+  assert(made.code === 0, `rosezm new --template ${t} exits 0 (stderr: ${made.err.slice(0, 200)})`);
+  const checked = await run(['check', dir], REPO);
+  assert(checked.code === 0, `the ${t} template type-checks (stderr: ${checked.err.slice(0, 300)})`);
+  const tplPkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+  assert(tplPkg.scripts?.check === 'rosezm check', `the ${t} template carries the check script`);
+  assert(Boolean(tplPkg.devDependencies?.['@types/node']), `the ${t} template declares the node types its routes need`);
+}
 
 const relBuilt = await run(['build', 'example'], REPO);
 assert(relBuilt.code === 0, `a relative dir argument builds the repo demo (stderr: ${relBuilt.err.slice(0, 300)})`);
@@ -1265,6 +1299,111 @@ try {
   scSrv.kill();
 }
 
+// AM (BUG.md): the conditional-request layer was HTML-only. A feed, a sitemap, a
+// robots.txt or a JSON API is the most-polled dynamic document there is, and it
+// used to leave the server with NO validator at all, so every poll re-paid the
+// whole body. The fix widens the gate to every buffered response. It also had to
+// change what the validator is: the hot store's tag was
+// `W/"<byte-length>-<fnv(cookie)>"`, and for an anonymous reader the cookie half
+// is a constant - so two equal-length representations shared one validator, a
+// client holding the older tag revalidated into a bodiless 304, and it stayed on
+// stale bytes for the whole TTL. The fixture serves equal-length / different-
+// content XML, then changes the bytes out-of-band (a POST - the thing that
+// clears the hot cache) to prove the tag moves with the content and that the
+// stale tag no longer buys a false 304.
+const tagDir = path.join(tmp, 'condtag');
+fs.mkdirSync(path.join(tagDir, 'src', 'pages', 'api'), { recursive: true });
+fs.writeFileSync(path.join(tagDir, 'src', 'pages', 'api', 'feed.rose'), `<script>
+  export async function GET() {
+    const g = globalThis;
+    g.__rosezm_t_r197_feed = (g.__rosezm_t_r197_feed ?? 0) + 1;
+    const seq = String(g.__rosezm_t_r197_feed).padStart(4, '0');
+    return new Response('<rss><item seq="' + seq + '"/></rss>', { status: 200, headers: { 'content-type': 'application/rss+xml' } });
+  }
+</script>
+`);
+fs.writeFileSync(path.join(tagDir, 'src', 'pages', 'api', 'own.rose'), `<script>
+  export async function GET() {
+    const g = globalThis;
+    g.__rosezm_t_r197_own = (g.__rosezm_t_r197_own ?? 0) + 1;
+    return new Response(JSON.stringify({ n: g.__rosezm_t_r197_own }), { status: 200, headers: { 'content-type': 'application/json', etag: 'W/"app-picks-this"' } });
+  }
+</script>
+`);
+const tagBuilt = await run(['build'], tagDir);
+assert(tagBuilt.code === 0, `the conditional-tag fixture builds (stderr: ${tagBuilt.err.slice(0, 200)})`);
+const tagPort = await takePort(0);
+const tagSrv = spawn(process.execPath, [path.join(tagDir, 'dist', 'prod.mjs')], {
+  cwd: tagDir,
+  env: { ...process.env, PORT: String(tagPort), rosezm_WORKERS: '1' },
+});
+let tagOut = '';
+tagSrv.stdout.on('data', (c) => { tagOut += c; });
+tagSrv.stderr.on('data', (c) => { tagOut += c; });
+try {
+  const tagBase = `http://localhost:${tagPort}`;
+  for (let i = 0; i < 100; i++) {
+    try { await fetch(tagBase + '/api/feed'); break; } catch { await new Promise((r) => setTimeout(r, 150)); }
+  }
+  const raw = async (p, init) => {
+    const r = await fetch(tagBase + p, init);
+    return { status: r.status, etag: r.headers.get('etag'), text: await r.text() };
+  };
+  // Half one, cold path: a machine-read document now publishes a validator at
+  // all, and it is weak + content-derived rather than absent.
+  const f1 = await raw('/api/feed');
+  assert(f1.status === 200 && /^W\/"[A-Za-z0-9_-]{16,}"$/.test(f1.etag || ''), `a non-HTML dynamic response publishes a weak content ETag (got ${f1.status} ${JSON.stringify(f1.etag)})`);
+  // Half two, hot replay: the conditional GET answers a bodiless 304 that still
+  // names the representation it revalidated (RFC 9110 - a 304 carries the
+  // validators a 200 would have carried).
+  const f2 = await raw('/api/feed', { headers: { 'if-none-match': f1.etag } });
+  assert(f2.status === 304 && f2.text === '', `a matching If-None-Match answers a bodiless 304 (got ${f2.status}, ${f2.text.length}B)`);
+  assert(f2.etag === f1.etag, `the 304 names the representation it revalidated (${JSON.stringify(f2.etag)} vs ${JSON.stringify(f1.etag)})`);
+  const f3 = await raw('/api/feed', { headers: { 'if-none-match': 'W/"other-tag", ' + f1.etag } });
+  assert(f3.status === 304, `an If-None-Match list is matched element by element (got ${f3.status})`);
+  const f4 = await raw('/api/feed', { headers: { 'if-none-match': '*' } });
+  assert(f4.status === 304, `'*' revalidates whatever the representation is (got ${f4.status})`);
+  const f5 = await raw('/api/feed', { headers: { 'if-none-match': '"W/app-picks-this"' } });
+  assert(f5.status === 200 && f5.text === f1.text, `a non-matching validator gets the full body back (got ${f5.status})`);
+  // The false-304 lock. A POST is what clears the hot cache; the next GET then
+  // re-renders and the counter moves - one character, same byte length. Under
+  // the old length-derived tag both representations hashed to the SAME
+  // validator, so the client below would have got a 304 and kept the stale feed.
+  await fetch(tagBase + '/api/feed', { method: 'POST' }).catch(() => {});
+  await new Promise((r) => setTimeout(r, 250));
+  const f6 = await raw('/api/feed');
+  assert(f6.status === 200 && f6.text !== f1.text && f6.text.length === f1.text.length, `the refreshed feed is different bytes of the SAME length (${JSON.stringify(f1.text)} -> ${JSON.stringify(f6.text)})`);
+  assert(f6.etag !== f1.etag, `a content-derived tag moves when the bytes move - a length-derived one could not tell them apart (${JSON.stringify(f1.etag)} vs ${JSON.stringify(f6.etag)})`);
+  const f7 = await raw('/api/feed', { headers: { 'if-none-match': f1.etag } });
+  assert(f7.status === 200 && f7.text === f6.text, `the stale validator no longer revalidates into a false 304 (got ${f7.status} ${JSON.stringify(f7.text)})`);
+  // The ownership rule: an app that published its own validator keeps it, so a
+  // hand-tuned tag (a version stamp, a DB revision) is not silently replaced by
+  // a hash the app never declared.
+  const o1 = await raw('/api/own');
+  assert(o1.etag === 'W/"app-picks-this"', `the app's own ETag survives - the server does not overwrite its validator (got ${JSON.stringify(o1.etag)})`);
+  const o2 = await raw('/api/own', { headers: { 'if-none-match': 'W/"app-picks-this"' } });
+  assert(o2.status === 304 && o2.etag === o1.etag, `the app's validator revalidates on the replay path too (got ${o2.status} ${JSON.stringify(o2.etag)})`);
+} finally {
+  tagSrv.kill();
+}
+// The other three servers share the same rule. dev/preview front the app with a
+// Node pipeline (a short-circuiting middleware, an /api route) and `rosezm
+// serve` runs the edge branch, which used to compute a validator only when it
+// was also going to compress - i.e. only for text/html GETs. Asserted as wiring:
+// a byte-exact lock would need a server per branch, and the prod one above is
+// where the store that minted the bad tag lives.
+{
+  const cliSrc = fs.readFileSync(path.join(REPO, 'src/cli/index.ts'), 'utf8');
+  assert(!/req\.headers\['if-none-match'\]\s*===/.test(cliSrc), 'every server compares validators through ifNoneMatch - no exact string equality left');
+  assert(cliSrc.includes('const etag = responseEtag(web, raw);'), 'a short-circuiting middleware/hook Response publishes a content-derived validator (dev + preview)');
+  assert(cliSrc.includes('const apiEtag = responseEtag(apiRes, apiRaw);'), 'an /api route answers conditional GETs under dev and preview too');
+  assert(cliSrc.includes('const etag = responseEtag(response, raw);'), 'the serve worker validates every buffered edge response, not only the HTML it compresses');
+  assert(cliSrc.includes("const enc = htmlDoc && req.method === 'GET' ? pickEncoding(req) : null;"), 'compression stays HTML-only while the validator gate opens to every body');
+  const prodSrc = fs.readFileSync(path.join(REPO, 'src/cli/prod-server.ts'), 'utf8');
+  assert(!/W\/"\$\{raw\.length\}/.test(prodSrc), 'no length-derived validator is minted anywhere in the prod server');
+  assert(prodSrc.includes('etag: responseEtag(response, raw),'), 'the warm render stores the validator the request path would have derived');
+}
+
 // The render memo (`export const cache = N`) is the OTHER shared store in the
 // request path, and it was keyed on URL + cookie alone: a route that asked for
 // a render memo AND negotiated its representation replayed one visitor's
@@ -1406,7 +1545,9 @@ try {
   const devHeaders = await fetch(devBase + '/');
   assert(devHeaders.headers.get('content-security-policy') === null, 'dev drops the hash CSP (the injected bridge is not hashed)');
   assert(devHeaders.headers.get('content-encoding') === null, 'dev answers uncompressed (a compressed body has no <head> to inject into)');
-  assert(devDoc.includes('data-on-click="__h0"'), 'an inline on: handler gets a synthetic name in the markup');
+  // R278 names a synthetic handler after its module (the bare __h0 of every page
+  // overwrote every other page's handler in the global registry).
+  assert(/data-on-click="__h_[\w]+_\d+"/.test(devDoc), 'an inline on: handler gets a synthetic name in the markup');
   const sse = await fetch(devBase + '/__rosezm_reload');
   assert(sse.headers.get('content-type')?.includes('text/event-stream'), 'the reload channel is an SSE stream');
   const reader = sse.body.getReader();
@@ -1430,9 +1571,18 @@ try {
   const posted = await fetch(devBase + '/__rosezm_state', { method: 'POST', body: snap, headers: { 'content-type': 'application/json' } });
   assert(posted.status === 204, 'the bridge can post its snapshot back');
   const resumed = await (await fetch(devBase + '/')).text();
-  assert(resumed.includes(`<script>window.__rosezm_resume=${snap}</script>`), 'the next document carries the snapshot back (the edit lands on the live state)');
+  assert(resumed.includes(`<script>window.__rosezm_resume=${JSON.stringify(snap)}</script>`), 'the next document carries the snapshot back (the edit lands on the live state)');
+  // the shell reads the seed with JSON.parse(window.__rosezm_resume), so the
+  // injected value must be a STRING - a bare object literal used to throw
+  // "[object Object] is not valid JSON" and kill the boot script on every
+  // hot reload that carried state
+  const seedM = /<script>window\.__rosezm_resume=([\s\S]*?)<\/script>/.exec(resumed);
+  assert(seedM, 'the resume seed is injected');
+  const seedValue = new Function('window', 'return ' + seedM[1])({});
+  assert(typeof seedValue === 'string', 'the seed arrives as a JSON string, not an object literal');
+  assert(JSON.stringify(JSON.parse(seedValue)) === snap, 'the seed round-trips through the shell\'s parse');
   const after = await (await fetch(devBase + '/')).text();
-  assert(!after.includes(`window.__rosezm_resume=${snap}`), 'the snapshot is one-shot (it is not served twice)');
+  assert(!after.includes(`window.__rosezm_resume=${JSON.stringify(snap)}`), 'the snapshot is one-shot (it is not served twice)');
   fs.writeFileSync(path.join(devDir, 'src', 'pages', 'fresh.rose'), '<h1>fresh route</h1>\n');
   await new Promise((r) => setTimeout(r, 150));
   const fresh = await fetch(devBase + '/fresh');
@@ -2857,6 +3007,68 @@ ${bufHead.replace('buffered nonce', 'plain head')}
   }
 }
 
+// `rosezm export` is a tool as much as a command: no target lists the matrix,
+// --json is machine-readable, and the human output groups its warnings.
+const matrix = await run(['export'], REPO);
+assert(matrix.code === 0 && matrix.out.includes('export targets') && matrix.out.includes('weapp') && matrix.out.includes('cpp'), 'rosezm export with no target lists the matrix instead of failing');
+const matrixJson = await run(['export', '--json'], REPO);
+const parsedMatrix = JSON.parse(matrixJson.out.trim().split('\n').pop());
+assert(parsedMatrix.ok === true && parsedMatrix.targets.length === 14 && parsedMatrix.targets.every((t) => t.status === 'ready'), 'the matrix is machine-readable (14 ready targets)');
+const oneJson = await run(['export', 'weapp', path.join(REPO, 'example'), '--json'], REPO);
+const parsedOne = JSON.parse(oneJson.out.trim().split('\n').pop());
+assert(parsedOne.ok === true && parsedOne.target === 'weapp' && parsedOne.pages.length >= 30 && Array.isArray(parsedOne.warnings), 'a single export reports its pages, components and warnings as JSON');
+const allJson = await run(['export', 'all', path.join(REPO, 'example'), '--json'], REPO);
+const parsedAll = JSON.parse(allJson.out.trim().split('\n').pop());
+assert(parsedAll.ok === true && parsedAll.targets.length === 14 && parsedAll.targets.every((t) => t.pages >= 0), 'export all reports every target as JSON');
+const human = await run(['export', 'weapp', path.join(REPO, 'example')], REPO);
+assert(human.out.includes('warning(s) -') && human.out.includes('kind(s)'), 'the human exporter groups its warnings by kind instead of dumping 40 lines');
+
 await rmTreeStable(tmp);
+// R112 (BUG AK): source hygiene - a debug probe that landed in src/ once
+// shipped as a hard syntax error (a heredoc escape split a single-quoted
+// literal across lines), and every consumer of the vendored copy failed to
+// boot. Two locks: no probe markers in src/, and every src file still
+// transforms, which is what the loader does before anything can run.
+{
+  const { default: esbuild } = await import('esbuild');
+  const srcFiles = [];
+  const walkSrc = (d) => {
+    for (const f of fs.readdirSync(d)) {
+      const p = path.join(d, f);
+      if (fs.statSync(p).isDirectory()) { walkSrc(p); continue; }
+      if (p.endsWith('.ts') || p.endsWith('.mjs')) srcFiles.push(p);
+    }
+  };
+  walkSrc(path.join(REPO, 'src'));
+  checks++;
+  const probeHits = [];
+  for (const f of srcFiles) {
+    const text = fs.readFileSync(f, 'utf8');
+    if (/PROBE|DEBUG_AUTH|UNCONDITIONAL-BODY|r1\\d\\d-probe/.test(text)) probeHits.push(f);
+  }
+  if (probeHits.length > 0) {
+    console.error(`FAIL: src/ carries debug-probe residue (${probeHits.slice(0, 3).join(
+)}) - a probe that parses can still ship; remove it`);
+    process.exit(1);
+  }
+  checks++;
+  const transformBad = [];
+  for (const f of srcFiles) {
+    try { esbuild.transformSync(fs.readFileSync(f, 'utf8'), { loader: f.endsWith('.mjs') ? 'js' : 'ts' }); }
+    catch (err) {
+      // BUG.md AN: a backtick in a `///` comment opens a template literal and
+      // the failure surfaces hundreds of lines away, so the message must name
+      // the file AND the offending line - an editor and tsc both accept it.
+      const first = err?.errors?.[0];
+      const where = first?.location ? `${f}:${first.location.line}:${first.location.column}` : f;
+      transformBad.push(`${where} ${first?.text ?? String(err?.message ?? err)}`);
+    }
+  }
+  if (transformBad.length > 0) {
+    console.error(`FAIL: ${transformBad.length} src file(s) do not transform - the dev server and every vendored consumer would fail to boot:\n  ${transformBad.join('\n  ')}`);
+    process.exit(1);
+  }
+  console.log(`ok - src hygiene: ${srcFiles.length} files, no probe residue, all transform`);
+}
 console.log(`\nAll CLI checks passed - the framework builds any project, not just its own demo - ${checks} assertions.`);
 process.exit(0);

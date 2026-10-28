@@ -318,4 +318,13 @@ await likePass({}, 'a POST with neither Origin nor Sec-Fetch-Site passes (not CS
   assert(thornHtml.includes('The thorn in every stack') && !thornHtml.includes('Hello rosezm'), 'the thorn query resolves its own hit set');
 }
 
+// --- AO: a page that calls redirect() must 302 through the prod edge entry ---
+// Before the fix the handler built the shell unconditionally and a redirecting
+// page 500'd (dev/preview routed through a different handler that was fine).
+{
+  const redirected = await handle(new Request('http://localhost/goto'));
+  assert(redirected.status === 302, `a redirect() page 302s at the edge (got ${redirected.status})`);
+  assert(redirected.headers.get('location') === '/about', 'the edge redirect names its target');
+}
+
 console.log(`\nAll edge adapter checks passed - Web-standard handler, one request, zero hydration - ${checks} assertions.`);
