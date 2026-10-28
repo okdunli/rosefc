@@ -1,0 +1,67 @@
+# rosezm - iOS build (GitHub Actions): an UNSIGNED archive.
+#
+# `rosezm export xcode` copies this file into the export tree as
+# .github/workflows/ios.yml, at the root of the exported Xcode project, so
+# every path below is the project's own. The shared scheme this archives is
+# emitted beside project.pbxproj by the same export.
+#
+# No credential is written into this file. A signed archive reads its
+# certificate from `${{ secrets.NAME }}` - see DEPLOY.md.
+
+name: iOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  archive:
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: List the project
+        run: xcodebuild -list -project rosezmApp.xcodeproj
+
+      # No certificate, no provisioning profile, no team: signing is switched
+      # off and the archive lands unsigned in build/. Installing or shipping
+      # it is the manual step - see DEPLOY.md.
+      - name: xcodebuild archive (unsigned)
+        run: |
+          xcodebuild archive \
+            -project rosezmApp.xcodeproj \
+            -scheme rosezmApp \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/rosezmApp.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rosezm-ios-xcarchive
+          path: build/rosezmApp.xcarchive
+          if-no-files-found: error
+
+# Signed archive: add the certificate as repository secrets, import it into a
+# temporary keychain before the archive, and replace CODE_SIGNING_ALLOWED=NO
+# with `-allowProvisioningUpdates`.
+#
+#     env:
+#       IOS_CERT_P12_BASE64: ${{ secrets.IOS_CERT_P12_BASE64 }}
+#       IOS_CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+#       IOS_KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+#
+#     steps:
+#       - name: Import the signing certificate
+#         run: |
+#           echo "$IOS_CERT_P12_BASE64" | base64 -d > cert.p12
+#           security create-keychain -p "$IOS_KEYCHAIN_PASSWORD" build.keychain
+#           security default-keychain -s build.keychain
+#           security unlock-keychain -p "$IOS_KEYCHAIN_PASSWORD" build.keychain
+#           security import cert.p12 -k build.keychain -P "$IOS_CERT_PASSWORD" -T /usr/bin/codesign
+#           security set-key-partition-list -S apple-tool:,apple: -s -k "$IOS_KEYCHAIN_PASSWORD" build.keychain

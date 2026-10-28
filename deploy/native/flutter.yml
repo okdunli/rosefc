@@ -1,0 +1,96 @@
+# rosezm - Flutter build (GitHub Actions): APK + unsigned iOS app.
+#
+# `rosezm export flutter` copies this file into the export tree as
+# .github/workflows/flutter.yml, at the root of the exported Flutter project,
+# so every path below is the project's own.
+#
+# No credential is written into this file. A signed build reads its keystore
+# or certificate from `${{ secrets.NAME }}` - see DEPLOY.md.
+
+name: Flutter
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      # The export ships `lib/` and `pubspec.yaml` but no platform folders
+      # (the emitter generates none). `flutter create` fills in android/ and
+      # ios/ without touching the generated Dart - `--overwrite` is what would
+      # clobber it, so it is deliberately absent. --org matters: with no
+      # ios/Runner or android/app on disk, `flutter create` cannot infer one.
+      - name: Scaffold the platform folders
+        run: flutter create --platforms=android,ios --org dev.rosezm --project-name rosezm_app .
+
+      # Flutter falls back to the debug key until a release keystore is
+      # configured, so this APK builds and installs without one - signing it is
+      # the manual step (see DEPLOY.md).
+      - name: flutter build apk
+        run: flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rosezm-flutter-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+
+  ios:
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - name: Scaffold the platform folders
+        run: flutter create --platforms=android,ios --project-name rosezm_app .
+
+      # `flutter build ipa` needs a signed Xcode project, and the export ships
+      # no signing setup. Until a certificate exists, build the device app
+      # bundle without codesign, then package it as an .ipa by hand -
+      # Payload/Runner.app is the whole format.
+      - name: flutter build ios (unsigned)
+        run: flutter build ios --release --no-codesign
+
+      - name: Package an unsigned ipa
+        run: |
+          mkdir -p build/ipa/Payload
+          cp -R build/ios/iphoneos/Runner.app build/ipa/Payload/
+          cd build/ipa && zip -qry rosezmApp-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rosezm-flutter-ipa
+          path: build/ipa/rosezmApp-unsigned.ipa
+          if-no-files-found: error
+
+# Signed builds: add the secrets named in DEPLOY.md, then
+#   - Android: write android/key.properties from
+#     `${{ secrets.ANDROID_KEYSTORE_BASE64 }}` (base64 -d) et al.
+#   - iOS: import `${{ secrets.IOS_CERT_P12_BASE64 }}` into a temporary
+#     keychain and replace the two steps above with `flutter build ipa --release`.

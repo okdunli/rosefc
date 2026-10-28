@@ -1,0 +1,62 @@
+# rosezm - Android release build (GitHub Actions).
+#
+# `rosezm export android` copies this file into the export tree as
+# .github/workflows/android.yml, at the root of the exported Gradle project,
+# so every path below is the project's own.
+#
+# No credential is written into this file. A signed build reads its keystore
+# material from `${{ secrets.NAME }}` - see DEPLOY.md, the manual step.
+
+name: Android
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # The export carries no Gradle wrapper (gradlew is a binary the emitter
+      # does not generate), so this action installs and caches Gradle itself.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      # Unsigned until the signing config in DEPLOY.md is in place - the
+      # resulting APK still installs with `adb install`.
+      - name: gradle assembleRelease
+        run: gradle assembleRelease
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rosezm-android-release
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+# Signed release: add the four repository secrets below, then decode the
+# keystore before the build and add the `signingConfigs.release` block that
+# reads keystore.properties (DEPLOY.md shows both).
+#
+#     env:
+#       ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+#       ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+#       ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+#       ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+#
+#     steps:
+#       - name: Decode the release keystore
+#         run: |
+#           echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > release.keystore
+#           printf 'storeFile=release.keystore\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+#             "$ANDROID_KEYSTORE_PASSWORD" "$ANDROID_KEY_ALIAS" "$ANDROID_KEY_PASSWORD" > keystore.properties
