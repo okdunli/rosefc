@@ -2218,8 +2218,11 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
     .replace(/<img\b(?![^>]*?\sdecoding=)/gi, '<img decoding="async"')
   // BUG.md BE: the page path namespaces the handler key, so two pages'
   // inline handlers can no longer overwrite each other in the global
-  // registry (the last page imported used to win for both).
-  const moduleId = filePath.replace(/[^\w]/g, '_').replace(/^_+|_+$/g, '').slice(-40);
+  // registry (the last page imported used to win for both). The key is the
+  // project-relative scopeKey, never filePath: an absolute path would bake
+  // the builder's directory into the shipped bundle and make two checkouts
+  // of the same source emit different bytes.
+  const moduleId = scopeKey.replace(/[^\w]/g, '_').replace(/^_+|_+$/g, '').slice(-40);
   const wired = wireEventBindings(imgDefaulted, actionNames, filePath, moduleId);
   // R259: a handler inlined into its {#each} render closure needs `__rhreg`
   // (and $setState, for a state-write body) in the render scope of BOTH halves.
