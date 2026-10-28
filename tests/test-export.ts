@@ -1,0 +1,5476 @@
+/**
+ * test-export.ts - the 0.2.0 universal export pipeline.
+ *
+ * The web build is proven by four other suites; this one proves that the SAME
+ * `.rose` pages leave the web at all. It runs the real exporter against the
+ * demo app and then:
+ *
+ *   1. checks the emitted project tree (app.json page table, one page per
+ *      route, dialect extensions, scoped CSS, project.config.json),
+ *   2. checks the WXML translation (no Rose syntax left, mapped tags, wx:if /
+ *      wx:for, every event bound to a generated adapter),
+ *   3. EXECUTES the generated page JS in a sandbox that impersonates the
+ *      mini-program runtime (Page(), wx.request) and drives it: state
+ *      initialization from $state AND from a layout, a tap handler mutating
+ *      data, a server action doing a POST and applying the state patch, and
+ *      the $data channel applying a GET response,
+ *   4. exports a second dialect (alipay) and asserts its file extensions and
+ *      template prefix, and
+ *   5. falsifies: an unknown target refuses, and no target is left merely planned.
+ *
+ * Run: npx tsx tests/test-export.ts   (from the repo root)
+ */
+import { readFileSync, existsSync, rmSync, mkdtempSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { tmpdir } from 'os';
+import { join, relative, basename } from 'path';
+import { createContext, runInContext } from 'vm';
+import { exportProject, TARGETS } from '../src/export/index.js';
+import { buildProject } from '../src/compiler/index.js';
+import { parseStylesheet } from '../src/export/style-engine.js';
+import { translateExpr, type ExprDialect } from '../src/export/expr-ir.js';
+import { fileURLToPath } from 'node:url';
+
+/** Every file under a directory, recursively. */
+function walk(dir: string): string[] {
+  const out: string[] = [];
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name);
+    if (statSync(full).isDirectory()) out.push(...walk(full));
+    else out.push(full);
+  }
+  return out;
+}
+
+let checks = 0;
+const assert = (cond: boolean, msg: string) => {
+  checks++;
+  if (!cond) {
+    console.error(`FAIL: ${msg}`);
+    process.exit(1);
+  }
+  console.log(`ok - ${msg}`);
+};
+
+const repo = new URL('../', import.meta.url);
+const example = new URL('example/', repo).pathname.replace(/^\/([A-Za-z]:)/, '$1');
+const scratch = mkdtempSync(join(tmpdir(), 'rosezm-export-'));
+
+try {
+  const result = await exportProject('weapp', example, { apiBase: 'https://api.example.com', outRoot: scratch });
+  const dir = result.outDir;
+  const read = (rel: string) => readFileSync(join(dir, rel), 'utf8');
+  const has = (rel: string) => existsSync(join(dir, rel));
+
+  // 1. the project tree
+  const app = JSON.parse(read('app.json'));
+  assert(Array.isArray(app.pages) && app.pages.length >= 20, `app.json lists the pages (${app.pages?.length})`);
+  assert(app.pages.includes('pages/index/index'), 'the home route is in the page table');
+  assert(app.pages.every((p: string) => p.startsWith('pages/') && !p.includes('[')), 'no route pattern leaked into the page table');
+  assert(has('pages/index/index.wxml') && has('pages/index/index.js') && has('pages/index/index.json'), 'a page is one .wxml + .js + .json trio');
+  assert(has('utils/rosezm.js'), 'the runtime kit ships with the project');
+  assert(has('app.js') && has('app.wxss'), 'app.js and app.wxss exist');
+  assert(has('project.config.json'), 'the WeChat project descriptor exists (the IDE opens the folder directly)');
+  const projectJson = JSON.parse(read('project.config.json'));
+  assert(projectJson.compileType === 'miniprogram' && projectJson.miniprogramRoot === './', 'project.config.json is a mini-program project');
+  assert(result.components.includes('fact-card'), 'the .rose component became a custom component');
+  assert(has('components/FactCard/FactCard.wxml'), 'the component carries its own template');
+  assert(read('components/FactCard/FactCard.json').includes('"component": true'), 'the component JSON declares itself a component');
+  assert(read('components/FactCard/FactCard.js').includes("fact: { type: String, value: 'a fact about rosezm' }"), 'a component prop is declared with the type and default from its script');
+  assert(read('pages/about/about.wxml').includes('fact-card fact="{{fact}}"'), 'the call site passes its prop expression into the custom component');
+
+  // 2. the template translation
+  const wxml = read('pages/index/index.wxml');
+  assert(!/\{#|\{\/|{@|\{:[a-z]/.test(wxml), 'no Rose block syntax survives into WXML');
+  assert(wxml.includes('wx:for="{{links}}"') && wxml.includes('wx:if="{{showFeatures}}"'), 'each/if became wx:for/wx:if');
+  assert(wxml.includes('<navigator') && wxml.includes('<button') && wxml.includes('<form') && wxml.includes('<input'), 'element vocabulary mapped (navigator/button/form/input)');
+  assert(!wxml.includes('<div') && !wxml.includes('<span') && !wxml.includes('<p>'), 'no HTML tags survived');
+  const wxDeftest = read('pages/deftest/deftest.wxml');
+  assert(wxDeftest.includes('snip-out') && wxDeftest.includes('hello') && wxDeftest.includes("'ok'") && wxDeftest.includes("'n'") && wxDeftest.includes('{{sq}}'), '{@render} expanded at its call site, with literal and state arguments substituted');
+  assert((wxDeftest.match(/\{@render|\{#snippet/g) ?? []).length === 0, 'no {@render}/{#snippet survives expansion');
+  // R258: the element carries its semantic name as a class (rose-p), because
+  // TAG_MAP rewrites <p> into <text> and a stylesheet could not reach it.
+  assert(wxDeftest.includes('class="trans-in rf-in-fade rose-p" style="animation-duration: 300ms;animation-delay: 0ms"'), 'in:fade becomes the rf-in-fade class with the 300ms default baked into the inline style');
+  assert(wxDeftest.includes('class="p30 rf-in-fade rose-p" style="animation-duration: 200ms;animation-delay: 0ms"'), 'transition:fade={duration: 200} extracts its literal duration');
+  assert(wxDeftest.includes('class="f41-trans rf-in-fade rose-p" style="animation-duration: 500ms;animation-delay: 100ms"'), 'duration and delay both extract from the literal params');
+  assert(/class="trans-out rose-p"/.test(wxDeftest) && !wxDeftest.includes('rf-in-out'), 'out: has no entrance equivalent - the element survives but plays nothing');
+  // R139: `<select multiple bind:value>` is a multi-select - the web writes an
+  // ARRAY, so a single-select picker is wrong. A checkbox-group writes exactly
+  // that array, so the state keeps its shape and selm().join('|') behaves.
+  assert(/<checkbox-group bindchange="__cg\d+"><checkbox value="x" checked="\{\{__selm_x\}\}"/.test(wxDeftest) && /<checkbox value="y" checked="\{\{__selm_y\}\}"/.test(wxDeftest), 'a <select multiple> becomes a checkbox-group whose checked flags track the array state');
+  assert(!/mode="selector" range="\{\{\['X', 'Y'\]\}\}" value="\{\{__sel_selm\}\}"/.test(wxDeftest), 'a <select multiple> is not degraded to a single-select picker');
+  const defWxss = read('pages/deftest/deftest.wxss');
+  assert(defWxss.includes('@keyframes rf-in-fade {') && defWxss.includes('.rf-in-fade { animation-name: rf-in-fade;'), 'each used pose emits its keyframes and the class that plays them (WXSS runs in the renderer)');
+  assert(wxml.includes('bindtap="__a0"'), 'a click handler is bound through a generated adapter');
+  assert(!/bindtap="increment"/.test(wxml), 'a handler is never bound raw (it would get the mini-program event shape)');
+  assert(wxml.includes('form-type="submit"'), 'a submit button carries form-type="submit"');
+  // R144/R157: a native <form method="GET" action="/search"> has no mini-program
+  // equivalent - the attributes never appear in the WXML. R144 made the message
+  // honest ("dropped", not "kept as text"); R157 went further and made the form
+  // actually work, so the attributes are now *translated* into a submit binding
+  // rather than dropped, and no warning fires for them at all.
+  const searchWxml = read('pages/search/search.wxml');
+  assert(!/method=/.test(searchWxml) && !/action=/.test(searchWxml), 'a native form method/action is genuinely dropped from the WXML');
+  assert(!(result.warnings ?? []).some((w) => /attribute (method|action) has no mini-program equivalent \(form\)/.test(w)), 'a form method/action is no longer reported as dropped - it is translated into the submit binding');
+  assert(!(result.warnings ?? []).some((w) => /kept as text/.test(w)), 'no warning still claims an attribute is "kept as text"');
+  // R157: but the FORM no longer does nothing. A GET form's submit is wired to
+  // the platform's own navigateTo with the same URL - the search box works.
+  assert(/<form bindsubmit="__formGet0">/.test(searchWxml), 'a GET form is wired to a submit handler instead of being inert');
+  // R157: a progressive-enhancement `<form method="POST">` used to render with no
+  // submit binding at all - on the web the bootstrap intercepts the native
+  // submit, but a mini program has no bootstrap, so the button did nothing. It
+  // is now bound to the page's server action, and the action's POST carries the
+  // form's fields (the server reads them with form.get()).
+  const signFormWxml = read('pages/sign/sign.wxml');
+  assert(/<form bindsubmit="action">/.test(signFormWxml), 'a method="POST" form is bound to the page server action');
+  const signFormJs = read('utils/rosezm.js');
+  assert(/let body = '__action=' \+ encodeURIComponent\(name\)/.test(signFormJs), 'the action POST body is built');
+  assert(/for \((?:var|const) k in fields\)/.test(signFormJs) && /encodeURIComponent\(String\(fields\[k\]\)\)/.test(signFormJs), 'the form fields ride in the action POST body');
+  assert(/(?:var|const) fields = \(extra && extra\.detail && extra\.detail\.value\) \|\| \{\}/.test(signFormJs), 'the submit event supplies the form fields');
+  // R216/R217: media elements map to native mini-program tags with their source.
+  const mediaWxml = read('pages/mediaprobe/mediaprobe.wxml');
+  assert(mediaWxml.includes('<progress') && mediaWxml.includes('<video src="/media/demo.mp4"') && mediaWxml.includes('<audio src="/media/demo.mp3"'), 'progress/video/audio map to native WeChat tags with their source');
+  // R145: a $kv declaration is a server-side memo whose value cannot be baked,
+  // so the field starts null. The old code emitted the raw $kv args as the
+  // initial value - a comma expression evaluating to the ttl (60), not a stamp.
+  assert(/^\s*stamp: null,?$/m.test(read('pages/kvdemo/kvdemo.js')), 'a $kv field starts null - the $kv args do not leak into the page data');
+  // R159: but the value is no longer lost. The compute expression is carried in
+  // a kv list and evaluated at load, memoized for its TTL in wx storage, so the
+  // page shows a real stamp instead of a permanent null.
+  assert(/kv: \[\{ name: "stamp", fn: function \(\) \{ return \(\(\(\) => Date\.now\(\)\)\(\)\); \}, ttl: 60 \}\]/.test(read('pages/kvdemo/kvdemo.js')), 'the $kv compute expression is carried for the load-time seed');
+  // R159, at runtime: the mini-program kit is executable, so the seed is proven
+  // by running it - the field is filled from the compute expression and the
+  // value is memoized in storage for the TTL.
+  {
+    const vm = await import('node:vm');
+    const store: Record<string, unknown> = {};
+    const wx = {
+      getStorageSync: (k: string) => (Object.prototype.hasOwnProperty.call(store, k) ? store[k] : ''),
+      setStorageSync: (k: string, v: unknown) => { store[k] = v; },
+      request: () => {},
+    };
+    const sandbox: Record<string, unknown> = { wx, console, module: { exports: {} }, Date };
+    sandbox.globalThis = sandbox;
+    vm.createContext(sandbox);
+    vm.runInContext(read('utils/rosezm.js'), sandbox);
+    const defs = { data: { stamp: null }, kv: [{ name: 'stamp', fn: function () { return 1700000000000; }, ttl: 60 }] };
+    const page = vm.runInContext('rosePage', sandbox)(function () { return {}; }, defs);
+    const patches: Array<Record<string, unknown>> = [];
+    page.setData = (patch: Record<string, unknown>) => { patches.push(patch); };
+    page.onLoad({});
+    assert(patches.some((p) => p.stamp === 1700000000000), 'the mini program seeds a $kv field at load');
+    assert(!!store['rosezm:kv:stamp'], 'the seeded $kv value is memoized in storage for its TTL');
+  }
+  // R146: $persist is a real primitive on the mini program - the field is written
+  // through to wx storage on every set and restored from it at load, so it
+  // survives a reload the way localStorage does on the web.
+  const persistJs = read('pages/persist-demo/persist-demo.js');
+  assert(persistJs.includes('persist: ["theme"]'), 'the page declares its $persist fields to the runtime');
+  const kitJs = readFileSync(join(result.outDir, 'utils/rosezm.js'), 'utf8');
+  assert(/if \(this\.__persist && this\.__persist\.indexOf\(key\) !== -1\)/.test(kitJs), 'a $persist write is mirrored into wx storage');
+  assert(/wx\.getStorageSync\('rosezm:' \+ key\)/.test(kitJs), 'a $persist field is restored from wx storage at load');
+  // R131: a bare <template> is a transparent fragment (the web compiler unwraps it
+  // the same way). Left as an element it became an inert WXML <template> tag whose
+  // content never rendered - the sign page's guestbook was blank on WeChat.
+  const signWxml = read('pages/sign/sign.wxml');
+  assert(!/<template[ >]/.test(signWxml), 'a bare <template> wrapper is unwrapped - no inert <template> tag survives into WXML');
+  assert(signWxml.includes('Guestbook') && signWxml.includes('Signatures'), 'the sign page content renders inline after the unwrap');
+  assert(!(result.warnings ?? []).some((w) => /<template> is used but no exported component/.test(w)), 'no page warns that a <template> has no exported component');
+  // R132: a script comment that MENTIONS <head> (the guarded layout's does) used to
+  // make the IR's head extraction cut mid-comment, leaking stray <script> tags and
+  // comment text into the node tree - the guarded page was garbled on every target.
+  const guardedWxml = read('pages/guarded-index/guarded-index.wxml');
+  assert(!/<script[ >]/.test(guardedWxml) && !/Regression guard|guards its/.test(guardedWxml), 'no script block or comment text leaks into the guarded page WXML');
+  assert(guardedWxml.includes('Guarded') && /<block wx:if="\{\{open\}\}">/.test(guardedWxml), 'the guarded page renders its slot content inside the layout guard');
+  assert(!(result.warnings ?? []).some((w) => /<script> is used but no exported component/.test(w)), 'no page warns that a <script> has no exported component');
+  // R133: the {#boundary} is a real error boundary - the content sits behind an
+  // `ok` flag and the fallback in wx:else, so a throwing computed degrades in
+  // place instead of blanking the section (the old "content only" behavior).
+  assert(/<block wx:if="\{\{__bnd0\}\}">.*?<\/block><block wx:else><view>This section failed to render\.<\/view><\/block>/.test(wxml), 'the mini-program boundary renders content behind an ok flag with the fallback in wx:else');
+  assert(!(result.warnings ?? []).some((w) => /boundary/.test(w)), 'no mini-program boundary warns it is content-only');
+  const wxss = read('pages/index/index.wxss');
+  assert(wxss.includes('.rose-index .rcard'), 'component CSS is scoped under the page wrapper class');
+  const appWxss = read('app.wxss');
+  assert(!/(^|\s)(body|html|:root|#app)\b/.test(appWxss), 'the web shell CSS dropped selectors a mini program cannot have');
+  assert(!/rem\b/.test(appWxss), 'rem units were converted to px');
+  assert(appWxss.includes('navigator {'), 'the shell anchor rule became a navigator rule');
+
+  // 3. execute the generated page
+  let pageDef: any = null;
+  const requests: Array<{ url: string; method: string; data: string }> = [];
+  const wxStub = {
+    request(opts: any) {
+      requests.push({ url: opts.url, method: opts.method, data: opts.data });
+      const patch = /__rosezm\/data/.test(opts.url) ? { state: { facts: ['from the data channel'] } } : { state: { likes: 99 } };
+      opts.success({ data: patch });
+    },
+  };
+  const baseGlobals = () => ({
+    console: { log: () => {}, warn: () => {}, error: () => {} },
+    module: { exports: {} }, exports: {},
+    Component: () => {},
+    App: () => {},
+    wx: wxStub,
+    setTimeout, clearTimeout, Promise, Object, Array, String, Number, Boolean, JSON, Math, Error, Symbol, RegExp, Date,
+  });
+  // One context for the runtime kit, a FRESH one for the page: both declare
+  // top-level bindings, and a mini-program runs them as separate modules while
+  // a single vm context shares one global scope.
+  const runtimeSandbox: any = baseGlobals();
+  runtimeSandbox.globalThis = runtimeSandbox;
+  createContext(runtimeSandbox);
+  runInContext(readFileSync(join(dir, 'utils/rosezm.js'), 'utf8'), runtimeSandbox);
+  const runtime = runtimeSandbox.module.exports;
+  assert(typeof runtime?.rosePage === 'function', 'the runtime exports rosePage');
+  // app.js does this on boot; the test drives the same call.
+  runtime.setApiBase('https://api.example.com');
+  // A mini program shares ONE global object between the kit and the page; the
+  // test runs them in two vm contexts, so the FormData shim is handed over.
+  runtime.installFormData();
+  assert(typeof runtimeSandbox.FormData === 'function', 'the runtime installs a DOM-shaped FormData for web-shaped handlers');
+
+  let pageDef2: any = null;
+  const pageSandbox: any = baseGlobals();
+  pageSandbox.globalThis = pageSandbox;
+  pageSandbox.Page = (def: any) => { pageDef2 = def; };
+  pageSandbox.FormData = runtimeSandbox.FormData;
+  // The page requires the baked collections when the project has any; the real
+  // mini program resolves that to the JSON on disk.
+  pageSandbox.require = (p: string) => (p.endsWith('content.json') ? JSON.parse(readFileSync(join(dir, 'data/content.json'), 'utf8')) : runtime);
+  createContext(pageSandbox);
+  runInContext(readFileSync(join(dir, 'pages/index/index.js'), 'utf8'), pageSandbox);
+  pageDef = pageDef2;
+  assert(!!pageDef && typeof pageDef === 'object', 'Page() received a definition (the file is valid JS)');
+
+  const page = Object.assign({}, pageDef);
+  page.data = JSON.parse(JSON.stringify(pageDef.data));
+  page.setData = function (patch: any) { Object.assign(this.data, patch); };
+  page.onLoad({});
+  assert(page.data.count === 0, 'a $state initial value landed in data');
+  assert(Array.isArray(page.data.links) && page.data.links.length === 8, 'a LAYOUT state initial value landed in the page data');
+  assert(page.data.likes === 41, 'a non-literal $state initial value ran inside the script scope (store read)');
+  assert(String(page.data.guests?.[0]).includes('founder'), 'an array of objects initialized verbatim');
+
+  page.increment();
+  assert(page.data.count === 1, 'a named handler bound by the template mutates state through setData');
+  page.addItem();
+  assert(page.data.items.length === 4 && String(page.data.items[3]).startsWith('Item'), 'the list update produced exactly one new item');
+
+  const like = page.like();
+  assert(typeof like?.then === 'function', 'a server action returns a promise (it posts)');
+  await like;
+  assert(requests.some((r) => r.url === 'https://api.example.com/index' && r.method === 'POST' && r.data === '__action=like'), 'the server action POSTed the framework protocol to the api base');
+  assert(page.data.likes === 99, 'the action response state patch was adopted');
+
+  await page.__loadData();
+  assert(Array.isArray(page.data.facts) && page.data.facts[0] === 'from the data channel', 'the $data channel applied GET /__rosezm/data?path=<route>');
+
+  // R133: the {#boundary} around weather() is a real error boundary on the mini
+  // program - the throwing computed flips its `ok` flag so the fallback renders.
+  assert(page.data.__bnd0 === false, 'a throwing computed inside the boundary flipped its ok flag to the fallback');
+
+  const formPage = Object.assign({}, pageDef);
+  formPage.data = JSON.parse(JSON.stringify(pageDef.data));
+  formPage.setData = function (patch: any) { Object.assign(this.data, patch); };
+  formPage.onLoad({});
+  // The WXML binds `bindsubmit` to a generated adapter - drive the same entry
+  // point WeChat calls, not the raw handler (which expects a DOM event).
+  const submitBinding = /bindsubmit="([^"]+)"/.exec(wxml)?.[1];
+  assert(!!submitBinding, 'the form submit is bound to a generated adapter');
+  formPage[submitBinding!]({ detail: { value: { name: 'Ada' } }, currentTarget: { dataset: {} } });
+  assert(formPage.data.guests[0] === 'Ada', 'a web-shaped handler (e.target + FormData) ran against the DOM-shaped event shim');
+  assert(formPage.data.guests.length === 2, 'the guestbook prepended exactly one entry');
+
+  // The bind-demo page drives the generated radio / checkbox group handlers.
+  let bindDef: any = null;
+  const bindSandbox: any = baseGlobals();
+  bindSandbox.globalThis = bindSandbox;
+  bindSandbox.require = () => runtime;
+  bindSandbox.Page = (def: any) => { bindDef = def; };
+  bindSandbox.FormData = runtimeSandbox.FormData;
+  createContext(bindSandbox);
+  runInContext(readFileSync(join(dir, 'pages/bind-demo/bind-demo.js'), 'utf8'), bindSandbox);
+  const bindPage = Object.assign({}, bindDef);
+  bindPage.data = JSON.parse(JSON.stringify(bindDef.data));
+  bindPage.setData = function (patch: any) { Object.assign(this.data, patch); };
+  bindPage.onLoad({});
+  assert(bindPage.data.plan === 'free' && bindPage.data.__colors_red === false && bindPage.data.__colors_green === false, 'a checkbox group seeds its per-value checked flags');
+  const radioBinding = /bindchange="(__rg\d+)"/.exec(readFileSync(join(dir, 'pages/bind-demo/bind-demo.wxml'), 'utf8'))?.[1];
+  assert(!!radioBinding, 'a radio group is bound to a generated change handler');
+  bindPage[radioBinding!]({ detail: { value: 'pro' } });
+  assert(bindPage.data.plan === 'pro', 'the radio group change handler writes the selected value');
+  const checkBinding = /bindchange="(__cg\d+)"/.exec(readFileSync(join(dir, 'pages/bind-demo/bind-demo.wxml'), 'utf8'))?.[1];
+  assert(!!checkBinding, 'a checkbox group is bound to a generated change handler');
+  bindPage[checkBinding!]({ detail: { value: ['red', 'green'] } });
+  assert(Array.isArray(bindPage.data.colors) && bindPage.data.colors.length === 2 && bindPage.data.__colors_red === true && bindPage.data.__colors_green === true, 'the checkbox group handler writes the list and recomputes its checked flags');
+  const pickerBinding = /bindchange="(__ps\d+)"/.exec(readFileSync(join(dir, 'pages/bind-demo/bind-demo.wxml'), 'utf8'))?.[1];
+  assert(!!pickerBinding && bindPage.data.__sel_plan === 0, 'a bound select keeps a derived index field (its picker value)');
+  bindPage[pickerBinding!]({ detail: { value: 1 } });
+  assert(bindPage.data.plan === 'pro' && bindPage.data.__sel_plan === 1, 'the picker handler maps its index back to the option value');
+  assert(!/<picker[^>]*range="\{\{\["/.test(readFileSync(join(dir, 'pages/bind-demo/bind-demo.wxml'), 'utf8')), 'the picker range uses single-quoted labels (a double quote would end the attribute)');
+
+  // R201: a mini program can only read `data`, so a `$derived` has to be
+  // published there by the runtime, and an `$effect` has to be replayed after
+  // each pass - the script body keeps both runes verbatim, so an untreated page
+  // died on the first load with a ReferenceError and every derived read stayed
+  // blank forever. The deftest page carries one of each.
+  {
+    const defJs = readFileSync(join(dir, 'pages/deftest/deftest.js'), 'utf8');
+    const derivedAt = defJs.indexOf('__computed.sq = function () { return (state.n * state.n); };');
+    const firstHoisted = defJs.search(/__computed\.__c\d+ = function/);
+    assert(derivedAt >= 0, 'a $derived becomes a recomputed data field on the mini program');
+    assert(firstHoisted < 0 || derivedAt < firstHoisted, 'the derived field is registered before the hoisted template expressions');
+    assert(defJs.includes('__effects.push('), 'an $effect body is collected instead of running as a raw rune');
+    assert(readFileSync(join(dir, 'utils/rosezm.js'), 'utf8').includes('page.__runEffects'), 'the runtime replays effects after each recompute pass');
+
+    let defDef: any = null;
+    const defSandbox: any = baseGlobals();
+    defSandbox.globalThis = defSandbox;
+    defSandbox.require = () => runtime;
+    defSandbox.Page = (d: any) => { defDef = d; };
+    defSandbox.FormData = runtimeSandbox.FormData;
+    createContext(defSandbox);
+    runInContext(defJs, defSandbox);
+    const defPage = Object.assign({}, defDef);
+    defPage.data = JSON.parse(JSON.stringify(defDef.data));
+    defPage.setData = function (patch: any) { Object.assign(this.data, patch); };
+    defPage.onLoad({});
+    assert(defPage.data.sq === 4, 'the derived field holds its computed value after load (n=2 -> sq=4)');
+    assert(defPage.data.mirror === 14, 'the effect ran on load and wrote its own state (mirror = n * 7)');
+    const defWxml = readFileSync(join(dir, 'pages/deftest/deftest.wxml'), 'utf8');
+    const derivedTap = /<button[^>]*bindtap="([^"]+)"[^>]*class="derived-btn"/.exec(defWxml)?.[1];
+    assert(!!derivedTap, 'the derived demo button is bound to a generated adapter');
+    assert(defWxml.includes('{{sq}}'), 'the template reads the derived field by name (it is a data field now)');
+    defPage[derivedTap!]({ detail: {}, currentTarget: { dataset: {} } });
+    assert(defPage.data.n === 3 && defPage.data.sq === 9, 'a state write recomputes the derived field in data');
+    assert(defPage.data.mirror === 21, 'the effect replays after the recompute pass');
+    defPage.bump();
+    assert(defPage.data.sq === 16 && defPage.data.mirror === 28, 'a second write recomputes and replays again');
+    const beforeUnload = defPage.data.sq;
+    defPage.onUnload();
+    assert(defPage.data.sq === beforeUnload && defPage.__effects.length === 0, 'unloading drops the effect list so a re-entry does not double-run it');
+  }
+
+  // Every emitted file is syntactically valid, not just the one we drove: a
+  // single broken page would otherwise be discovered only in the platform IDE.
+  const allJs = walk(join(dir, 'pages')).filter((f) => f.endsWith('.js')).concat([join(dir, 'utils/rosezm.js'), join(dir, 'app.js')]);
+  let checked = 0;
+  for (const file of allJs) {
+    execFileSync(process.execPath, ['--check', file], { stdio: 'pipe' });
+    checked++;
+  }
+  assert(allJs.length === checked && checked >= 30, `every emitted .js file parses (${checked} files)`);
+  const allJson = walk(dir).filter((f) => f.endsWith('.json'));
+  for (const file of allJson) JSON.parse(readFileSync(file, 'utf8'));
+  assert(allJson.length >= 30, `every emitted .json file parses (${allJson.length} files)`);
+  const allTpl = walk(dir).filter((f) => f.endsWith('.wxml'));
+  let leftOver = 0;
+  for (const file of allTpl) {
+    const tpl = readFileSync(file, 'utf8');
+    if (/\{(?:#|\/|:|@)/.test(tpl)) {
+      console.error(`FAIL: Rose syntax left in ${file}`);
+      process.exit(1);
+    }
+    const opens = (tpl.match(/<block\b/g) ?? []).length;
+    const closes = (tpl.match(/<\/block>/g) ?? []).length;
+    if (opens !== closes) leftOver++;
+  }
+  assert(leftOver === 0, `block tags balance in every emitted template (${allTpl.length} files)`);
+
+  // 4. a second dialect, same source
+  const alipay = await exportProject('alipay', example, { outRoot: scratch });
+  const adir = alipay.outDir;
+  assert(existsSync(join(adir, 'pages/index/index.axml')), 'alipay emits .axml templates');
+  assert(existsSync(join(adir, 'pages/index/index.acss')), 'alipay emits .acss styles');
+  const axml = readFileSync(join(adir, 'pages/index/index.axml'), 'utf8');
+  assert(axml.includes('a:for=') && axml.includes('a:if='), 'alipay uses the a: template prefix');
+  assert(readFileSync(join(adir, 'pages/index/index.js'), 'utf8').includes('rosePage'), 'alipay reuses the same page runtime');
+
+  // 5. the SECOND family on the same IR: Flutter/Dart
+  const flutter = await exportProject('flutter', example, { apiBase: 'https://api.example.com', outRoot: scratch });
+  const fdir = flutter.outDir;
+  const fread = (rel: string) => readFileSync(join(fdir, rel), 'utf8');
+  assert(existsSync(join(fdir, 'pubspec.yaml')) && existsSync(join(fdir, 'lib/main.dart')), 'flutter emits a pubspec + entrypoint');
+  const pubspec = fread('pubspec.yaml');
+  const depsBlock = pubspec.split('dependencies:')[1]?.split('flutter:')[0] ?? '';
+  assert(/flutter:\s*\n\s*sdk: flutter/.test(pubspec) && !/\^/.test(depsBlock), 'the Flutter project has no third-party dependency (SDK only)');
+  assert(flutter.pages.length === result.pages.length, `one Dart page per Rose route (${flutter.pages.length})`);
+  assert(existsSync(join(fdir, 'lib/pages/index.dart')) && existsSync(join(fdir, 'lib/components/fact_card.dart')), 'page and component files exist');
+  const mainDart = fread('lib/main.dart');
+  assert(mainDart.includes('MaterialApp') && mainDart.includes("'/'") && mainDart.includes('onGenerateRoute'), 'main.dart builds a MaterialApp with routes and dynamic-route generation');
+  assert(flutter.pages.every((p) => mainDart.includes(p.replace('lib/', '').replace('.dart', '.dart'))), 'every generated page is imported by main.dart');
+
+  // R255: Dart has no backtick string. Every .dart page used to open its text
+  // runs with ` - a syntax error on 33/33 files that no word-matching gate
+  // could see (the words were all there, only the quotes were illegal).
+  const dartPageSrc = flutter.pages.map((p) => readFileSync(join(fdir, p), 'utf8'));
+  assert(dartPageSrc.every((s) => !s.includes('`')), 'no backtick string survives into Dart (it would not compile)', dartPageSrc.map((s, i) => s.includes('`') ? flutter.pages[i] : '').filter(Boolean).join(', '));
+
+  const indexDart = fread('lib/pages/index.dart');
+  assert(indexDart.includes('StatefulWidget') && indexDart.includes('build(BuildContext context)'), 'a page is a StatefulWidget with a build method');
+  assert(indexDart.includes('dynamic count = 0;') && indexDart.includes("dynamic name = 'rosezm';"), 'a $state value became a Dart field with its initializer');
+  assert(indexDart.includes("setState(") && indexDart.includes("case 'count': count = value; break;"), 'state writes go through setState');
+  assert(indexDart.includes("rosezmData('/')"), 'the page loads its $data through the data channel');
+  assert(/rosezmAction\('\/', 'like'(, __formFields\(\))?\)/.test(indexDart), 'a server action posts the framework protocol');
+  // R158: the action POST carries the page's form inputs, so the server action's
+  // form.get() reads real values instead of empty strings.
+  assert(indexDart.includes("fields[\"name\"] = name;"), 'a Flutter action posts the form fields');
+  assert(/rosezmAction\('\/', 'like', __formFields\(\)\)/.test(indexDart), 'the Flutter action call passes the form fields');
+  // R216: progress/video/audio used to collapse to SizedBox.shrink() on Flutter - now real widgets.
+  assert(fread('lib/pages/mediaprobe.dart').includes('LinearProgressIndicator('), 'progress becomes a Flutter LinearProgressIndicator');
+  assert(fread('lib/pages/mediaprobe.dart').includes("'🎬 /media/demo.mp4'") && fread('lib/pages/mediaprobe.dart').includes("'🔊 /media/demo.mp3'"), 'video/audio carry their source URL as a placeholder');
+  // R218: the stylesheet reaches the media widgets - .bar's box, not a bare control.
+  assert(fread('lib/pages/mediaprobe.dart').includes("roseResolve(const <String>['bar'], 'mediaprobe', 'progress')"), 'the .bar class styles the Flutter progress bar');
+  // R159: a $kv field is seeded at load from its own compute expression, so the
+  // page shows a real value rather than a permanent null.
+  assert(/T rosezmKv<T>\(String name, T Function\(\) compute, int ttlSeconds\)/.test(fread('lib/rosezm.dart')), 'the Flutter kit ships a TTL memo helper');
+  assert(/rosezmKv\("stamp", \(\) => \(\(\(\) => Date\.now\(\)\)\(\)\), 60\)/.test(fread('lib/pages/kvdemo.dart')), 'a Flutter $kv field is seeded from its compute expression at load');
+  assert(indexDart.includes('onPressed: increment'), 'an event handler is bound as a method reference');
+  // R123: `[...items(), x]` used to be refused as "spread" (a no-op button) and the
+  // `'Item ' + n + 1` concat would not compile (Dart has no String + int). Both are
+  // gone: the kit's roseAppend plus a coerced toString(), so Add Item really appends.
+  assert(indexDart.includes('__set("items", [...items, "Item " + (items.length).toString() + (1).toString()])'), 'Flutter turns [...items(), x] into a native spread append with a coerced string concat');
+  assert(!/handler body not translated \(uses object\/array spread\)/.test(indexDart), 'the Add Item handler is no longer a spread stub on Flutter');
+  // R126: `throw new Error(...)` used to be refused as `new`; the shared
+  // rewriteThrowNew turns it into the kit's roseThrow, so the boundary widget
+  // (weather) throws for real instead of degrading to a no-op stub.
+  assert(indexDart.includes('roseThrow("weather service unreachable")'), 'Flutter rewrites throw new Error into the kit roseThrow');
+  assert(!/handler body not translated \(uses new\)/.test(indexDart), 'no Flutter handler on the home page stubs on `new`');
+  // R127: the guestbook submit handler used to stub on FormData. The shared
+  // rewriteFormReads turns `new FormData(form).get('name')` into the bound state
+  // read and strips preventDefault/reset/e.target, so it compiles - and `if
+  // (guest)` becomes Dart's isNotEmpty.
+  assert(indexDart.includes('var guest = (name).trim();') && indexDart.includes('if (guest.isNotEmpty) __set("guests", [guest, ...guests]);'), 'Flutter runs the guestbook submit handler through the form channel');
+  assert(!/handler body not translated \(uses FormData\)/.test(indexDart), 'the guestbook handler is no longer a FormData stub on Flutter');
+  assert(!indexDart.includes('on:click') && !indexDart.includes('{#') && !indexDart.includes('$state('), 'no Rose syntax survives into Dart');
+  assert(!indexDart.includes('Container(style:'), 'a text style is attached to the Text, not to the Container');
+  assert(indexDart.includes("link['label']") && !indexDart.includes('link.label'), 'a loop variable reads decoded JSON as a map');
+  assert(indexDart.includes("Navigator.pushNamed(context, link['href'].toString())"), 'a link becomes a navigator call with the decoded href');
+
+  const stylesDart = fread('lib/styles.dart');
+  assert(stylesDart.includes('class RoseStyle') && stylesDart.includes("'rcard__index': RoseStyle("), 'the .rose <style> blocks compile to the style map, scoped per page');
+  assert(stylesDart.includes("'rcard__about': RoseStyle(") && stylesDart.includes('Color(0xFFE8F5E9)'), 'the second page keeps its own .rcard - no cross-page style leak');
+  assert(stylesDart.includes('width: 4') && !stylesDart.includes('$width'), 'the border width is a real number, not an uninterpolated variable');
+  assert(stylesDart.includes('BorderRadius.only(topLeft: Radius.circular(0), topRight: Radius.circular(6)'), 'the four-value border-radius keeps all four corners');
+  assert(stylesDart.includes('fontSize: 32') || stylesDart.includes('fontSize:'), 'CSS sizes survive (px/rem -> double)');
+  const kit = fread('lib/rosezm.dart');
+  assert(kit.includes('rosezmData') && kit.includes('rosezmAction') && kit.includes('https://api.example.com'), 'the kit carries the data channel, the action POST and the --api base');
+  const blogDart = fread('lib/pages/blog_param_id.dart');
+  assert(blogDart.includes('final Map<String, String> params;'), 'a dynamic route page takes its params');
+  assert(mainDart.includes('RegExp(r\'^/blog/([^/]+)$\')'), 'a dynamic route is matched in onGenerateRoute');
+
+  // Every Dart file must at least be delimiter-balanced outside strings and
+  // comments - the parser-level check a machine without the Dart SDK can make.
+  const dartFiles = walk(join(fdir, 'lib')).filter((f) => f.endsWith('.dart'));
+  const dartDeftestFile = walk(join(fdir, 'lib', 'pages')).find((f) => /deftest/.test(f));
+  const dartDeftest = dartDeftestFile ? readFileSync(dartDeftestFile, 'utf8') : '';
+  // R145: a $kv declaration is a server-side memo (compute + ttl) whose value
+  // cannot be baked at export time, so the field starts null. Emitting the raw
+  // args was a Dart SYNTAX ERROR (`dynamic x = () => f(), 60;`) - the kvdemo
+  // page would not have compiled at all.
+  const dartKv = walk(join(fdir, 'lib', 'pages')).find((f) => /kvdemo/.test(f));
+  const kvDart = dartKv ? readFileSync(dartKv, 'utf8') : '';
+  assert(kvDart.includes('dynamic stamp = null;') && !/dynamic stamp = \(\)/.test(kvDart), 'a $kv field starts null in Dart - no arrow function or comma expression leaks into the declaration');
+  assert(dartDeftest.includes('hello') && !dartDeftest.includes('{@render'), 'the shared snippet expansion reaches Dart too');
+  // R140: a <select multiple> writes an ARRAY on the web, so Dart gets a row of
+  // toggling checkboxes (not a single-choice DropdownButton that would collapse
+  // the array to a scalar). The single-select path (bind-demo) is unchanged.
+  assert(dartDeftest.includes('Wrap(children: [Row(children: [Checkbox(value: ((selm as List).contains("x"))') && /list\.remove\("x"\); \} __set\('selm', list\)/.test(dartDeftest), 'a <select multiple> becomes toggling checkboxes on Flutter, keeping the array shape');
+  const aboutDart = walk(join(fdir, 'lib', 'pages')).filter((f) => /about/.test(f)).map((f) => readFileSync(f, 'utf8')).join('\n');
+  assert(aboutDart.includes('FactCard(fact: fact)'), 'Dart passes the prop into the widget constructor');
+  assert(existsSync(join(fdir, 'assets', 'images', 'rose.png')) && readFileSync(join(fdir, 'pubspec.yaml'), 'utf8').includes('- assets/images/rose.png') && aboutDart.length >= 0, 'Flutter copies the image and lists it in pubspec assets');
+  const indexDartAsset = readFileSync(join(fdir, 'lib', 'pages', 'index.dart'), 'utf8');
+  assert(indexDartAsset.includes("Image.asset('assets/images/rose.png'"), 'Flutter renders the copied image');
+  const bindDart = readFileSync(join(fdir, 'lib', 'pages', 'bind_demo.dart'), 'utf8');
+  assert(bindDart.includes('Checkbox(value: subscribed == true, onChanged: (value) => __set(\'subscribed\', value ?? false))') && bindDart.includes("Radio<dynamic>(value: \"free\", groupValue: plan, onChanged: (value) => __set('plan', value))") && bindDart.includes("DropdownButton<String>(items: <DropdownMenuItem<String>>"), 'Flutter wires checkbox, radio group and select two-way');
+  assert(readFileSync(join(fdir, 'lib', 'components', 'fact_card.dart'), 'utf8').includes("this.fact = 'a fact about rosezm'"), 'a Dart component prop keeps its declared default');
+  let unbalanced = 0;
+  for (const file of dartFiles) if (!balancedCode(readFileSync(file, 'utf8'))) unbalanced++;
+  assert(unbalanced === 0 && dartFiles.length >= 30, `every emitted .dart file is delimiter-balanced (${dartFiles.length} files)`);
+
+  // 6. the THIRD family: Python desktop (stdlib Tkinter). This one the suite can
+  // actually EXECUTE: the generated app runs against a stubbed Tkinter and the
+  // test drives a real button handler through the real generated code.
+  const python = await exportProject('python', example, { apiBase: 'https://api.example.com', outRoot: scratch });
+  const pdir = python.outDir;
+  const pread = (rel: string) => readFileSync(join(pdir, rel), 'utf8');
+  // R147: Tk has a real store too - a JSON file beside the app, written through a
+  // RoseState dict subclass on every persisted write and read back at load.
+  assert(pread('pages/persist_demo.py').includes('PERSIST = ["theme"]'), 'the Tk page declares its $persist fields');
+  assert(pread('app.py').includes('class RoseState(dict)') && pread('app.py').includes('STORE_PATH = os.path.join'), 'the Tk app has a JSON-backed persistent store');
+  // R253: the store was named `__STORE` - Python name-mangles a double-underscore
+  // identifier inside a class body, so this restore line raised
+  // NameError: _RoseApp__STORE at first load and the field never came back.
+  // Single underscore keeps one binding across module, class and copy.
+  assert(/if __k in _rose_store:/.test(pread('app.py')), 'a Tk $persist field is restored from the store at load');
+  assert(existsSync(join(pdir, 'app.py')) && existsSync(join(pdir, 'rosezm.py')) && existsSync(join(pdir, 'styles.py')), 'python emits app/kit/styles');
+  assert(python.pages.length === result.pages.length, `one Python page module per Rose route (${python.pages.length})`);
+  const pykit = pread('rosezm.py');
+  assert(pykit.includes('def data_patch') && pykit.includes('def action_patch') && pykit.includes('https://api.example.com'), 'the Python kit carries the data channel, the action POST and the --api base');
+  const pyapp = pread('app.py');
+  assert(pyapp.includes('RoseApp(tk.Tk)') && pyapp.includes("('/', page_index)") && pyapp.includes('/blog/:id'), 'the app routes static and dynamic pages');
+  const pyStyles = pread('styles.py');
+  assert(pyStyles.includes("'rcard__index': {") && pyStyles.includes("'bg':"), 'the .rose <style> blocks compile to Tk option dicts, scoped per page');
+  assert(pyStyles.includes("'highlightthickness': 4") && pyStyles.includes("'padx': 16") && pyStyles.includes("'pady': 12"), 'the border keeps its real width and padding honours both axes (0.75rem/1rem at 16px/12px)');
+  const pyIndex = pread('pages/index.py');
+  assert(pyIndex.includes('STATE = {') && pyIndex.includes("'count': 0"), 'state initializers become the page STATE');
+  assert(pyIndex.includes("def build(app, st, parent):") && pyIndex.includes("st['count'] = st.get('count') + 1"), 'handlers mutate state through the page dict');
+  assert(!/st\['[^']+'\] = [^;\n]*;/.test(pyIndex), 'a Python state write carries no JS statement terminator');
+  // R121: `.length` is a real Python len() now - the state-read receiver becomes a
+  // dict lookup, so the whole handler compiles instead of degrading to a stub, and
+  // the JS string concat is coerced with str() so it runs.
+  assert(pyIndex.includes("st['items'] = [*st.get('items'), \"Item \" + str(len(st.get('items'))) + str(1)]"), 'a .length handler compiles to len() with JS string coercion');
+  assert(!/not translated \(uses \.length\)/.test(walk(join(pdir, 'pages')).map((f) => readFileSync(f, 'utf8')).join('\n')), 'no Python handler stubs on .length');
+  assert(!/\{#|\{\/|\$state\(|\$setState\(/.test(walk(join(pdir, 'pages')).map((f) => readFileSync(f, 'utf8')).join('\n')), 'no Rose syntax survives into Python');
+
+  // Byte-compile every generated module (a real Python syntax check).
+  const pyFiles = walk(pdir).filter((f) => f.endsWith('.py'));  assert(existsSync(join(pdir, 'assets', 'rose.png')), 'Tkinter export copies the public raster image');
+  const bindPy = readFileSync(join(pdir, 'pages', 'bind_demo.py'), 'utf8');
+  assert(bindPy.includes('tk.Checkbutton(') && bindPy.includes('tk.Radiobutton(') && bindPy.includes('__choice.trace_add'), 'Tkinter wires checkbox, radio group and select two-way');
+  // R143: an option's value differs from its label ("free" vs "Free plan"), and
+  // tk.OptionMenu displays and returns the same string - so the state must store
+  // the VALUE (as the web does), translated through a label->value map, not the
+  // label the menu shows.
+  assert(bindPy.includes('tk.OptionMenu(') && bindPy.includes('"Free plan", "Pro plan"') && /\{"Free plan":"free","Pro plan":"pro"\}\.get\(__choice\.get\(\), __choice\.get\(\)\)/.test(bindPy), 'Tk stores the option VALUE (label->value map), not the displayed label');
+  assert(readFileSync(join(pdir, 'pages', 'index.py'), 'utf8').includes("tk.PhotoImage(file='assets/rose.png')") || readFileSync(join(pdir, 'pages', 'index.py'), 'utf8').includes('tk.PhotoImage(file="assets/rose.png")'), 'Tkinter renders the copied image with a placeholder fallback');
+  // R216: media elements used to collapse to empty frames - now real widgets.
+  assert(readFileSync(join(pdir, 'pages', 'mediaprobe.py'), 'utf8').includes('ttk.Scale('), 'progress becomes a Tkinter ttk.Scale');
+  assert(readFileSync(join(pdir, 'pages', 'mediaprobe.py'), 'utf8').includes("[video: /media/demo.mp4]") && readFileSync(join(pdir, 'pages', 'mediaprobe.py'), 'utf8').includes("[audio: /media/demo.mp3]"), 'video/audio carry their source URL as a placeholder');
+  // R218: the .bar class reaches the scale (its width becomes the track length).
+  assert(readFileSync(join(pdir, 'pages', 'mediaprobe.py'), 'utf8').includes('ttk.Scale(__f1_12, from_=0, to=100, value=st.get(\'pct\'), length=200)'), 'the .bar class styles the Tkinter scale');
+  // R101: a row layout (header/nav/footer) packs its children LEFT - the old
+  // emitter degraded every one to a vertical stack (91 warnings, broken chrome).
+  const pyAboutRow = readFileSync(join(pdir, 'pages', 'about.py'), 'utf8');
+  assert(pyAboutRow.includes(".pack(anchor='w', side='left')"), 'Tkinter packs a row layout left-to-right');
+  const pyWarnings = (python.warnings ?? []).filter((w) => /row layout/.test(w));
+  assert(pyWarnings.length === 0, `no row layout degrades to a column (${pyWarnings.length} warnings)`);
+  // R101: a label f-string is double-quoted - nesting the same quote inside an
+  // interpolation only parses on Python 3.12+, and an exported app must run on
+  // whatever the user has.
+  assert(!/(^|[^A-Za-z0-9_])f'[^'\n]*\{[^{}]*'[^{}]*\}/.test(walk(pdir).map((f) => readFileSync(f, 'utf8')).join('\n')), 'no label f-string nests the same quote (Python < 3.12 compatible)');
+  assert(pyAboutRow.includes('rose_link(') && pyAboutRow.includes("f\"{rose_text(lambda: link.get('label'))}\""), 'a link label with an interpolation is a double-quoted f-string, evaluated through the safe-text helper');
+  const compile = spawnSync('python', ['-m', 'py_compile', ...pyFiles], { encoding: 'utf8' });
+  const hasPython = !compile.error;
+  if (hasPython) {
+    assert(compile.status === 0 && pyFiles.length >= 30, `every emitted .py file byte-compiles (${pyFiles.length} files)`);
+  } else {
+    console.log('skip - python is not on PATH: py_compile/smoke checks skipped');
+  }
+
+  // Execute the app against a stubbed Tkinter and drive a real handler.
+  if (hasPython) {
+    const smoke = join(process.cwd(), 'tests', 'fixtures', 'python-smoke.py');
+    const run = spawnSync('python', [smoke, pdir], { encoding: 'utf8', timeout: 60_000 });
+    let smokeResult: any = null;
+    try { smokeResult = JSON.parse((run.stdout || '').trim().split('\n').pop() || 'null'); } catch { smokeResult = null; }
+    assert(!!smokeResult && smokeResult.ok === true, `the exported Python app runs (${smokeResult?.error ?? run.stderr?.slice(-200) ?? 'no output'})`);
+    assert(smokeResult.data_call === true, 'the app asked the data channel for the home route on show()');
+    assert(smokeResult.home_labels === true && String(smokeResult.labels).includes('Increment'), 'the home widget tree carries the real page content');
+    assert(Array.isArray(smokeResult.increment) && smokeResult.increment[0] === 7 && smokeResult.increment[1] === 8, 'a generated button handler mutated state (7 -> 8)');
+    assert(smokeResult.rerendered === true, 'the handler re-rendered the page from the mutated state');
+    // R121: `.length` is a real Python len() now - the Add Item handler reads the
+    // list length and appends a coerced label; before this it was refused as a stub.
+    // JS `'Item ' + length + 1` is left-associative string concat -> "Item 31"; the
+    // Python build coerces the numbers to str() and produces the same string.
+    assert(Array.isArray(smokeResult.add_item) && smokeResult.add_item[0] === 3 && smokeResult.add_item[1] === 4 && smokeResult.add_item[2] === 'Item 31', `a .length handler mutates the list through len() with JS string coercion (${JSON.stringify(smokeResult.add_item)})`);
+    assert(smokeResult.param === '1' && smokeResult.param_data_call === true, 'a dynamic route resolved its param and loaded its data');
+    assert(smokeResult.nav_current === '/', 'a link navigation lands on the target route');
+    assert(smokeResult.back_current === '/blog/:id' && smokeResult.back_param === '1', 'back() returns to the page we left, with its state intact');
+    assert(smokeResult.back_floor_noop === true, 'back() at the floor is a no-op, not an error');
+    assert(smokeResult.rich_text === true, 'the Tk kit renders trusted markup as tagged spans (bold text carries r_bold)');
+    assert(smokeResult.rich_link === true, 'a link inside trusted markup carries the link tag');
+    assert(smokeResult.rich_entity === true, 'an HTML entity inside trusted markup decodes to its character');
+    // R124: `{#defer hold=50}` on the Tk target arms its timer ONCE. build()
+    // runs again on every re-render, so an unconditional app.root.after() armed
+    // a fresh timer on each one - and every callback re-renders, arming the next:
+    // a render storm at the hold interval, forever. The stub's after() records
+    // every arming, so the storm is countable instead of a silent noop.
+    assert(smokeResult.defer_hidden_before === true, 'the deferred block is hidden before its hold elapses');
+    assert(smokeResult.defer_arm_first === 1, `the Tk defer timer arms exactly once on first build (${smokeResult.defer_arm_first})`);
+    assert(smokeResult.defer_arm_after_rerenders === 1, `three re-renders add no new timers (${smokeResult.defer_arm_after_rerenders})`);
+    assert(smokeResult.defer_flag_before === false, 'the defer flag starts false');
+    assert(smokeResult.defer_flag_after === true, 'firing the timer flips the defer flag');
+    assert(smokeResult.defer_shown_after === true, 'the deferred content renders after the timer fires');
+    assert(smokeResult.defer_arm_after_fire === 1, `the re-render the timer triggers arms nothing further (${smokeResult.defer_arm_after_fire})`);
+    // R202/R203: the same run also EXECUTES a page with a $derived, a $effect and
+    // a bare read, which is the only way to see a NameError the label fallback
+    // would otherwise swallow. mirror = n * 7 must follow n as the handler bumps
+    // it, and no label on the page may fall back to "failed to render".
+    assert(Array.isArray(smokeResult.deftest_load) && smokeResult.deftest_load.join() === '2,4,14', `derived and effect are both live on load: n=2, sq=4, mirror=14 (${JSON.stringify(smokeResult.deftest_load)})`);
+    assert(smokeResult.deftest_mirror_label === true, 'the bare {mirror} read renders its value, not the error fallback');
+    assert(smokeResult.deftest_failed === false, 'no expression on the deftest page raises inside the generated app');
+    assert(Array.isArray(smokeResult.deftest_bump) && smokeResult.deftest_bump.join() === '3,9,21', `a handler re-runs the derived AND the effect: 2->3, 4->9, 14->21 (${JSON.stringify(smokeResult.deftest_bump)})`);
+  }
+
+
+  // 7. the FOURTH family: HarmonyOS ArkTS (ArkUI). DevEco Studio opens the tree;
+  // the suite checks the project skeleton, the decorators, the state/handler
+  // translation and that every emitted .ets file is delimiter-balanced.
+  const arkts = await exportProject('arkts', example, { apiBase: 'https://api.example.com', outRoot: scratch });
+  const adir2 = arkts.outDir;
+  const aread = (rel: string) => readFileSync(join(adir2, rel), 'utf8');
+  for (const rel of ['build-profile.json5', 'hvigorfile.ts', 'oh-package.json5', 'AppScope/app.json5', 'entry/src/main/module.json5', 'entry/src/main/resources/base/profile/main_pages.json']) {
+    assert(existsSync(join(adir2, rel)), `arkts emits ${rel.split('/').pop()}`);
+  }
+  const mainPages = JSON.parse(aread('entry/src/main/resources/base/profile/main_pages.json'));
+  assert(Array.isArray(mainPages.src) && mainPages.src.length === result.pages.length, `main_pages.json lists every route (${mainPages.src.length})`);
+  assert(mainPages.src.includes('pages/IndexPage'), 'the home route page is registered');
+  const moduleJson = JSON.parse(aread('entry/src/main/module.json5'));
+  assert(moduleJson.module.mainElement === 'EntryAbility' && moduleJson.module.pages === '$profile:main_pages', 'module.json5 wires the ability and the page profile');
+  assert(existsSync(join(adir2, 'entry/src/main/ets/entryability/EntryAbility.ets')), 'the EntryAbility loads pages/IndexPage');
+  assert(aread('entry/src/main/ets/entryability/EntryAbility.ets').includes("loadContent('pages/IndexPage'"), 'the ability loads the generated home page');
+  const arkPages = walk(join(adir2, 'entry/src/main/ets/pages')).filter((f) => f.endsWith('.ets'));
+  assert(arkPages.length === result.pages.length && arkPages.length >= 30, `one @Entry struct per route (${arkPages.length})`);
+  const indexEts = aread('entry/src/main/ets/pages/IndexPage.ets');
+  assert(indexEts.includes('@Entry') && indexEts.includes('@Component') && indexEts.includes('struct IndexPage'), 'a page is an @Entry @Component struct');
+  assert(indexEts.includes('@State count: number = 0;') && indexEts.includes("@State name: string = 'rosezm';"), '$state values become typed @State fields');
+  assert(indexEts.includes('this.count = this.count + 1;'), 'a handler writes the @State field (no setData call)');
+  // R128: the guestbook submit handler used to stub on FormData. The shared
+  // rewriteFormReads turns it into the bound @State field and strips the web event
+  // bookkeeping, so it compiles - with ArkTS's explicit string emptiness test.
+  assert(indexEts.includes("const guest = (this.name).trim();") && indexEts.includes("if (guest !== '') this.guests = [ guest ].concat(this.guests);"), 'ArkTS runs the guestbook submit handler through the form channel');
+  assert(!/not translated \(web-only API\)/.test(indexEts.split('signGuestbook')[1] ?? ''), 'the guestbook handler is no longer a web-only stub on ArkTS');
+  assert(/roseAction\("\/", "like"(, __formFields\(\))?\)/.test(indexEts), 'the data channel and a server action are wired');
+  // R159: a kv field is seeded at load from its own compute expression, memoized
+  // for its TTL, so the page shows a real value rather than a permanent null.
+  const kvInner = '((() => Date.now())())'.replace(/[()]/g, '\\$&');
+  assert(new RegExp('this\\.stamp = roseKv\\("stamp", \\(\\) => ' + kvInner + ', 60\\);').test(aread('entry/src/main/ets/pages/KvdemoPage.ets')), 'an ArkTS $kv field is seeded from its compute expression at load');  assert(indexEts.includes('ForEach(this.links') && indexEts.includes('Record<string, Object>'), 'each becomes ForEach with a map-typed item');
+  assert(indexEts.includes('.fontSize(20)'), 'a <style> rule becomes an ArkUI modifier chain');
+  // R100: /logo.svg is a vector, so it draws on a Canvas (a media resource
+  // would reference a file the exporter never copies); the raster image still
+  // rides the media catalog.
+  assert(aread('entry/src/main/ets/pages/AboutPage.ets').includes('Canvas(this.__vec0)') && aread('entry/src/main/ets/pages/AboutPage.ets').includes('c.bezierCurveTo(') && aread('entry/src/main/ets/pages/AboutPage.ets').includes('private __vec0 = new CanvasRenderingContext2D();'), 'a public SVG is drawn on a Canvas with its own path ops');
+  assert(aread('entry/src/main/ets/pages/IndexPage.ets').includes("Image($r('app.media.rose'))"), 'a public raster image is still copied into media resources and referenced');
+  // R216: media elements used to collapse to empty columns - now real components.
+  assert(aread('entry/src/main/ets/pages/MediaprobePage.ets').includes('Progress('), 'progress becomes an ArkTS Progress component');
+  assert(aread('entry/src/main/ets/pages/MediaprobePage.ets').includes('Video({ src: "/media/demo.mp4" }') && aread('entry/src/main/ets/pages/MediaprobePage.ets').includes('Video({ src: "/media/demo.mp3" }'), 'video/audio become ArkTS Video components with their source');
+  assert(!/\{#|\{\/|\{@|\$state\(|on:click/.test(arkPages.map((f) => readFileSync(f, 'utf8')).join('\n')), 'no Rose syntax survives into ArkTS');
+  const arkIndex = readFileSync(join(adir2, 'entry/src/main/ets/pages/IndexPage.ets'), 'utf8');
+  assert(existsSync(join(adir2, 'entry/src/main/resources/base/media/rose.png')) && arkIndex.includes("$r('app.media.rose')"), 'ArkTS copies the image into media and renders it');
+  const bindArk = readFileSync(join(adir2, 'entry/src/main/ets/pages/BindDemoPage.ets'), 'utf8');
+  assert(bindArk.includes('Toggle({ type: ToggleType.Checkbox, isOn: this.subscribed })') && bindArk.includes("Radio({ value: \"free\", group: 'plan' })") && bindArk.includes(".onSelect((index: number, value?: string) => { this.plan = value ?? ''; })"), 'ArkTS wires checkbox, radio group and select two-way');
+  const blogEts = aread('entry/src/main/ets/pages/BlogParamIdPage.ets');
+  assert(blogEts.includes('router.getParams()') && blogEts.includes('@State params'), 'a dynamic route reads its params from the router');
+  const etsFiles = walk(join(adir2, 'entry')).filter((f) => f.endsWith('.ets'));
+  let etsUnbalanced = 0;
+  for (const file of etsFiles) if (!balancedCode(readFileSync(file, 'utf8'))) etsUnbalanced++;
+  assert(etsUnbalanced === 0 && etsFiles.length >= 30, `every emitted .ets file is delimiter-balanced (${etsFiles.length} files)`);
+
+  // 8. the FIFTH family: Android (Kotlin + Jetpack Compose). A Gradle project
+  // Android Studio opens; state is remember/mutableStateOf, a handler is a
+  // lambda that writes it, and the route table parses dynamic segments.
+  const android = await exportProject('android', example, { apiBase: 'https://api.example.com', outRoot: scratch });
+  const kdir = android.outDir;
+  const kread = (rel: string) => readFileSync(join(kdir, rel), 'utf8');
+  for (const rel of ['settings.gradle.kts', 'build.gradle.kts', 'gradle.properties', 'app/build.gradle.kts', 'app/src/main/AndroidManifest.xml', 'app/src/main/res/values/strings.xml']) {
+    assert(existsSync(join(kdir, rel)), `android emits ${rel.split('/').pop()}`);
+  }
+  assert(kread('app/build.gradle.kts').includes('compose = true') && kread('app/build.gradle.kts').includes('androidx.compose.material3:material3'), 'the Gradle module enables Compose and its dependencies');
+  const manifest = kread('app/src/main/AndroidManifest.xml');
+  assert(manifest.includes('<manifest') && manifest.includes('android:name=".MainActivity"') && manifest.includes('android.permission.INTERNET'), 'the manifest launches MainActivity and allows the data channel');
+  const kpages = walk(join(kdir, 'app/src/main/java/dev/rosezm/app/pages')).filter((f) => f.endsWith('.kt'));
+  assert(kpages.length === result.pages.length && kpages.length >= 30, `one Compose page per route (${kpages.length})`);
+  const kIndex = kread('app/src/main/java/dev/rosezm/app/pages/IndexPage.kt');
+  assert(kIndex.includes('@Composable') && kIndex.includes('fun IndexPage(onNavigate: (String) -> Unit, route: String'), 'a page is a @Composable with navigation and route parameters');
+  assert(kIndex.includes('var count by remember { mutableStateOf<Int>(0) }') && kIndex.includes('var name by remember { mutableStateOf<String>("rosezm") }'), '$state becomes typed remember/mutableStateOf');
+  assert(kIndex.includes('val increment: () -> Unit = {') && kIndex.includes('count = count + 1;'), 'a handler is a lambda that writes the state');
+  assert(/stamp = roseKv\("stamp", \{ \(\(\) => Date\.now\(\)\)\(\) \}, 60\)/.test(kread('app/src/main/java/dev/rosezm/app/pages/KvdemoPage.kt')), 'a Compose $kv field is seeded from its compute expression at load');
+  assert(kIndex.includes('val like: () -> Unit = {') && kIndex.includes('roseAction(') && kIndex.includes('roseData('), 'the data channel and a server action are wired');
+  // R158: the action POST carries the page's form inputs, so the server action's
+  // form.get() reads real values instead of empty strings.
+  assert(/roseAction\(.*, "like", __rosezmFormFields\(\["name"\]\)\)/.test(kIndex), 'a Compose action posts the form fields');
+  assert(kIndex.includes('.forEach { link ->') && kIndex.includes('link["label"]'), 'each becomes forEach over a map-typed item');
+  assert(kIndex.includes('fontSize = 20.sp'), 'a <style> rule becomes Compose text parameters');
+  assert(existsSync(join(kdir, 'app/src/main/res/drawable/rose.png')) && kIndex.includes('painterResource(id = R.drawable.rose)'), 'Compose copies the image into res/drawable and renders it');
+  const bindKotlin = readFileSync(join(kdir, 'app/src/main/java/dev/rosezm/app/pages/BindDemoPage.kt'), 'utf8');
+  assert(bindKotlin.includes('Checkbox(checked = subscribed, onCheckedChange = { subscribed = it })') && bindKotlin.includes('RadioButton(selected = plan == "free", onClick = { plan = "free" })') && bindKotlin.includes('FilterChip(selected = plan =='), 'Compose wires checkbox, radio group and select two-way');
+  // R140: a <select multiple> on Compose is a row of toggling checkboxes (the
+  // checkbox-group idiom), so the array state survives - not radio-like chips.
+  const deftestKt = readFileSync(join(kdir, 'app/src/main/java/dev/rosezm/app/pages/DeftestPage.kt'), 'utf8');
+  assert(deftestKt.includes('Checkbox(checked = (selm as? List<*>)?.contains("x") == true, onCheckedChange = { on -> selm = (((selm as? List<*>) ?: emptyList<Any?>()).toMutableList().also { if (on) it.add("x") else it.remove("x") }) }'), 'a <select multiple> becomes toggling checkboxes on Compose, keeping the array shape');
+  assert(!/FilterChip\(selected = selm ==/.test(deftestKt), 'a <select multiple> is not degraded to radio-like FilterChips on Compose');
+  assert(readFileSync(join(kdir, 'app/src/main/java/dev/rosezm/app/pages/AboutPage.kt'), 'utf8').includes('FactCard(fact = fact)') && readFileSync(join(kdir, 'app/src/main/java/dev/rosezm/app/components/FactCard.kt'), 'utf8').includes('fact: Any? = "a fact about rosezm"'), 'Kotlin passes the prop and keeps its default');
+  assert(kIndex.includes('onNavigate(link["href"].toString())'), 'a link becomes a navigation callback');
+  assert(!/\{#|\{\/|\{@|\$state\(|on:click/.test(kpages.map((f) => readFileSync(f, 'utf8')).join('\n')), 'no Rose syntax survives into Kotlin');
+  const kBlog = kread('app/src/main/java/dev/rosezm/app/pages/BlogParamIdPage.kt');
+  assert(kBlog.includes('params["id"] ?: "1"') && kBlog.includes('roseData(if (route.isEmpty())'), 'a dynamic page seeds its param state and loads the live route');
+  const appKt = kread('app/src/main/java/dev/rosezm/app/RoseApp.kt');
+  assert(appKt.includes('route == "/" -> IndexPage(') && appKt.includes('Regex("^/blog/([^/]+)$")'), 'the app routes static and dynamic pages');
+  // R214: Compose gets a real back stack (history + BackHandler), so the system
+  // Back button revisits the previous page instead of closing the app.
+  assert(appKt.includes('mutableStateListOf<String>()') && appKt.includes('BackHandler(enabled = history.isNotEmpty())') && appKt.includes('history.removeAt(history.lastIndex)'), 'Compose keeps a navigation history wired to the system Back button');
+  assert(kread('app/src/main/java/dev/rosezm/app/kit/RoseKit.kt').includes('fun roseData(') && kread('app/src/main/java/dev/rosezm/app/kit/RoseKit.kt').includes('fun roseAction('), 'the kit speaks the data channel and the action protocol over HttpURLConnection');
+  // R216: media elements used to collapse to empty Compose columns - now real widgets.
+  assert(kread('app/src/main/java/dev/rosezm/app/pages/MediaprobePage.kt').includes('LinearProgressIndicator('), 'progress becomes a Compose LinearProgressIndicator');
+  assert(kread('app/src/main/java/dev/rosezm/app/pages/MediaprobePage.kt').includes('VideoView(') && kread('app/src/main/java/dev/rosezm/app/pages/MediaprobePage.kt').includes('/media/demo.mp4'), 'video becomes an Android VideoView with its source');
+  // R218: the .bar/.vid/.aud classes reach the widgets (width, height, colour, radius).
+  assert(kread('app/src/main/java/dev/rosezm/app/pages/MediaprobePage.kt').includes('Modifier.background(Color(0xFFEEEEEE)).width(200.dp).height(8.dp)'), 'the .bar class styles the Compose progress bar');
+  assert(kread('app/src/main/java/dev/rosezm/app/pages/MediaprobePage.kt').includes('clip(RoundedCornerShape(8.dp)).width(320.dp)'), 'the .vid class styles the Compose video view');
+  const kFiles = walk(join(kdir, 'app/src/main/java')).filter((f) => f.endsWith('.kt'));
+  let kUnbalanced = 0;
+  for (const file of kFiles) if (!balancedCode(readFileSync(file, 'utf8'))) kUnbalanced++;
+  assert(kUnbalanced === 0 && kFiles.length >= 30, `every emitted .kt file is delimiter-balanced (${kFiles.length} files)`);
+
+  // 9. the SIXTH family: Xcode/SwiftUI. A deterministic project.pbxproj (every
+  // Swift file referenced), one View per route, @State fields, a URLSession kit.
+  const xcode = await exportProject('xcode', example, { apiBase: 'https://api.example.com', outRoot: scratch });
+  const xdir = xcode.outDir;
+  const xread = (rel: string) => readFileSync(join(xdir, rel), 'utf8');
+  for (const rel of ['rosezmApp.xcodeproj/project.pbxproj', 'rosezmApp/rosezmApp.swift', 'rosezmApp/RoseRootView.swift', 'rosezmApp/Info.plist', 'rosezmApp/Kit/RoseKit.swift', 'rosezmApp/Kit/RoseTheme.swift']) {
+    assert(existsSync(join(xdir, rel)), `xcode emits ${rel.split('/').pop()}`);
+  }
+  const pbx = xread('rosezmApp.xcodeproj/project.pbxproj');
+  const swiftFiles = walk(join(xdir, 'rosezmApp')).filter((f) => f.endsWith('.swift'));
+  assert(pbx.includes('objectVersion = 56') && /rootObject = [0-9A-F]{24}/.test(pbx), 'the pbxproj has a version and a root object');
+  assert((pbx.match(/isa = PBXBuildFile/g) ?? []).length >= swiftFiles.length, `every Swift file is in the build phase (${swiftFiles.length} files)`);
+  assert((pbx.match(/sourcecode\.swift/g) ?? []).length === swiftFiles.length, 'every Swift file has a PBXFileReference');
+  assert(pbx.includes('productType = "com.apple.product-type.application"') && pbx.includes('INFOPLIST_FILE = rosezmApp/Info.plist'), 'the target is an app with an Info.plist');
+  const xswift = walk(join(xdir, 'rosezmApp', 'Pages')).filter((f) => f.endsWith('.swift'));
+  assert(xswift.length === result.pages.length && xswift.length >= 30, `one SwiftUI View per route (${xswift.length})`);
+  const xIndex = xread('rosezmApp/Pages/IndexView.swift');
+  assert(xIndex.includes('struct IndexView: View') && xIndex.includes('var body: some View'), 'a page is a SwiftUI View');
+  assert(xIndex.includes('@State private var count: Int = 0') && xIndex.includes('@State private var name: String = "rosezm"'), '$state becomes typed @State fields');
+  assert(xIndex.includes('private func increment()') && xIndex.includes('count = count + 1'), 'a handler is a method that writes the state');
+  assert(xIndex.includes('roseData(route)') && /roseAction\(route, "like"(, __formFields\(\))?\)/.test(xIndex), 'the data channel and a server action are wired');
+  // R159: SwiftUI seeds a kv field the same way, through its own TTL memo.
+  const swKvInner = '{ (() => Date.now())() }'.replace(/[(){}]/g, '\\$&');
+  assert(new RegExp('stamp = roseKv\\("stamp", ' + swKvInner + ', 60\\)').test(xread('rosezmApp/Pages/KvdemoView.swift')), 'a SwiftUI $kv field is seeded from its compute expression at load');
+  assert(xIndex.includes('ForEach(Array((links).enumerated())') && xIndex.includes('link["label"] ?? ""'), 'each becomes ForEach over a map-typed item');
+  // R124: `[...items(), x]` already became Swift array concat; the missing half was
+  // the string concat - Swift has no `String + Int`, so `'Item ' + items.count + 1`
+  // would not compile. It now coerces through String(describing:), so Add Item builds.
+  assert(xIndex.includes('items = (items) + ["Item " + String(describing: items.count) + String(describing: 1)]'), 'SwiftUI coerces the string concat so [...items(), x] compiles');
+  // R130: the guestbook submit handler used to stub on FormData. The shared
+  // rewriteFormReads turns it into the bound @State field and strips the web event
+  // bookkeeping; Swift spells trim/truthiness/let and wraps the single-line if.
+  assert(xIndex.includes('let guest = String(name).trimmingCharacters(in: .whitespaces);') && xIndex.includes('if (!guest.isEmpty) {') && xIndex.includes('guests = [ guest ] + (guests)'), 'SwiftUI runs the guestbook submit handler through the form channel');
+  assert(!/not translated \(web-only API\)/.test(xIndex.split('func signGuestbook')[1] ?? ''), 'the guestbook handler is no longer a web-only stub on SwiftUI');
+  assert(xIndex.includes('.font(.system(size: 20))'), 'a <style> rule becomes a SwiftUI font modifier');
+  assert(existsSync(join(xdir, 'rosezmApp/Resources/Assets.xcassets/rose.imageset/rose.png')) && xIndex.includes('Image("rose")'), 'SwiftUI copies the image into an asset catalog and renders it');
+  const bindSwift = xread('rosezmApp/Pages/BindDemoView.swift');
+  assert(bindSwift.includes('Toggle(isOn: Binding(get: { subscribed }, set: { subscribed = $0 }))') && bindSwift.includes('Picker("select", selection: Binding(get: { plan }') && bindSwift.includes('largecircle.fill.circle'), 'SwiftUI wires checkbox, radio group and select two-way');
+  assert(!/\{#|\{\/|\{@|\$state\(|on:click/.test(walk(join(xdir, 'rosezmApp')).filter((f) => f.endsWith('.swift')).map((f) => readFileSync(f, 'utf8')).join('\n')), 'no Rose syntax survives into Swift');
+  // R216: media elements used to collapse to empty VStacks - now real views.
+  assert(xread('rosezmApp/Pages/MediaprobeView.swift').includes('ProgressView('), 'progress becomes a SwiftUI ProgressView');
+  assert(xread('rosezmApp/Pages/MediaprobeView.swift').includes('VideoPlayer(player: AVPlayer(url: URL(string: "/media/demo.mp4")') && xread('rosezmApp/Pages/MediaprobeView.swift').includes('"/media/demo.mp3"'), 'video/audio become SwiftUI VideoPlayer with their source');
+  const xBlog = xread('rosezmApp/Pages/BlogParamIdView.swift');
+  assert(xBlog.includes('params: [String: String]') && xBlog.includes('params["id"] ??'), 'a dynamic route seeds its param state from the router');
+  const rootSwift = xread('rosezmApp/RoseRootView.swift');
+  assert(rootSwift.includes('if route == "/"') && rootSwift.includes('route.hasPrefix("/blog/")') && rootSwift.includes('route.dropFirst("/blog/".count)'), 'the root view routes static and dynamic pages (parsing the segment)');
+  // R214: the root view must hand every page a real onNavigate, else links resolve
+  // to the default no-op ({ _ in }) and tapping any link does nothing on iOS.
+  assert(rootSwift.includes('AboutView(route: route, onNavigate: navigate)') && rootSwift.includes('BlogParamIdView(route: route, params:'), 'every SwiftUI page receives the real navigate callback, not the default no-op');
+  // R214: SwiftUI gets a back stack (history + back()) so navigation is reversible.
+  assert(rootSwift.includes('@State private var history: [String]') && rootSwift.includes('private func back()') && rootSwift.includes('if let prev = history.popLast()'), 'SwiftUI keeps a navigation history with a back()');
+  assert(xread('rosezmApp/Kit/RoseKit.swift').includes('func roseData(') && xread('rosezmApp/Kit/RoseKit.swift').includes('func roseAction('), 'the kit speaks the data channel and the action protocol over URLSession');
+  assert(xread('rosezmApp/Pages/AboutView.swift').includes('FactCardView(fact: fact)') && xread('rosezmApp/Components/FactCardView.swift').includes('var fact: Any? = "a fact about rosezm"'), 'SwiftUI passes the prop and keeps its default');
+  const swiftUnbalanced = walk(join(xdir, 'rosezmApp')).filter((f) => f.endsWith('.swift')).filter((f) => !balancedBraces(readFileSync(f, 'utf8')));
+  assert(swiftUnbalanced.length === 0, `every emitted .swift file has balanced braces and parens (${swiftFiles.length} files)`);
+  assert(xread('rosezmApp/Pages/DeftestView.swift').includes('hello') && !xread('rosezmApp/Pages/DeftestView.swift').includes('{@render'), 'the shared snippet expansion reaches SwiftUI too');
+
+  // 9b. R103: module-scope seeds. A property-wrapper initializer cannot read an
+  // instance member, so a module bind is a static let reached through Self, a
+  // $store payload is the seed (no server on a device), and $query().q ?? ''
+  // seeds its fallback. None of the three may degrade to nil.
+  assert(xIndex.includes('static let store: [String: Any] = ["likes": 41]'), 'a module bind is a static let, not an instance property');
+  assert(xIndex.includes('@State private var likes: Any? = Self.store["likes"]'), 'a state initializer reads a module bind through Self');
+  const xSearch = xread('rosezmApp/Pages/SearchView.swift');
+  // R187: this used to assert `@State private var q: String = ""` - the BUGGY
+  // output, where `$query()` was blanked to its ?? fallback and the query string
+  // was silently dropped. The correct seed reads the launch parameter.
+  assert(/@State private var q: Any\? = \(params\["q"\] \?\? ""\) \?\? ""/.test(xSearch), "a $query().q ?? '' state seeds the launch parameter, not just the fallback");
+  const xSign = xread('rosezmApp/Pages/SignView.swift');
+  assert(xSign.includes('@State private var guests: Any? = (["Ada Lovelace", "Grace Hopper"])'), 'a $store payload is the seed on every target');
+  const xcodeWarns = (xcode.warnings ?? []).filter((w) => /initializer reads module-level/.test(w));
+  assert(xcodeWarns.length === 0, `no xcode state initializer degrades to nil (${xcodeWarns.length})`);
+  // The $store rewrite is shared: the same payload seeds Flutter, ArkTS and Tk.
+  const fSign = fread('lib/pages/sign.dart');
+  assert(fSign.includes("dynamic guests = (['Ada Lovelace', 'Grace Hopper']);"), 'Flutter seeds the $store payload too');
+  const aSign = aread('entry/src/main/ets/pages/SignPage.ets');
+  assert(aSign.includes("@State guests: Object = (['Ada Lovelace', 'Grace Hopper']);"), 'ArkTS seeds the $store payload too');
+  const pySign = pread('pages/sign.py');
+  assert(pySign.includes("'guests': (['Ada Lovelace', 'Grace Hopper']),"), 'Tk seeds the $store payload too');
+
+  // 10. the desktop shell: Electron around the built web app. The CLI build
+  // still proves `rosezm build` itself works (prerender + shell document);
+  // the export no longer reads that dist/ - it compiles the sources itself,
+  // so a stale dist/ can never be what ships (R254).
+  const tsxLoader = new URL('../node_modules/tsx/dist/esm/index.mjs', import.meta.url).href;
+  const cliEntry = fileURLToPath(new URL('../src/cli/index.ts', import.meta.url));
+  const cliBuild = spawnSync(process.execPath, ['--import', tsxLoader, cliEntry, 'build', '.'], { cwd: example, encoding: 'utf8' });
+  assert(cliBuild.status === 0 && existsSync(join(example, 'dist', 'index.html')), 'the demo builds a shell document for the desktop target');
+  // Poison the project's dist/ with a build the export must NOT ship.
+  writeFileSync(join(example, 'dist', 'index.html'), '<!DOCTYPE html><title>stale</title><p>stale build</p>');
+  const electronDir = join(scratch, 'electron');
+  const electron = await exportProject('electron', example, { apiBase: 'https://api.example.com', outRoot: scratch });
+  const erdir = electron.outDir;
+  const eread = (rel: string) => readFileSync(join(erdir, rel), 'utf8');
+  const epkg = JSON.parse(eread('package.json'));
+  assert(epkg.main === 'main.cjs' && epkg.devDependencies.electron, 'electron emits a package.json with main.cjs and the electron devDependency');
+  assert(existsSync(join(erdir, 'preload.cjs')), 'the shell ships a (deliberately empty) preload');
+  assert(eread('main.cjs').includes('contextIsolation: true') && eread('main.cjs').includes('nodeIntegration: false'), 'the window is hardened (no Node in the renderer)');
+  assert(eread('main.cjs').includes('https://api.example.com'), 'the --api base is baked into the shell for the dynamic half');
+  const checkMain = spawnSync(process.execPath, ['--check', join(erdir, 'main.cjs')], { encoding: 'utf8' });
+  const checkPreload = spawnSync(process.execPath, ['--check', join(erdir, 'preload.cjs')], { encoding: 'utf8' });
+  assert(checkMain.status === 0 && checkPreload.status === 0, 'the shell scripts are valid CommonJS');
+  assert(existsSync(join(erdir, 'dist', 'server.js')), 'the export builds the project from source and ships its SSR server');
+  assert(readFileSync(join(erdir, 'dist', 'server.js'), 'utf8').includes('renderPage'), 'the shipped server exports renderPage, which the shell calls when there is no prerendered document');
+  assert(walk(join(erdir, 'dist')).every((f) => !f.endsWith('.br')), 'the brotli siblings stay out of the shell (they are for the HTTP servers)');
+  // The poisoned index.html above must not be in the export: if the emitter
+  // ever goes back to copying dist/, this is the line that fails.
+  assert(!existsSync(join(erdir, 'dist', 'index.html')) || !readFileSync(join(erdir, 'dist', 'index.html'), 'utf8').includes('stale build'), 'a stale dist/ in the project never reaches the export (the shell compiles the sources)');
+  void electronDir;
+
+  // 11. the desktop JVM family: Java Swing, stdlib only.
+  const java = await exportProject('java', example, { apiBase: 'https://api.example.com', outRoot: scratch });
+  const jdir = java.outDir;
+  const jread = (rel: string) => readFileSync(join(jdir, rel), 'utf8');
+  const japp = 'src/main/java/dev/rosezm/app';
+  assert(jread('pom.xml').includes('mainClass') && jread('pom.xml').includes('maven.compiler.source'), 'a Maven project with the main class and Java 17');
+  const jpages = walk(join(jdir, japp, 'pages')).filter((f) => f.endsWith('.java'));
+  assert(jpages.length === result.pages.length && jpages.length >= 30, `one page class per route (${jpages.length})`);
+  const jIndex = jread(`${japp}/pages/IndexPage.java`);
+  assert(jIndex.includes('public static void build(RoseApp app, JPanel parent)'), 'a page is a Swing builder');
+  assert(jIndex.includes('state.putIfAbsent("count", 0)') && jIndex.includes('state.putIfAbsent("items", List.of('), 'state is seeded once (a re-render keeps what a handler changed)');
+  assert(jIndex.includes('private static void increment(RoseApp app)') && jIndex.includes('app.set("count", RoseTheme.integer(app.v("count")) + 1)'), 'a handler mutates the typed state');
+  assert(jIndex.includes('RoseTheme.label(') && jIndex.includes('RoseTheme.button(') && jIndex.includes('RoseTheme.link('), 'text/button/link map to Swing components');
+  assert(jIndex.includes('for (Object itemObj : RoseTheme.list(app.v("items")))'), 'each becomes a for-each over the state list');
+  assert(jIndex.includes('RoseTheme.card('), 'a CSS class becomes a styled panel');
+  const jApp = jread(`${japp}/RoseApp.java`);
+  assert(jApp.includes('if (route.equals("/about"))') && jApp.includes('Matcher matcherBlogParamId') && jApp.includes('params.put("id", matcherBlogParamId.group(1))'), 'the app routes static and dynamic pages');
+  assert(jApp.includes('ArrayDeque<String> history') && jApp.includes('public void back()') && jApp.includes('ESCAPE'), 'Java keeps a native back stack with Alt+Left / Escape');
+  assert(jread(`${japp}/RoseKit.java`).includes('public static Map<String, Object> data(') && jread(`${japp}/RoseKit.java`).includes('public static final class Json'), 'the kit carries the data channel, the action protocol and a stdlib JSON parser');
+  assert(jread(`${japp}/RoseTheme.java`).includes('STYLES.put(') && jread(`${japp}/RoseTheme.java`).includes('public static Color color('), 'the theme compiles the style classes');
+  assert(jread(`${japp}/pages/AboutPage.java`).includes('FactCardView.build(app, panel7, fact)') && jread(`${japp}/components/FactCardView.java`).includes('Object fact)'), 'Java passes the prop as a parameter (no state hack)');
+  const bindJava = jread(`${japp}/pages/BindDemoPage.java`);
+  assert(bindJava.includes('RoseTheme.checkBox(') && bindJava.includes('RoseTheme.radio(') && bindJava.includes('RoseTheme.choice('), 'Swing wires checkbox, radio group and combo two-way');
+  assert(existsSync(join(jdir, 'src/main/resources/images/rose.png')) && jread(`${japp}/pages/IndexPage.java`).includes('RoseTheme.image(panel5, "images/rose.png")'), 'Java copies the image into resources and renders it');
+  // R216: media elements used to collapse to empty panels - now real widgets.
+  assert(jread(`${japp}/pages/MediaprobePage.java`).includes('JProgressBar'), 'progress becomes a Swing JProgressBar');
+  // R218: the .bar class reaches the bar (the stylesheet's colour reaches the widget).
+  assert(jread(`${japp}/pages/MediaprobePage.java`).includes('RoseTheme.apply(bar, "bar__Mediaprobe")'), 'the .bar class styles the Swing progress bar');
+  assert(jread(`${japp}/pages/MediaprobePage.java`).includes('[video: /media/demo.mp4]') && jread(`${japp}/pages/MediaprobePage.java`).includes('[audio: /media/demo.mp3]'), 'video/audio carry their source URL as a placeholder');
+  const jFiles = walk(join(jdir, 'src')).filter((f) => f.endsWith('.java'));
+  const jBad = jFiles.filter((f) => !balancedJava(readFileSync(f, 'utf8')));
+  assert(jFiles.length >= 30 && jBad.length === 0, `every emitted .java file is balanced (${jFiles.length} files)`);
+  // javac cannot run here, so the tree is checked as far as its shape goes:
+  // declarators, constructor arities, cross-file members, comma hygiene.
+  const jShape = javaShape(new Map(jFiles.map((f) => [f.split(/[\\/]/).pop() as string, readFileSync(f, 'utf8')])));
+  assert(jShape.length === 0, `the emitted Swing tree passes the Java shape gate (${jFiles.length} files)${jShape.length ? ': ' + jShape.slice(0, 3).join(' | ') : ''}`);
+  const SHAPE_BROKEN = `public final class Bad {
+    public static final class Style {
+        public final String fontName, String borderColor, int borderWidth;
+        public Style(int fontSize, String color, String background, int padding, boolean bold, String align, String fontName) {
+            this.fontName = fontName;
+        }
+    }
+    static { Object o = new Style(14, "#222222", null, 0, false, "left", "SansSerif", "", 0); Bad.nope(1); }
+}`;
+  const jGateFires = javaShape(new Map([['Bad.java', SHAPE_BROKEN]]));
+  assert(jGateFires.length >= 3 && jGateFires.some((d) => /restates its type/.test(d)) && jGateFires.some((d) => /new Style\(9 args\)/.test(d)) && jGateFires.some((d) => /Bad.nope/.test(d)), `the shape gate is alive: it fires on a restated declarator, a 9-arg call to a 7-param constructor and a member nobody declares (${jGateFires.length} defects)`);
+  assert(javaShape(new Map([['Good.java', 'public final class Good { public static int two(int a, int b) { return a + b; } public Good() { this(1, 2); } static { Object o = new Good(); Object p = Good.two(1, 2); } }']])).length === 0, 'the shape gate stays quiet on legal Java');
+  assert(readFileSync(join(jdir, japp, 'pages', 'DeftestPage.java'), 'utf8').includes('hello'), 'the shared snippet expansion reaches Java too');
+  // R198: a component whose own body holds {#await} used to throw the whole
+  // Swing export - the page context carries `awaits` but the component context
+  // never did, so the emitter read `.length` of undefined. The fixture is a
+  // component alone (no page await) so a regression fails here, not somewhere
+  // the example project happens to cover.
+  {
+    const awRoot = join(scratch, 'await-component');
+    mkdirSync(join(awRoot, 'src/pages'), { recursive: true });
+    mkdirSync(join(awRoot, 'src/components'), { recursive: true });
+    writeFileSync(join(awRoot, 'src/components/Loader.rose'), `<script>
+  export let title = 'untitled';
+</script>
+<div class="box">
+  <h3>{title}</h3>
+  {#await Promise.resolve(['a', 'b'])}
+    <p>waiting</p>
+  {:then items}
+    <ul>{#each items as it}<li>{it}</li>{/each}</ul>
+  {:catch err}
+    <p>{err.message}</p>
+  {/await}
+</div>
+<style>.box { padding: 8px; color: #333333; }</style>
+`);
+    writeFileSync(join(awRoot, 'src/pages/index.rose'), `<script>
+  import Loader from '../components/Loader.rose';
+</script>
+<h1>Gate</h1>
+<Loader title="hi" />
+`);
+    const awJava = await exportProject('java', awRoot, { apiBase: 'x', outRoot: join(scratch, 'await-component-out') });
+    const awView = readFileSync(join(awJava.outDir, japp, 'components', 'LoaderView.java'), 'utf8');
+    assert(awView.includes('Object __await0Value = null;') && awView.includes('boolean __await0Failed = false;') && awView.includes('__await0Value = (java.util.Arrays.asList('), 'a component awaits in its own body and numbers its locals from zero');
+    assert(awView.includes('if (__await0Failed) {') && awView.includes('for (Object itObj : RoseTheme.list(__await0Value))'), 'the component renders the catch branch and iterates the settled value');
+    const awFiles = walk(join(awJava.outDir, 'src')).filter((f) => f.endsWith('.java'));
+    const awShape = javaShape(new Map(awFiles.map((f) => [f.split(/[\\/]/).pop() as string, readFileSync(f, 'utf8')])));
+    assert(awShape.length === 0, `the component-await tree is shape-clean (${awFiles.length} files)${awShape.length ? ': ' + awShape.slice(0, 3).join(' | ') : ''}`);
+  }
+
+  // 12. the WPF desktop family: a real .NET project (net8.0-windows).
+  const dotnet = await exportProject('dotnet', example, { apiBase: 'https://api.example.com', outRoot: scratch });
+  const ndir = dotnet.outDir;
+  const nread = (rel: string) => readFileSync(join(ndir, rel), 'utf8');
+  const xmlOk = (rel: string) => spawnSync('python', ['-c', 'import xml.etree.ElementTree as ET,sys; ET.parse(sys.argv[1])', join(ndir, rel)], { encoding: 'utf8' }).status === 0;
+  assert(nread('rosezmApp.csproj').includes('net8.0-windows') && nread('rosezmApp.csproj').includes('<UseWPF>true</UseWPF>'), 'a WPF project targeting net8.0-windows');
+  assert(xmlOk('rosezmApp.csproj') && xmlOk('App.xaml') && xmlOk('MainWindow.xaml'), 'the project and both XAML files are well-formed XML');
+  assert(nread('App.xaml').includes('x:Class="rosezmApp.App"') && nread('MainWindow.xaml').includes('x:Class="rosezmApp.MainWindow"'), 'the XAML classes match their code-behind files');
+  assert(nread('MainWindow.xaml.cs').includes('new RoseApp(Host).Show()'), 'the window hosts the app');
+  const npages = walk(join(ndir, 'Pages')).filter((f) => f.endsWith('.cs'));
+  assert(npages.length === result.pages.length && npages.length >= 30, `one page class per route (${npages.length})`);
+  const nIndex = nread('Pages/IndexPage.cs');
+  assert(nIndex.includes('public static Panel Build(RoseApp app, Panel parent)'), 'a page builds a WPF panel and hands it back');
+  assert(nIndex.includes('state.TryAdd("count", 0)') && nIndex.includes('state.TryAdd("items", new List<object?>'), 'state is seeded once (a re-render keeps what a handler changed)');
+  assert(nIndex.includes('app.Set("count", RoseTheme.Int(app.V("count")) + 1)'), 'a handler mutates the typed state');
+  assert(nIndex.includes('RoseTheme.Label(') && nIndex.includes('RoseTheme.Button(') && nIndex.includes('RoseTheme.Link('), 'text/button/link map to WPF elements');
+  assert(nIndex.includes('foreach (var item in RoseTheme.AsList(app.V("items")))'), 'each becomes a foreach over the state list');
+  assert(nIndex.includes('RoseTheme.Card('), 'a CSS class becomes a themed panel');
+  const nApp = nread('RoseApp.cs');
+  assert(nApp.includes('if (route == "/about")') && nApp.includes('Regex.Match(route, "^/blog/([^/]+)$")') && nApp.includes('Params["id"] = matchBlogParamId.Groups[1].Value'), 'the app routes static and dynamic pages');
+  assert(nApp.includes('Stack<string> history') && nApp.includes('public void Back()'), '.NET keeps a native back stack');
+  assert(nread('RoseKit.cs').includes('public static Dictionary<string, object?> Data(') && nread('RoseKit.cs').includes('JsonDocument.Parse'), 'the kit carries the data channel, the action protocol and System.Text.Json');
+  assert(nread('RoseTheme.cs').includes('public static Color FromHex(') && nread('RoseTheme.cs').includes('public static string Str('), 'the theme compiles the style classes and the typed state views');
+  assert(nread('Pages/AboutPage.cs').includes('FactCardView.Build(app, panel7, fact)') && nread('Components/FactCardView.cs').includes('object? fact'), '.NET passes the prop as a parameter');
+  const bindNet = nread('Pages/BindDemoPage.cs');
+  assert(bindNet.includes('RoseTheme.CheckBox(') && bindNet.includes('RoseTheme.Radio(') && bindNet.includes('RoseTheme.Choice('), 'WPF wires checkbox, radio group and combo two-way');
+  assert(existsSync(join(ndir, 'Assets', 'rose.png')) && nread('Pages/IndexPage.cs').includes('RoseTheme.Image(panel5, "Assets/rose.png")'), '.NET copies the image and renders it');
+  // R216: media elements used to collapse to empty panels - now real widgets.
+  assert(nread('Pages/MediaprobePage.cs').includes('new ProgressBar'), 'progress becomes a WPF ProgressBar');
+  // R218: the .bar class reaches the bar - width, height and colour all travel.
+  assert(nread('Pages/MediaprobePage.cs').includes('RoseTheme.Apply(pb2, new RoseStyle { Color = "#e91e63", Background = "#eeeeee", Width = new RoseLen(200, "px"), Height = new RoseLen(8, "px") })'), 'the .bar class styles the WPF progress bar');
+  assert(nread('Pages/MediaprobePage.cs').includes('[video: /media/demo.mp4]') && nread('Pages/MediaprobePage.cs').includes('[audio: /media/demo.mp3]'), 'video/audio carry their source URL as a placeholder');
+  const nFiles = walk(join(ndir)).filter((f) => f.endsWith('.cs'));
+  const nBad = nFiles.filter((f) => !balancedJava(readFileSync(f, 'utf8')));
+  assert(nFiles.length >= 30 && nBad.length === 0, `every emitted .cs file is brace-balanced (${nFiles.length} files)`);
+  assert(nread('Pages/DeftestPage.cs').includes('hello'), 'the shared snippet expansion reaches WPF too');
+
+  // 13. the last desktop family: C++ with Qt 6 Widgets + CMake.
+  const cpp = await exportProject('cpp', example, { apiBase: 'https://api.example.com', outRoot: scratch });
+  const cdir = cpp.outDir;
+  const cread = (rel: string) => readFileSync(join(cdir, rel), 'utf8');
+  assert(cread('CMakeLists.txt').includes('find_package(Qt6 COMPONENTS Widgets Network REQUIRED)') && cread('CMakeLists.txt').includes('target_link_libraries(rosezm-app PRIVATE Qt6::Widgets Qt6::Network)'), 'a CMake project linking Qt6 Widgets and Network');
+  const cppFiles = walk(join(cdir, 'src', 'pages')).filter((f) => f.endsWith('.cpp'));
+  assert(cppFiles.length === result.pages.length && cppFiles.length >= 30, `one Qt page per route (${cppFiles.length})`);
+  assert(cread('CMakeLists.txt').includes('src/pages/IndexPage.cpp') && walk(join(cdir, 'src')).filter((f) => f.endsWith('.cpp')).length >= 30, 'every page source is listed in the build');
+  const cIndex = cread('src/pages/IndexPage.cpp');
+  assert(cIndex.includes('void buildIndex(RoseApp& app, QWidget* parent)'), 'a page is a Qt builder function');
+  assert(cIndex.includes('if (!app.state().count("count")) app.state()["count"] = RoseValue(0)'), 'state is seeded once (a re-render keeps what a handler changed)');
+  assert(cIndex.includes('void increment(RoseApp& app)') && cIndex.includes('rose_num(app.v("count")) + 1'), 'a handler mutates the typed state');
+  // R125: `[...items(), 'Item ' + items().length + 1]` used to be refused wholesale
+  // on `.length`. `.length` is now rose_count and the string concat coerces with
+  // std::to_string, so Add Item appends through the kit in real, compiling C++.
+  assert(cIndex.includes('rose_append(app.v("items"), "Item " + std::to_string(rose_count(app.v("items"))) + std::to_string(1))'), 'Qt turns [...items(), x] into rose_append with rose_count and a coerced concat');
+  assert(!/not translated \(web-only construct\)/.test(cIndex.split('void addItem')[1] ?? ''), 'the Add Item handler is no longer a stub on Qt');
+  assert(cIndex.includes('rose_label(') && cIndex.includes('rose_button(') && cIndex.includes('rose_link('), 'text/button/link map to Qt widgets');
+  assert(cIndex.includes('for (const RoseValue& item : rose_list(app.v("items")))'), 'each becomes a range-for over the state list');
+  assert(cIndex.includes('RoseValue::object(') && cIndex.includes('RoseValue::list('), 'a JS object/array literal becomes a RoseValue object/list');
+  const cRoseH = cread('src/rose.h');
+  assert(cRoseH.includes('class RoseValue') && cRoseH.includes('std::vector<RoseValue> rose_list('), 'the header carries the value type and the views');
+  const cApp = cread('src/rose.cpp');
+  assert(cApp.includes('if (route_ == "/about")') && cApp.includes('std::regex_match(route_, match') && cApp.includes('params_["id"] = match[1].str()'), 'the app routes static and dynamic pages');
+  assert(cread('src/rose.h').includes('std::vector<std::string> history_') && cApp.includes('void RoseApp::back()'), 'C++ keeps a native back stack');
+  assert(cread('src/pages/AboutPage.cpp').includes('buildFactCardView(app, panel7, RoseValue(fact))') && cread('src/pages.h').includes('const RoseValue& fact)'), 'C++ passes the prop and declares it');
+  const bindCpp = cread('src/pages/BindDemoPage.cpp');
+  assert(bindCpp.includes('rose_checkbox(') && bindCpp.includes('rose_radio(') && bindCpp.includes('rose_combo(') && cread('src/rose.h').includes('rose_contains('), 'Qt wires checkbox, radio group and combo two-way');
+  assert(existsSync(join(cdir, 'assets', 'rose.png')) && cread('src/pages/IndexPage.cpp').includes('rose_image(panel5, "assets/rose.png")'), 'C++ copies the image and renders it with QPixmap');
+  // R216: media elements used to collapse to empty widgets - now real widgets.
+  assert(cread('src/pages/MediaprobePage.cpp').includes('QProgressBar'), 'progress becomes a Qt QProgressBar');
+  assert(cread('src/pages/MediaprobePage.cpp').includes('[video: /media/demo.mp4]') && cread('src/pages/MediaprobePage.cpp').includes('[audio: /media/demo.mp3]'), 'video/audio carry their source URL as a placeholder');
+  assert(cApp.includes('void RoseApp::callAction(') && cApp.includes('rose_keys('), 'the kit carries the data channel, the action protocol and the JSON text helpers');
+  const cppAll = walk(join(cdir, 'src')).filter((f) => /\.(cpp|h)$/.test(f));
+  const cppBad = cppAll.filter((f) => !balancedJava(readFileSync(f, 'utf8')));
+  assert(cppAll.length >= 30 && cppBad.length === 0, `every emitted C++ file is brace-balanced (${cppAll.length} files: ${cppBad.map((f) => f.split(/[\\/]/).pop()).join(', ')})`);
+  const cppLeftovers = cppAll.filter((f) => /\$\{|\{@|\{#|RoseMap/.test(readFileSync(f, 'utf8')) && !f.endsWith('rose.h'));
+  assert(cppLeftovers.length === 0, 'no template/Rose syntax survives into C++');
+  assert(cread('src/pages/DeftestPage.cpp').includes('hello'), 'the shared snippet expansion reaches C++ too');
+
+  // 13a. R202/R203: what a page RUNS, not what it looks like. The example's
+  // deftest page carries a $derived, a $effect that writes state, BARE reads of
+  // both, a list join and the class/style object shorthand - the constructs that
+  // used to reach a native target as JS source and either fail to compile or fail
+  // at read time, hidden behind a label's own "failed to render" fallback. Each
+  // one is asserted in the emitted language, so a regression names the target.
+  {
+    const pyDef = readFileSync(join(pdir, 'pages', 'deftest.py'), 'utf8');
+    const weDef = read('pages/deftest/deftest.js');
+    const flDef = readFileSync(join(fdir, 'lib/pages/deftest.dart'), 'utf8');
+    const akDef = readFileSync(join(adir2, 'entry/src/main/ets/pages/DeftestPage.ets'), 'utf8');
+    const andDef = kread('app/src/main/java/dev/rosezm/app/pages/DeftestPage.kt');
+    const swDef = xread('rosezmApp/Pages/DeftestView.swift');
+    const jvDef = jread('src/main/java/dev/rosezm/app/pages/DeftestPage.java');
+    const ntDef = nread('Pages/DeftestPage.cs');
+    const cpDef = cread('src/pages/DeftestPage.cpp');
+    // A $effect has no reactive graph to hook on a compiled target, so the two
+    // that replay it are the mini program (after every notify) and Tk (inside
+    // build(), which IS the recompute pass). Every other target says so.
+    assert(/def __effect0\(\):/.test(pyDef) && /st\['mirror'\] = st\.get\('n'\) \* 7/.test(pyDef) && /^\s{4}__effect0\(\)$/m.test(pyDef), 'python replays the page $effect inside build(): the field it maintains is live, not frozen at its seed');
+    assert(/__effects\.push\(\(\) => \{\s*__setState\("mirror", state\.n \* 7\)/.test(weDef), 'the mini program queues the page $effect for its recompute pass');
+    for (const [label, res] of [['flutter', flutter], ['android', android], ['arkts', arkts], ['xcode', xcode], ['java', java], ['dotnet', dotnet], ['cpp', cpp]] as Array<[string, { warnings: string[] }]>) {
+      assert((res.warnings ?? []).some((w) => /deftest\.rose.*\$effect body does not run on this platform/.test(w)), `${label}: a dropped $effect is named with its file, not swallowed`);
+    }
+    assert(!(result.warnings ?? []).some((w) => /\$effect/.test(w)), 'the mini program is not warned about a rune it runs');
+    assert(!(python.warnings ?? []).some((w) => /pages\/deftest\.rose.*\$effect/.test(w)), 'python is not warned about a page effect it replays');
+    // A template read is BARE in the source (`{mirror}`); the web build callifies
+    // it and the export IR hands the emitter the source spelling. Every target
+    // has to spell the read itself or the name it emitted is undeclared.
+    assert(pyDef.includes(`f"{rose_text(lambda: st.get('mirror'))}"`), 'python: a bare read becomes the state getter (a NameError inside rose_text is invisible);');
+    assert(akDef.includes('Text(`${this.mirror}`)') && !/Text\(\`\$\{mirror\}\`\)/.test(akDef), 'arkts: a bare read becomes the component property, not an undeclared identifier');
+    assert(cpDef.includes('rose_str(app.v("mirror"))') && !/rose_str\(mirror\)/.test(cpDef), 'qt: a bare read is the app state lookup');
+    assert(flDef.includes("roseText('${mirror}'") && swDef.includes('Text("\\(mirror)")'), 'flutter and swiftui read their own declared field');
+    // JS `list.join(sep)` - only Dart and ArkTS have that method. Every other
+    // target either had no join at all or puts the separator first.
+    assert(pyDef.includes(`'|'.join(st.get('selm'))`), 'python: a list join is the separator-first Python idiom, not a method on a list');
+    assert(flDef.includes("${selm.join('|')}") && akDef.includes("this.selm.join('|')"), 'dart and ArkTS keep their native join');
+    assert(jvDef.includes('RoseTheme.join(app.v("selm"), "|")') && ntDef.includes('RoseTheme.Join(app.V("selm"), "|")'), 'swing and WPF join through the theme helper (their state is untyped)');
+    assert(cpDef.includes('rose_join(app.v("selm"), "|")') && andDef.includes('roseJoin(selm, "|")') && swDef.includes('roseJoin(selm, "|")'), 'qt, compose and swiftui get a kit join for a dynamically typed list');
+    assert(!/\.join\("/.test(jvDef + ntDef + cpDef + andDef + swDef), 'no JS-shaped list.join() survives into a target that has no such method');
+    // The object shorthand: literal entries fold, false entries vanish, and the
+    // conditional ones become class names the target already knows how to apply.
+    assert(weDef.includes('__computed.__c0 = function () { return (state.selm.join(\'|\')); };') && read('pages/deftest/deftest.wxml').includes('class="cls-obj a c rose-p"'), 'the mini program computes the join into data and folds a class object into static classes');
+    assert(flDef.includes("roseResolve(const <String>['cls-obj', 'a', 'c'], 'deftest', 'p')") && flDef.includes("RoseStyle(color: Color(0xFFFF0000)"), 'flutter: a literal class object is a const list, carrying its tag so element rules apply, and a style object is a real Color');
+    assert(pyDef.includes(`text="y", wraplength=680, fg='#ff0000'`), 'python: a literal style object folds into the widget options, with no runtime call to pay for');
+  }
+
+  // 13b. R102: the desktop form channel - a submit handler reads its inputs
+  // through the same state keys the widgets bind to, never through FormData,
+  // and no JS-only construct (spread, String(), const, throw new) leaks.
+  assert(jIndex.includes('RoseTheme.textField(panel9, "Your name", app, "name")'), 'a named input binds to the state key its handler reads');
+  assert(jIndex.includes('RoseTheme.button(panel9, "Sign", new RoseTheme.Style(16, "#222222", null, 8, false, "left", "SansSerif", "", 0).pad(8, 16, 8, 16).margin(0, 8, 0, 0), event -> { signGuestbook(app); app.render(); })'), 'a submit button rides the form handler on the desktop, with the user button style on it');
+  assert(jIndex.includes('var guest = RoseTheme.text(app.v("name")).trim();'), 'a FormData read becomes the state read, once');
+  assert(jIndex.includes('if (!guest.isEmpty())'), 'a string local tests emptiness, not JS truthiness');
+  assert(jIndex.includes('RoseTheme.prepend(RoseTheme.list(app.v("guests")), guest)'), 'a spread state write becomes the kit append/prepend');
+  assert(jIndex.includes('roseThrow("weather service unreachable")'), 'throw new Error becomes the kit throw');
+  const nIndexPage = nread('Pages/IndexPage.cs');
+  assert(nIndexPage.includes('var guest = RoseTheme.Str(app.V("name")).Trim();'), 'WPF spells the C# string helpers with a capital');
+  assert(nIndexPage.includes('!string.IsNullOrEmpty(guest)'), 'WPF tests the C# emptiness');
+  assert(cIndex.includes('auto guest = rose_str(app.v("name")).trim();'), 'Qt declares the local with auto');
+  assert(cIndex.includes('if (!guest.empty())'), 'Qt tests the std::string emptiness');
+  const desktopPages = [jIndex, nIndexPage, cIndex].join('\n');
+  assert(!/\.\.\./.test(desktopPages), 'no JS spread survives into a desktop handler');
+  assert(!/\bconst\s+\w+\s*=/.test(desktopPages), 'no const declaration survives into a desktop handler');
+  for (const [what, body] of [['java', jIndex], ['wpf', nIndexPage], ['qt', cIndex]] as Array<[string, string]>) {
+    const stubs = body.split('\n').filter((l) => l.includes('not translated')).length;
+    assert(stubs <= 1, `${what} keeps the form handler translated (${stubs} stubs on the index page)`);
+  }
+
+  // 13c. R104: the functional subset - `$setState('k', (p) => p.map(...))` with
+  // object and array spreads. It used to stub on the desktop targets and leak
+  // a raw JS arrow into Swift, which does not compile.
+  const jNest = jread(`${japp}/pages/NestDemoPage.java`);
+  assert(jNest.includes('RoseTheme.mapList(RoseTheme.list(app.v("groups")), g -> (RoseTheme.merge(g, RoseTheme.mapOf(Map.entry("on", !RoseTheme.bool(RoseTheme.get(g, "on")))))))'), 'Java maps a list through the kit, with the object spread merged');
+  assert(jNest.includes('RoseTheme.mapListIdx(RoseTheme.list(app.v("groups")), (g, i) ->'), 'Java binds the index parameter of a two-arg arrow');
+  assert(jNest.includes('RoseTheme.append(RoseTheme.get(g, "items"), "a" + (((java.util.List<?>) (RoseTheme.get(g, "items"))).size() + 1))'), 'Java appends inside the mapped expression and counts the nested list');
+  assert(!jNest.includes('=>'), 'no JS arrow survives into Java');
+  const cNest = cread('src/pages/NestDemoPage.cpp');
+  assert(cNest.includes('rose_map(rose_list(app.v("groups")), [](const RoseValue& g) { return (rose_merge(g, RoseValue::object({{"on", !rose_bool(rose_get(g, "on"))}}))); })'), 'Qt maps through a lambda over the kit merge/object helpers');
+  assert(!cNest.includes('=>'), 'no JS arrow survives into C++');
+  const nNest = nread('Pages/NestDemoPage.cs');
+  assert(nNest.includes('RoseTheme.Map(RoseTheme.List(app.V("groups")), delegate(object g) { return (RoseTheme.Merge(g, RoseTheme.Obj(("on", !RoseTheme.Bool(RoseTheme.Get(g, "on")))))); })'), 'WPF maps through an anonymous method (a lambda would trip the arrow refusal)');
+  assert(!nNest.includes('.map(') && !nNest.includes('$setState') && !nNest.includes('...'), 'no JS construct survives into C#');
+  const xNest = xread('rosezmApp/Pages/NestDemoView.swift');
+  assert(xNest.includes('groups = roseMap(groups) { g in (roseMerge(g, ["on": !roseBool(((g) as? [String: Any])?["on"])])) };'), 'SwiftUI maps through a trailing closure with the cast member read');
+  assert(xNest.includes('roseMapIdx(groups) { g, i in'), 'SwiftUI binds the index parameter too');
+  assert(!xNest.includes('=>'), 'no JS arrow survives into Swift');
+  const aNest = aread('entry/src/main/ets/pages/NestDemoPage.ets');
+  assert(aNest.includes("this.groups = roseMap(this.groups, (g: Object) => (roseMerge(g, { 'on': !roseBool(g['on']) })));"), 'ArkTS maps through the kit helpers with its own arrow syntax');
+  assert(!aNest.includes('...'), 'no JS spread survives into ArkTS');
+  const nestWarnings = (result.warnings ?? []).filter((w) => /NestDemo/.test(w));
+  assert(nestWarnings.filter((w) => /arrow|spread|\.map\(/.test(w)).length === 0, `no functional handler is refused on the nest page (${nestWarnings.length} warnings)`);
+
+  // 13d. R105: the same mapper channel on Flutter, Tk and Compose. Dart's
+  // pipeline renames $setState to __set before the body is translated, so the
+  // shared pass accepts both spellings; Python spells the conditional the
+  // other way round; Compose casts the untyped reads before + and !.
+  const fNest = fread('lib/pages/nest_demo.dart');
+  assert(fNest.includes("__set('groups', groups.map((g) => (roseMerge(g, {'on': !(g['on'])}))).toList());"), 'Flutter maps through the native map with the kit merge');
+  assert(!fNest.includes('...'), 'no JS spread survives into Dart');
+  const pyNest = pread('pages/nest_demo.py');
+  assert(pyNest.includes("st['groups'] = [({**g, **{'on': not g['on']}}) for g in st.get('groups')]"), 'Tk maps through a comprehension with native dict merge');
+  assert(pyNest.includes("if (i == 0) else (g) for i, g in enumerate(st.get('groups'))"), 'Tk spells the conditional expression the Python way');
+  const kNest = readFileSync(join(kdir, 'app/src/main/java/dev/rosezm/app/pages/NestDemoPage.kt'), 'utf8');
+  assert(kNest.includes('groups = groups.map { g -> (g + mapOf("on" to !(g["on"] as? Boolean ?: false))) };'), 'Compose maps through the native map with the coerced negation');
+  assert(kNest.includes('roseMapIdx(groups) { g, i ->'), 'Compose binds the index parameter through the kit helper');
+  assert(kNest.includes('(g["items"] as List<Any?>) + "a"'), 'Compose casts the untyped list before appending');
+  assert(!/\.map\(/.test(kNest), 'no JS map call survives into Kotlin');
+
+  // 13d-2. R122: a single-item array spread in a state write is a real append on
+  // Compose - `[...items(), x]` used to be refused as "spread" and the Add Item
+  // button was a no-op stub. It now compiles to the Kotlin list append.
+  assert(kIndex.includes('items = (items as List<Any?>) + listOf("Item " + items.size + 1);'), 'Compose turns [...items(), x] into a real list append');
+  assert(!/val addItem: \(\) -> Unit = \{\s*\n\s*\/\/ rosezm: handler body not translated \(uses spread\)/.test(kIndex), 'the Add Item handler is no longer a spread stub on Compose');
+  const androidSpreadWarnings = (android.warnings ?? []).filter((w) => /Index.*spread/.test(w));
+  assert(androidSpreadWarnings.length === 0, `no Compose handler on the index page stubs on spread (${androidSpreadWarnings.length})`);
+  // R126: `throw new Error(...)` used to be refused as `new`; rewriteThrowNew
+  // turns it into the kit's roseThrow, so the boundary widget throws for real.
+  assert(kIndex.includes('roseThrow("weather service unreachable")'), 'Compose rewrites throw new Error into the kit roseThrow');
+  assert(!(android.warnings ?? []).some((w) => /Index.*uses new/.test(w)), 'no Compose handler on the index page stubs on `new`');
+  // R129: the guestbook submit handler used to stub on FormData. The shared
+  // rewriteFormReads turns it into the (typed) bound state read and strips the web
+  // event bookkeeping, so it compiles - with Compose's isNotEmpty emptiness test.
+  assert(kIndex.includes('var guest = (name).trim();') && kIndex.includes('if (guest.isNotEmpty()) guests = listOf(guest) + (guests as List<Any?>);'), 'Compose runs the guestbook submit handler through the form channel');
+  assert(!(android.warnings ?? []).some((w) => /Index.*FormData/.test(w)), 'the guestbook handler is no longer a FormData stub on Compose');
+
+  // 13e. R106: the Sign page end to end on a desktop build. A form with no
+  // on:submit posts to the page's exported action; the action runs locally
+  // (no backend), reads its inputs through the state keys the widgets bind
+  // to, and writes the keyed store through the mapper channel.
+  const jSign = jread(`${japp}/pages/SignPage.java`);
+  assert(jSign.includes('RoseTheme.button(panel7, "Sign", new RoseTheme.Style(16, "#222222", null, 8, false, "left", "SansSerif", "", 0).pad(8, 16, 8, 16).margin(0, 8, 0, 0), event -> { action(app); app.render(); })'), 'a submit button in an action form runs the action');
+  assert(jSign.includes('roseThrow("A signature needs a name.", 422, "name")'), 'throw new ActionError becomes the kit throw');
+  assert(jSign.includes('var name = RoseTheme.text(app.v("name")).trim();'), 'an action reads its form field through the bound state key');
+  assert(jSign.includes('app.set("guests", RoseTheme.concat(RoseTheme.list(name), RoseTheme.list(app.v("guests"))))'), 'store.update prepends through the mapper channel');
+  assert(!jSign.includes('$actionError'), 'no $actionError call survives into Java');
+  assert(!jSign.includes('??'), 'no nullish coalescing survives into Java');
+  const cSign = cread('src/pages/SignPage.cpp');
+  assert(cSign.includes('roseThrow("A signature needs a name.", 422, "name")'), 'Qt throws the ActionError through the kit');
+  assert(!cSign.includes('$actionError'), 'no $actionError call survives into C++');
+  const nSign = nread('Pages/SignPage.cs');
+  assert(nSign.includes('RoseTheme.Concat(RoseTheme.List(name), RoseTheme.List(app.V("guests")))'), 'WPF prepends through the mapper channel');
+  assert(!nSign.includes('$actionError'), 'no $actionError call survives into C#');
+  const pySignPage = pread('pages/sign.py');
+  assert(pySignPage.includes('if not name:' + String.fromCharCode(10) + '            roseThrow('), 'Tk renders the action guard as a Python block');
+  assert(pySignPage.includes("st['guests'] = [*[name], *st.get('guests')]"), 'Tk prepends through the mapper channel');
+  assert(pySignPage.includes('name = (st.get(\'name\')).strip()'), 'Tk reads the form field through the bound state key');
+  assert(!pySignPage.includes('$formRead'), 'no $formRead marker survives into Python');
+  assert(!pySignPage.includes('store.likes'), 'no dot member access on a Python dict bind');
+
+  // 13f. R107: the same form channel on the mobile targets - a named input
+  // binds to its name, a submit button posts to the page's action, and
+  // $actionError() has no mobile state, so it maps to null instead of leaking.
+  const mSign = fread('lib/pages/sign.dart');
+  assert(mSign.includes("roseInputField(") && mSign.includes("(value) => __set('name', value)"), 'Flutter binds a named form input to its state key');
+  assert(mSign.includes("ElevatedButton(onPressed: () => __runAction('action')"), 'a Flutter submit button posts to the page action');
+  assert(!mSign.includes('$actionError'), 'no $actionError call survives into Dart');
+  const eSign = aread('entry/src/main/ets/pages/SignPage.ets');
+  assert(eSign.includes(".onChange((value: string) => { this.name = value; })"), 'ArkTS binds a named form input to its state key');
+  assert(eSign.includes('onClick(() => { this.action(); })'), 'an ArkTS submit button calls the page action');
+  assert(!eSign.includes('$actionError'), 'no $actionError call survives into ArkTS');
+  const sSign = xread('rosezmApp/Pages/SignView.swift');
+  assert(sSign.includes('Binding(get: { name }, set: { name = $0 })'), 'SwiftUI binds a named form input to its state key');
+  assert(!sSign.includes('$actionError'), 'no $actionError call survives into Swift');
+  const kSign = readFileSync(join(kdir, 'app/src/main/java/dev/rosezm/app/pages/SignPage.kt'), 'utf8');
+  assert(kSign.includes('onValueChange = { name = it }'), 'Compose binds a named form input to its state key');
+  assert(kSign.includes('Button(onClick = () -> action()'), 'a Compose submit button calls the page action');
+  assert(!kSign.includes('$actionError'), 'no $actionError call survives into Kotlin');
+  // The Kotlin lambda arrow: this emitter once produced the JS `() =>`, which
+  // does not compile - every on:click button in every Android export was wrong.
+  assert(!/\(\) =>/.test(kSign), 'no JS arrow survives into Kotlin');
+  // The shell's own button rule now reaches the element (a tag rule is part of
+  // the cascade), so the handler arrow rides with the shell's box: padding and
+  // margin, exactly as the web build paints it.
+  assert(kIndex.includes('Button(onClick = () -> increment(), colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent), modifier = Modifier.padding(start = 0.dp, top = 0.dp, end = 8.dp, bottom = 0.dp).padding(horizontal = 16.dp, vertical = 8.dp))'), 'a Kotlin button handler uses the language lambda arrow');
+
+  // 13g. R111: {#boundary} degrades like the web - the subtree runs and a
+  // throw renders the fallback text instead of killing the page. The seven
+  // statement-shaped targets get a real try/catch; Flutter (a widget expression
+  // tree) wraps its builder in the roseBoundary helper - see R138.
+  const BOUNDARY_TEXT = 'This section failed to render.';
+  for (const [name, body] of [['Java', jIndex], ['C++', cread('src/pages/IndexPage.cpp')], ['C#', nread('Pages/IndexPage.cs')], ['Tk', pread('pages/index.py')], ['Swift', xread('rosezmApp/Pages/IndexView.swift')], ['Compose', kIndex], ['ArkTS', aread('entry/src/main/ets/pages/IndexPage.ets')]] as Array<[string, string]>) {
+    assert(body.includes(BOUNDARY_TEXT), `${name} renders the boundary fallback text`);
+    assert(!new RegExp(name === 'Tk' ? 'boundary\} fallback is content only' : 'boundary\} fallback is content only').test(body), `${name} no longer warns the boundary is content-only`);
+  }
+  assert(jIndex.includes('} catch (Exception __roseBoundary) {'), 'Java wraps the boundary subtree in a try/catch');
+  assert(pyIndex.includes('    except Exception:' + String.fromCharCode(10) + '        tk.Label('), 'Tk wraps the boundary subtree in a try/except with an indented arm');
+  assert(xIndex.includes('do {') && xIndex.includes('} catch {'), 'Swift wraps the boundary subtree in a do/catch');
+  assert(kIndex.includes('try {') && /catch \(e: Exception\)/.test(kIndex), 'Compose wraps the boundary subtree in a try/catch');
+  // R138: Flutter's boundary is a real one too - the builder runs inside the
+  // roseBoundary helper's try, so a throwing widget degrades to the fallback.
+  assert(indexDart.includes(BOUNDARY_TEXT) && /\.\.\.roseBoundary\(\(\) => \[/.test(indexDart), 'Flutter renders the boundary fallback through the roseBoundary helper');
+  assert(fread('lib/rosezm.dart').includes('List<Widget> roseBoundary('), 'the Flutter kit defines the roseBoundary helper');
+  assert(!(flutter.warnings ?? []).some((w) => /boundary/.test(w)), 'Flutter no longer warns the boundary is content-only');
+
+  const jDocs = jread(`${japp}/pages/DocsPage.java`);
+  const jKit = jread(`${japp}/RoseTheme.java`);
+  const cDocs = cread('src/pages/DocsPage.cpp');
+  const cKit = cread('src/rose.cpp');
+  // 13h. R113: {@html} renders as MARKUP where the platform has a native
+  // rich-text widget - a format translation, not a degradation.
+  const wDocs = readFileSync(join(result.outDir, 'pages', 'docs', 'docs.wxml'), 'utf8');
+  assert(wDocs.includes('<rich-text nodes="{{') && wDocs.includes('}}"></rich-text>'), 'WXML renders trusted markup through the native rich-text component');
+  assert(!wDocs.includes('{@html'), 'no Rose html syntax survives into WXML');
+  assert(jDocs.includes('RoseTheme.htmlLabel('), 'Swing renders trusted markup through a JLabel html label');
+  assert(jKit.includes('public static JLabel htmlLabel('), 'the Java kit carries the html label helper');
+  assert(cDocs.includes('rose_html_label('), 'Qt renders trusted markup through a rich-text QLabel');
+  assert(cKit.includes('QLabel* rose_html_label(') && cKit.includes('Qt::RichText'), 'the C++ kit carries the rich-text label helper');
+  assert(!(java.warnings ?? []).some((w) => /java: \{@html/.test(w)), 'Java no longer warns that html degrades to text');
+  assert(!(cpp.warnings ?? []).some((w) => /cpp: \{@html/.test(w)), 'C++ no longer warns that html degrades to text');
+  assert(!(result.warnings ?? []).some((w) => /mini program renders it as text/.test(w)), 'the mini program no longer warns that html renders as text');
+  // The platforms without a native rich widget keep the honest warning.
+
+  const xKit = xread('rosezmApp/Kit/RoseTheme.swift');
+  const xDocs = xread('rosezmApp/Pages/DocsView.swift');
+  const nKit = nread('RoseTheme.cs');
+  const fKit = fread('lib/rosezm.dart');
+  const kKit = kread('app/src/main/java/dev/rosezm/app/kit/RoseKit.kt');
+  const kDocs = kread('app/src/main/java/dev/rosezm/app/pages/DocsPage.kt');
+  const aKit = aread('entry/src/main/ets/kit/RoseKit.ets');
+  const pKit = pread('rosezm.py');
+  const fDefer = fread('lib/pages/defer_demo.dart');
+  const xDeferDemo = xread('rosezmApp/Pages/DeferDemoView.swift');
+  const kDeftest = kread('app/src/main/java/dev/rosezm/app/pages/DeftestPage.kt');
+  const xDeftest = xread('rosezmApp/Pages/DeftestView.swift');
+  const cDeftest = cread('src/pages/DeftestPage.cpp');
+  const nDeftest = nread('Pages/DeftestPage.cs');
+
+
+  const jTheme = jread('src/main/java/dev/rosezm/app/RoseTheme.java');
+  const nTheme = nread('RoseTheme.cs');
+  const cTheme = cread('src/rose.h');
+  // R123: the desktop trio gains the same per-page scoping and the border.
+  assert(jTheme.includes('"rcard__Index"') && jTheme.includes('"rcard__About"'), 'Swing scopes the style classes per page');
+  assert(jTheme.includes('"#e91e63", 4') && jTheme.includes('new javax.swing.border.LineBorder'), 'Swing draws the border with its own colour and width');
+  assert(nTheme.includes('"rcard__Index"') && nTheme.includes('public string? BorderColor;') && nTheme.includes('public double[]? BorderWidth;'), 'WPF scopes the style classes per page and carries the border');
+  assert(cTheme.includes('"rcard__Index"') && cKit.includes('"border: " + std::to_string(style.border_width) + "px solid #" + style.border_color + ";"'), 'Qt draws the border through a style sheet built from the resolved model');
+  assert(!jTheme.includes('"rcard",') && !nTheme.includes('["rcard"],') && !cTheme.includes('{"rcard",'), 'no target keeps an unscoped style table entry');
+  assert(pKit.includes('def rose_button(parent, text, command, cls=') && pKit.includes("'cursor': 'hand2'") && pKit.includes("'activebackground': '#e91e63'"), 'the Tk kit styles its buttons: padding, cursor, active colours');
+  assert(pKit.includes('def rose_entry(parent, cls=') && pKit.includes("'relief': 'sunken'"), 'the Tk kit styles its text fields with the base font');
+  assert(/rose_button\(__f\d+_\d+, "Increment", increment, '', \{"font": \('Segoe UI', 11\), "padx": 16, "pady": 8\}\)/.test(pyIndex), 'a generated button routes through the styled kit helper with the shell button padding (0.5rem/1rem)');
+  assert(!/tk\.Button\([^)]*\)\.pack/.test(pyIndex.replace(/rose_button\([^)]*\)\.pack/g, '')), 'no unstyled bare tk.Button survives on the home page');
+  assert(pyIndex.includes('from rosezm import roseThrow, rose_text, rose_button, rose_entry, rose_html_label'), 'the generated page imports the kit helpers it uses');
+  // R121: `$derived` is live - a read re-evaluates its expression. Four
+  // targets consumed ctx.derivedExprs without ever populating it, so the read
+  // fell through to a name no declaration defined (uncompilable Kotlin/Swift).
+  assert(kDeftest.includes('Text("${(n * n)}")'), 'a Kotlin derived read is the inline expression, re-evaluated');
+  assert(xDeftest.includes('Text("\\((n * n))")'), 'a Swift derived read is the inline expression, re-evaluated');
+  assert(cDeftest.includes('rose_label(panel5, rose_str((app.v("n") * app.v("n")))'), 'a C++ derived read is the inline expression, re-evaluated');
+  assert(nDeftest.includes('RoseTheme.Str((RoseTheme.Int(app.V("n"))') && nDeftest.includes('* RoseTheme.Int(app.V("n"))))'), 'a C# derived read is the inline expression, re-evaluated');
+  assert(!kDeftest.includes('"${sq}"') && !xDeftest.includes('\(sq)'), 'no target references the derived name as an undefined variable');
+  const aDocs = aread('entry/src/main/ets/pages/DocsPage.ets');
+  const fDocs = fread('lib/pages/docs.dart');
+  const nDocs = nread('Pages/DocsPage.cs');
+  // 13i. R114: the remaining rich-text platforms get a RUNTIME parser - the
+  // html value is a string, so the spans are built where the app runs.
+  assert(xKit.includes('struct RoseHtmlText: View') && xKit.includes('NSAttributedString.DocumentType.html'), 'the SwiftUI kit parses trusted markup through the platform HTML reader');
+  assert(xDocs.includes('RoseHtmlText(html:'), 'SwiftUI renders trusted markup as attributed text');
+  assert(nKit.includes('public static TextBlock HtmlLabel(') && nKit.includes('TextDecorations.Underline'), 'the WPF kit parses the inline HTML subset into real Inlines');
+  assert(nDocs.includes('RoseTheme.HtmlLabel('), 'WPF renders trusted markup as Inlines');
+  assert(!(xcode.warnings ?? []).some((w) => /xcode: \{@html/.test(w)), 'Xcode no longer warns that html degrades to text');
+  assert(!(dotnet.warnings ?? []).some((w) => /dotnet: \{@html/.test(w)), 'WPF no longer warns that html degrades to text');
+  assert(fKit.includes('Widget roseHtml(String html)') && fKit.includes('Text.rich(TextSpan(children: spans))'), 'the Flutter kit parses trusted markup into a Text.rich span tree');
+  assert(fDocs.includes('roseHtml('), 'Flutter renders trusted markup as rich spans');
+  assert(fKit.includes('String roseDecodeEntities(') && fKit.includes('quot'), 'the Flutter kit decodes the HTML entities a content page uses');
+  assert(!(flutter.warnings ?? []).some((w) => /flutter: \{@html/.test(w)), 'Flutter no longer warns that html degrades to text');
+  assert(kKit.includes('fun roseHtml(html: String): AnnotatedString = buildAnnotatedString {') && kKit.includes('withStyle(style()) { append(buffer.toString()) }'), 'the Compose kit parses trusted markup into a styled AnnotatedString');
+  assert(kDocs.includes('Text(roseHtml('), 'Compose renders trusted markup as styled spans');
+  assert(!(android.warnings ?? []).some((w) => /android: \{@html/.test(w)), 'Compose no longer warns that html degrades to text');
+  assert(aKit.includes('export function roseHtmlSpans(html: string): rosezmSpan[]') && aKit.includes('export interface rosezmSpan'), 'the ArkTS kit parses trusted markup into styled spans');
+  assert(aDocs.includes('ForEach(roseHtmlSpans(') && aDocs.includes('.fontWeight(span.bold ? FontWeight.Bold : FontWeight.Normal)'), 'ArkUI renders trusted markup through a styled ForEach');
+  assert(!(arkts.warnings ?? []).some((w) => /arkts: \{@html/.test(w)), 'ArkTS no longer warns that html degrades to text');
+  // Every target now renders trusted markup as markup - the last honest
+  // warning is gone, which is the point of the whole arc.
+  const htmlWarnings = [...(result.warnings ?? []), ...(flutter.warnings ?? []), ...(python.warnings ?? []), ...(arkts.warnings ?? []), ...(android.warnings ?? []), ...(xcode.warnings ?? []), ...(java.warnings ?? []), ...(dotnet.warnings ?? []), ...(cpp.warnings ?? [])].filter((w) => /\{@html/.test(w));
+  assert(htmlWarnings.length === 0, `no export target still degrades trusted markup (${htmlWarnings.slice(0, 2).join(' | ')})`);
+
+  // R139-R142: a <select multiple> is a real multi-select on ALL TEN targets now
+  // - mini program (checkbox-group), Compose/Flutter (toggling checkboxes), the
+  // four desktop targets (native multi-selection lists, R141), and Swift/ArkTS
+  // (toggling buttons/checkbox Toggles, R142). No target silently collapses the
+  // array to a scalar any more, and none needs to warn about it.
+  const multiWarn = [...(result.warnings ?? []), ...(flutter.warnings ?? []), ...(python.warnings ?? []), ...(arkts.warnings ?? []), ...(android.warnings ?? []), ...(xcode.warnings ?? []), ...(java.warnings ?? []), ...(dotnet.warnings ?? []), ...(cpp.warnings ?? [])].filter((w) => /<select multiple>/.test(w));
+  assert(multiWarn.length === 0, `no target warns about <select multiple> any more - all ten render it (${multiWarn.length})`);
+  // R161: `{name() || 'stranger'}` is JS truthiness. Kotlin, ArkTS, Swift, Java,
+  // C# and C++ have no truthy String, so the fallback must become an emptiness
+  // test - it used to be emitted raw, which is a hard compile error in each of
+  // those languages. Dart and the mini programs are JavaScript-semantics targets
+  // and keep the operator verbatim.
+  assert(kread('app/src/main/java/dev/rosezm/app/pages/BindDemoPage.kt').includes('Text("Hello ${(if (name.toString().isNotEmpty()) name else "stranger")}!")'), 'Kotlin renders a JS || fallback as an emptiness test');
+  assert(kread('app/src/main/java/dev/rosezm/app/pages/BindDemoPage.kt').includes('Text("Last key: ${(if (lastKey.toString().isNotEmpty()) lastKey else "none")}")'), 'Kotlin rewrites a bare-state || fallback too');
+  assert(kread('app/src/main/java/dev/rosezm/app/pages/BindDemoPage.kt').includes('Text("Colors: ${(if (roseJoin(colors, ", ").toString().isNotEmpty()) roseJoin(colors, ", ") else "none")}")'), 'Kotlin rewrites a member-call || fallback too');
+  assert(aread('entry/src/main/ets/pages/BindDemoPage.ets').includes("Text(`Hello ${(this.name !== '' && this.name !== null) ? this.name : 'stranger'}!`)"), 'ArkTS renders a JS || fallback as an emptiness test');
+  // R162: the hand-written ArkTS kit is generated source too, and ArkTS has
+  // neither `typeof` nor `Array.isArray` - both were compile errors in the
+  // HarmonyOS project. They are now instanceof tests.
+  const arkKit = aread('entry/src/main/ets/kit/RoseKit.ets');
+  assert(!/\btypeof\s+\w/.test(arkKit.replace(/^\s*\/\/.*$/gm, '')), 'the ArkTS kit uses no typeof');
+  assert(!/Array\.isArray/.test(arkKit.replace(/^\s*\/\/.*$/gm, '')), 'the ArkTS kit uses no Array.isArray');
+  assert(/if \(value instanceof Boolean\) return value\.valueOf\(\);/.test(arkKit), 'roseBool tests a boolean with instanceof');
+  assert(/return value instanceof Array \? \(value as Object\[\]\) : \[\];/.test(arkKit), 'roseListOf tests an array with instanceof');
+  assert(xread('rosezmApp/Pages/BindDemoView.swift').includes('Text("Hello \\(!(name).isEmpty ? name : "stranger")!")'), 'Swift renders a JS || fallback as an emptiness test');
+  assert(jread('src/main/java/dev/rosezm/app/pages/BindDemoPage.java').includes('RoseTheme.text(!RoseTheme.text(RoseTheme.text(app.v("name"))).isEmpty() ? RoseTheme.text(app.v("name")) : "stranger")'), 'Java renders a JS || fallback as an emptiness test');
+  assert(nread('Pages/BindDemoPage.cs').includes('RoseTheme.Str(!string.IsNullOrEmpty(RoseTheme.Str(RoseTheme.Str(app.V("name")))) ? RoseTheme.Str(app.V("name")) : "stranger")'), 'C# renders a JS || fallback as an emptiness test');
+  assert(cread('src/pages/BindDemoPage.cpp').includes('rose_str((rose_bool(!rose_str(app.v("name")).empty()) ? app.v("name") : "stranger"))'), 'C++ renders a JS || fallback as an emptiness test');
+  assert(fread('lib/pages/bind_demo.dart').includes("name.isNotEmpty ? name : 'stranger'") === false && fread('lib/pages/bind_demo.dart').includes("name || 'stranger'"), 'Dart keeps JS || - its own truthiness already means empty');
+  // R146: $persist is a real primitive on the mini program (wx storage); the
+  // other nine have no local storage for it and now say so, rather than
+  // silently behaving as plain $state while the page promises persistence.
+  const persistWarns = [...(result.warnings ?? []), ...(flutter.warnings ?? []), ...(python.warnings ?? []), ...(arkts.warnings ?? []), ...(android.warnings ?? []), ...(xcode.warnings ?? []), ...(java.warnings ?? []), ...(dotnet.warnings ?? []), ...(cpp.warnings ?? [])].filter((w) => /\$persist\("theme"\) has no local storage/.test(w));
+  assert(persistWarns.length === 0, `every target now has a real $persist store - none warn any more (${persistWarns.length})`);
+  // R165: `__rosezmContent` is a server-side bridge over the markdown collections
+  // on disk. A client target has neither, so a page that reads it used to emit an
+  // unresolved identifier - a ReferenceError in the mini program and a compile
+  // error everywhere else. Every target now says so, and the reads resolve to an
+  // empty collection so the page still loads.
+  {
+    const so = await import('../src/export/state-ops.js') as Record<string, unknown>;
+    const serverOnlyGlobals = so.serverOnlyGlobals as ((s: string) => string[]) | undefined;
+    assert(typeof serverOnlyGlobals === 'function', 'state-ops exports serverOnlyGlobals');
+    assert(serverOnlyGlobals!("const p = globalThis.__rosezmContent.list('posts');").join(',') === '__rosezmContent', 'a server-only global read is detected');
+    const neutralize = so.neutralizeServerGlobals as ((c: string, e: string) => string) | undefined;
+    assert(neutralize!("globalThis.__rosezmContent.list('posts')", '[]') === '[]', 'the whole server-global read is consumed, not just its name');
+    assert(neutralize!("globalThis.__rosezmExtras.v.x", '[]') === '[]', 'a member chain with no call is consumed too');
+    const all = [...(result.warnings ?? []), ...(flutter.warnings ?? []), ...(python.warnings ?? []), ...(arkts.warnings ?? []), ...(android.warnings ?? []), ...(xcode.warnings ?? []), ...(java.warnings ?? []), ...(dotnet.warnings ?? []), ...(cpp.warnings ?? [])];
+    // R167: every page-emitting target now *bakes* the collections and says so,
+    // rather than warning that they resolve empty.
+    const bakedWarns = all.filter((w) => /__rosezmContent reads the content collections, baked/.test(w));
+    assert(bakedWarns.length >= 9, `every page-emitting target reports the baked content collections (${bakedWarns.length})`);
+    assert(!all.some((w) => /__rosezmContent is a server-side bridge/.test(w)), 'no target still reports the collections as absent when they are baked');
+    // And each target emits the bridge into its own kit, in its own language.
+    const kitAt = (rel: string) => readFileSync(join(({ python: pdir, java: jdir, dotnet: ndir, cpp: cdir, xcode: xcode.outDir, android: android.outDir, arkts: arkts.outDir, flutter: flutter.outDir } as Record<string, string>)[rel.split('/')[0]] ?? '', rel.split('/').slice(1).join('/')), 'utf8');
+    for (const [name, kit, needle] of [
+      ['android', 'android/app/src/main/java/dev/rosezm/app/kit/RoseKit.kt', 'fun roseContentList('],
+      ['arkts', 'arkts/entry/src/main/ets/kit/RoseKit.ets', 'export function roseContentList('],
+      ['xcode', 'xcode/rosezmApp/Kit/RoseKit.swift', 'func roseContentList('],
+      ['flutter', 'flutter/lib/rosezm.dart', 'roseContentList('],
+      ['cpp', 'cpp/src/rose.h', 'roseContentList('],
+      ['java', 'java/src/main/java/dev/rosezm/app/RoseKit.java', 'roseContentList('],
+      ['dotnet', 'dotnet/RoseKit.cs', 'RoseContentList('],
+    ] as const) {
+      const txt = kitAt(kit).replace(/\\"/g, '"');
+      assert(txt.includes(needle), `${name} ships the content bridge in its kit`);
+      assert(txt.includes('"posts"') && txt.includes('"slug":"hello"'), `${name} bakes the real collection data`);
+    }
+    // R170: the mini program had three separate places a rune could arrive - the
+  // script body, an inline handler and a computed expression - and only the first
+  // had the full pass. `{#if $actionError()}` therefore survived as a raw
+  // ReferenceError, `$store(...)` was left as a dead declaration, and a state
+  // initializer that read `$query()` leaked it into the page data. The kit now
+  // owns one mapping the three paths share, and no generated JS may contain a
+  // raw rune at all.
+  {
+    const RUNES = [/\$state\s*\(/, /\$derived\s*\(/, /\$effect\s*\(/, /\$data\s*\(/, /\$kv\s*\(/, /\$persist\s*\(/, /\$query\s*\(/, /\$store\b/, /\$cookies\s*\(/, /\$sessionCookie\s*\(/, /\$actionPending\s*\(/, /\$actionError\s*\(/, /\$setState\s*\(/, /\$action\s*\(/, /\$t\s*\(/, /new ActionError/];
+    const jsFiles: string[] = [];
+    const walkAll = (d: string): void => {
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        const p = join(d, e.name);
+        if (e.isDirectory()) walkAll(p);
+        else if (e.name.endsWith('.js')) jsFiles.push(p);
+      }
+    };
+    walkAll(result.outDir);
+    assert(jsFiles.length > 30, `the mini program emits JS for every page (${jsFiles.length} files)`);
+    const leaks: string[] = [];
+    for (const f of jsFiles) {
+      const txt = readFileSync(f, 'utf8');
+      for (const re of RUNES) if (re.test(txt)) leaks.push(`${f.split(/[\\/]/).pop()}: ${re}`);
+    }
+    assert(leaks.length === 0, `no generated JS contains a raw framework rune (${leaks.slice(0, 3).join('; ')})`);
+    assert(read('utils/rosezm.js').includes('function roseThrow(message)'), 'the kit ships roseThrow');
+    assert(read('utils/rosezm.js').includes('module.exports = { rosePage, setApiBase, getApiBase, installFormData, roseThrow, __rosezmConfirm, __rosezmAlert, __rosezmPrompt, __rosezmOpen, __rosezmNative }'), 'the kit exports roseThrow, the dialog helpers and the native capability bridge');
+    // R258: the kit helpers ride along only when the page's script names them
+  // (a page that never asks for a camera does not import the camera bridge).
+  assert(read('pages/sign/sign.js').includes('const { rosePage, roseThrow, getApiBase } = require'), 'a page that throws an ActionError imports roseThrow');
+    assert(read('pages/sign/sign.js').includes('roseThrow("The guestbook is full'), 'the action guard maps onto roseThrow');
+    assert(!/\$store\s*\(/.test(read('pages/sign/sign.js')), 'the dead $store declaration is dropped');
+  }
+  // R171: `??` was never rewritten anywhere. Swift, C# and Dart have it natively
+  // so they were fine by luck; Kotlin, Java, C++ and ArkTS do not, so
+  // `deftest.rose`'s `{numv() ?? 'empty'}` and `search.rose`'s
+  // `$state($query().q ?? '')` each emitted a raw `??` - a compile error. It had
+  // to be fixed in both the expression path and the state-initializer path,
+  // because a state initializer does not go through the expression translator.
+  {
+    const so = await import('../src/export/state-ops.js') as Record<string, unknown>;
+    const rn = so.rewriteNullish as ((c: string, s: (l: string, r: string) => string) => string) | undefined;
+    assert(typeof rn === 'function', 'state-ops exports rewriteNullish');
+    assert(rn!('a ?? b', (l, r) => `${l} ?: ${r}`) === 'a ?: b', 'a bare operand and a bare fallback');
+    assert(rn!("a ?? 'x'", (l, r) => `${l} ?: ${r}`) === "a ?: 'x'", 'a string fallback');
+    assert(rn!('f() ?? g()', (l, r) => `${l} ?: ${r}`) === 'f() ?: g()', 'a call on either side');
+    assert(rn!('a.b ?? c.d', (l, r) => `${l} ?: ${r}`) === 'a.b ?: c.d', 'a member read on either side');
+    assert(rn!('a ?? b ?? c', (l, r) => `${l} ?: ${r}`) === 'a ?: b ?: c', 'a chain rewrites left to right (Kotlin)');
+    assert(rn!('a ?? b ?? c', (l, r) => `(${l} != null ? ${l} : ${r})`) === '((a != null ? a : b) != null ? (a != null ? a : b) : c)', 'a chain rewrites left to right (Java)');
+    assert(!rn!('a ?? b ?? c', (l, r) => `(${l} != null ? ${l} : ${r})`).includes('??'), 'no ?? survives a chain rewrite');
+    const noNullish: Record<string, string> = {
+      'android/app/src/main/java/dev/rosezm/app/pages/DeftestPage.kt': android.outDir,
+      'java/src/main/java/dev/rosezm/app/pages/DeftestPage.java': java.outDir,
+      'cpp/src/pages/DeftestPage.cpp': cpp.outDir,
+      'arkts/entry/src/main/ets/pages/DeftestPage.ets': arkts.outDir,
+    };
+    for (const [rel, dir] of Object.entries(noNullish)) {
+      const txt = readFileSync(join(dir, rel.split('/').slice(1).join('/')), 'utf8');
+      assert(!/\?\?/.test(txt), `${rel.split('/')[0]} leaves no raw ?? in the page`);
+    }
+    assert(readFileSync(join(cpp.outDir, 'src/pages/SearchPage.cpp'), 'utf8').includes('rose_is_null('), 'C++ spells nullish through the kit helper');
+    assert(readFileSync(join(cpp.outDir, 'src/rose.h'), 'utf8').includes('bool rose_is_null('), 'the C++ kit ships rose_is_null');
+    assert(readFileSync(join(java.outDir, 'src/main/java/dev/rosezm/app/pages/DeftestPage.java'), 'utf8').includes('!= null ?'), 'Java spells nullish as a ternary');
+    assert(readFileSync(join(android.outDir, 'app/src/main/java/dev/rosezm/app/pages/DeftestPage.kt'), 'utf8').includes('?:'), 'Kotlin spells nullish as ?:');
+    assert(readFileSync(join(arkts.outDir, 'entry/src/main/ets/pages/DeftestPage.ets'), 'utf8').includes('!== null ?'), 'ArkTS spells nullish as a comparison');
+  }
+  // R172: two-way component binding is the most sophisticated contract in the
+  // framework - `bind:checked={subscribed}` at the call site, `export let
+  // checked` in the component, and an inferred onCheckedChange that writes back.
+  // Every structural assertion passes whether or not the write-back exists, so
+  // the only proof that counts is executing the generated page and watching the
+  // page state move.
+  {
+    const cbSandbox: any = baseGlobals();
+    cbSandbox.globalThis = cbSandbox;
+    let cbDef: any = null;
+    cbSandbox.Page = (d: any) => { cbDef = d; };
+    cbSandbox.require = (p: string) => (p.endsWith('content.json') ? JSON.parse(readFileSync(join(dir, 'data/content.json'), 'utf8')) : runtime);
+    createContext(cbSandbox);
+    // Each mini-program module gets its own scope, so the page is loaded through
+    // a wrapper function rather than at the context's top level.
+    const wrapper = runInContext(`(function (module, require, globalThis) { ${readFileSync(join(dir, 'pages/bind-demo/bind-demo.js'), 'utf8')}\n return module.exports; })`, cbSandbox) as (m: unknown, r: unknown, g: unknown) => unknown;
+    wrapper({ exports: {} }, cbSandbox.require, cbSandbox);
+    assert(!!cbDef, 'the bind-demo page registered a definition');
+    const page2 = Object.assign({}, cbDef);
+    page2.data = JSON.parse(JSON.stringify(cbDef.data ?? {}));
+    page2.setData = function (patch: any) { Object.assign(this.data, patch); };
+    page2.onLoad({});
+    assert(page2.data.subscribed === false, 'the bound checkbox starts from the page state');
+    assert(typeof page2.__bp1 === 'function', 'the checkbox has a change handler');
+    page2.__bp1.call(page2, { detail: true });
+    assert(page2.data.subscribed === true, 'checking the box writes back to the page state');
+    page2.__bp1.call(page2, { detail: false });
+    assert(page2.data.subscribed === false, 'unchecking the box writes back too');
+  }
+  // R173/R124: `{#defer}` is a streaming primitive - the web build flushes a
+  // placeholder and the content arrives later. R173 closed the gap the honest
+  // way (warn on the targets that could not honour it); R124 closed it for real.
+  // Every target now has a timer of its own: setTimeout on the mini programs and
+  // ArkUI, Future.delayed / Task.sleep / LaunchedEffect on Flutter / SwiftUI /
+  // Compose, a one-shot Swing DispatcherTimer Qt QTimer and Tk after() on the
+  // desktop kits. Each one flips a flag that starts false, so the block renders
+  // exactly when the hold elapses - and the "renders immediately" warning is
+  // gone from every emitter, because nothing renders immediately any more.
+  {
+    const so = await import('../src/export/state-ops.js') as Record<string, unknown>;
+    const db = so.deferBlocks as ((n: Array<Record<string, any>>) => Array<{ hold: number }>) | undefined;
+    assert(typeof db === 'function', 'state-ops exports deferBlocks');
+    assert(db!([{ kind: 'block', name: 'defer', head: 'hold=50', children: [] }]).length === 1, 'a top-level defer block is found');
+    assert(db!([{ kind: 'block', name: 'if', branches: [{ children: [{ kind: 'block', name: 'defer', head: 'hold=10', children: [] }] }] }]).length === 1, 'a nested defer block is found');
+    assert(db!([{ kind: 'element', children: [] }]).length === 0, 'a page with no defer block reports none');
+    // The mini program defers for real.
+    assert(read('pages/defer-demo/defer-demo.js').includes('__dfr0'), 'the mini program emits a defer flag');
+    assert(read('pages/defer-demo/defer-demo.js').includes('defers: [{'), 'the mini program passes the holds to the page');
+    assert(!(result.warnings ?? []).some((w) => /defer hold=/.test(w)), 'the mini program does not warn - it implements the deferral');
+    // No target warns any more: the deferral is implemented everywhere.
+    const allWarnings = [
+      ...(result.warnings ?? []), ...(flutter.warnings ?? []), ...(python.warnings ?? []),
+      ...(arkts.warnings ?? []), ...(android.warnings ?? []), ...(xcode.warnings ?? []),
+      ...(java.warnings ?? []), ...(dotnet.warnings ?? []), ...(cpp.warnings ?? []),
+    ];
+    assert(!allWarnings.some((w) => /defer hold=/.test(w)), `no target warns about {#defer} any more (${allWarnings.filter((w) => /defer hold=/.test(w)).length})`);
+    // Flutter and SwiftUI flip the block in on a timer: the client-side
+    // equivalent of the web's placeholder swap.
+    assert(fDefer.includes('bool __defer0 = false;') && fDefer.includes('Future.delayed(Duration(milliseconds: 50)'), 'the Flutter page flips its defer flag after the hold');
+    assert(xDeferDemo.includes('@State private var __defer0: Bool = false') && xDeferDemo.includes('Task.sleep(nanoseconds: UInt64(50)'), 'the SwiftUI page flips its defer flag after the hold');
+    // R124: the same contract on the five targets that used to warn. Each arms
+    // its own toolkit's timer with the block's hold, under an `armed` key where
+    // the page rebuilds on every render (build() re-running must not arm a fresh
+    // timer each time - that is a render storm at the hold interval, forever).
+    const rd = (rel: string, base: string) => readFileSync(join(base, rel), 'utf8');
+    const pyDefer = rd('pages/defer_demo.py', python.outDir);
+    assert(pyDefer.includes('__DEFER_ARMED') && pyDefer.includes("if '__defer0' not in __DEFER_ARMED"), 'the Tk page arms its defer timer once, guarded against re-render');
+    assert(pyDefer.includes('app.after(50,'), 'the Tk page schedules its defer through app.after with the block hold');
+    // The Tk root IS the app (RoseApp subclasses tk.Tk), so a `app.root.after`
+    // would raise AttributeError on first build - the smoke test drives this.
+    assert(!pyDefer.includes('app.root.'), 'the Tk page never reaches through a nonexistent .root handle');
+    const javaDefer = rd('src/main/java/dev/rosezm/app/pages/DeferDemoPage.java', java.outDir);
+    assert(javaDefer.includes('state.putIfAbsent("__defer0", Boolean.FALSE)'), 'the Swing page seeds its defer flag as state');
+    assert(javaDefer.includes('new javax.swing.Timer(50,'), 'the Swing page arms a one-shot javax.swing.Timer with the hold');
+    assert(javaDefer.includes('"__defer0__armed"'), 'the Swing timer is armed under a guard, once per page');
+    const netDefer = rd('Pages/DeferDemoPage.cs', dotnet.outDir);
+    assert(netDefer.includes('state.TryAdd("__defer0", false)'), 'the WPF page seeds its defer flag as state');
+    assert(netDefer.includes('DispatcherTimer()') && netDefer.includes('TimeSpan.FromMilliseconds(50)'), 'the WPF page arms a DispatcherTimer with the hold');
+    assert(netDefer.includes('"__defer0__armed"'), 'the WPF timer is armed under a guard, once per page');
+    const cppDefer = rd('src/pages/DeferDemoPage.cpp', cpp.outDir);
+    assert(cppDefer.includes('app.state()["__defer0"] = false;'), 'the Qt page seeds its defer flag as state');
+    assert(cppDefer.includes('QTimer::singleShot(50, &app,'), 'the Qt page arms a one-shot QTimer with the hold');
+    assert(cppDefer.includes('"__defer0__armed"'), 'the Qt timer is armed under a guard, once per page');
+    const arkDefer = rd('entry/src/main/ets/pages/DeferDemoPage.ets', arkts.outDir);
+    assert(arkDefer.includes('@State __defer0: boolean = false;'), 'the ArkUI page seeds its defer flag as @State');
+    assert(arkDefer.includes('setTimeout(() => { this.__defer0 = true; }, 50);'), 'the ArkUI page arms a setTimeout with the hold in aboutToAppear');
+    const ktDefer = rd('app/src/main/java/dev/rosezm/app/pages/DeferDemoPage.kt', android.outDir);
+    assert(ktDefer.includes('var __defer0 by remember { mutableStateOf(false) }'), 'the Compose page seeds its defer flag as remembered state');
+    assert(ktDefer.includes('LaunchedEffect(Unit) { delay(50L); __defer0 = true }'), 'the Compose page arms a LaunchedEffect with the hold');
+    // Every deferred page actually guards its block on the flag.
+    for (const [label, src] of [['Tk', pyDefer], ['Swing', javaDefer], ['WPF', netDefer], ['Qt', cppDefer], ['ArkUI', arkDefer], ['Compose', ktDefer], ['Flutter', fDefer], ['SwiftUI', xDeferDemo]] as Array<[string, string]>) {
+      assert(/__defer0/.test(src) && src.includes('延迟渲染'), `${label} renders the deferred content behind its flag`);
+    }
+  }
+  // R174: `$query()` inside a `{#await}` head (or anywhere else) was folded to
+  // the literal `false` by scriptConstsFor, so `?broken=1` could never reach the
+  // catch branch - and four targets then emitted a raw `$query().broken`, which
+  // is not valid Kotlin/Java/C#/C++/ArkTS/Swift/Dart at all. The const now
+  // carries its initializer and each target spells the launch parameters in its
+  // own idiom.
+  {
+    const so = await import('../src/export/state-ops.js') as Record<string, unknown>;
+    const db = so.deferBlocks as unknown;
+    assert(typeof db === 'function', 'state-ops still exports deferBlocks');
+    const q = await import('../src/export/ir.js') as Record<string, unknown>;
+    const scf = q.scriptConstsFor as ((s: string | null, n: Set<string>) => Map<string, string>) | undefined;
+    assert(typeof scf === 'function', 'ir exports scriptConstsFor');
+    const consts = scf!("const broken = $query().broken === '1';\nlet n = 3;", new Set())!;
+    assert(consts.get('broken') === "$query().broken === '1'", 'a query-reading const keeps its live initializer');
+    assert(consts.get('n') === '3', 'a plain literal const is still folded');
+    for (const [name, dir, rel, needle] of [
+      ['android', android.outDir, 'app/src/main/java/dev/rosezm/app/pages/AwaitDemoPage.kt', 'params.broken == "1"'],
+      ['java', java.outDir, 'src/main/java/dev/rosezm/app/pages/AwaitDemoPage.java', 'app.param("broken") == "1"'],
+      ['dotnet', dotnet.outDir, 'Pages/AwaitDemoPage.cs', 'app.Param("broken") == "1"'],
+      ['cpp', cpp.outDir, 'src/pages/AwaitDemoPage.cpp', 'app.param("broken")'],
+      ['arkts', arkts.outDir, 'entry/src/main/ets/pages/AwaitDemoPage.ets', "this.params['broken'] === '1'"],
+      ['xcode', xcode.outDir, 'rosezmApp/Pages/AwaitDemoView.swift', '(params["broken"] ?? "") == "1"'],
+      ['flutter', flutter.outDir, 'lib/pages/await_demo.dart', '(__params["broken"] ?? \'\') == \'1\''],
+    ] as const) {
+      const txt = readFileSync(join(dir, rel), 'utf8');
+      assert(txt.includes(needle), `${name} spells $query() with its own launch-parameter accessor`);
+      assert(!/\$query/.test(txt), `${name} leaves no raw $query() in the generated page`);
+    }
+  }
+  // R175: one fixture page that uses every rune in BOTH template and handler
+  // positions, exported to every target, and scanned for raw runes in the
+  // template-expression path. This is the systematic version of the audit that
+  // found `$query()` folded to `false` (R174): rather than guessing which
+  // construct is mishandled, exercise all of them at once and look for
+  // survivors. It found Flutter emitting `'${$actionPending()}'` and
+  // `'${$t(...)}'` verbatim - dartExpr rewrote `$actionError` but not its two
+  // siblings, and a raw `$` identifier inside Dart string interpolation is not
+  // valid Dart.
+  {
+    const fixRoot = join(scratch, 'runematrix');
+    mkdirSync(join(fixRoot, 'src/pages'), { recursive: true });
+    mkdirSync(join(fixRoot, 'src/content/posts'), { recursive: true });
+    writeFileSync(join(fixRoot, 'src/content/posts/hello.md'), '---\ntitle: Hello\n---\nbody\n');
+    writeFileSync(join(fixRoot, 'src/pages/rune.rose'), `<script>
+  let n = $state(3);
+  let flag = $state(true);
+  let items = $state(['a', 'b']);
+  let q = $state($query().q ?? '');
+  let memo = $kv(() => 42, 60);
+  let kept = $state('x');
+  $persist(kept);
+  let view = $data(async () => ({ who: 'ada' }));
+  const docList = globalThis.__rosezmContent.list('posts');
+  function bump() { $setState('n', n() + 1); }
+  function flip() { $setState('flag', !flag()); }
+  function add() { $setState('items', (xs) => [...xs, 'z']); }
+  async function save() { await refresh(); }
+</script>
+<h1>Rune matrix</h1>
+<p>n={n()} flag={flag()} memo={memo()} kept={kept()} view={view().who} docs={docList.length}</p>
+<p>q={q()}</p>
+<p>pending={$actionPending()} err={$actionError() ? $actionError().message : ''}</p>
+<p>translated={$t('rune.key')}</p>
+{#if flag}<p>on</p>{:else}<p>off</p>{/if}
+{#each items as it}<span>{it}</span>{/each}
+{#await Promise.resolve(['x'])}<p>loading</p>{:then vs}<span>{vs.length}</span>{:catch e}<p>{e.message}</p>{/await}
+<button on:click={bump}>+</button>
+<button on:click={flip}>flip</button>
+<button on:click={add}>add</button>
+<button on:click={save}>save</button>
+<form method="POST"><input name="who"><button type="submit">Go</button></form>
+`);
+    const TEMPLATE_RUNES = [
+      /\$actionPending\s*\(\s*\)/, /\$t\s*\(\s*['"]/, /\$actionError\s*\(\s*\)/,
+      /\$store\s*\(/, /\$cookies\s*\(/, /\$sessionCookie\s*\(/, /\$query\s*\(\s*\)/, /\$state\s*\(/,
+    ];
+    const walkFix = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walkFix(join(d, e.name)) : [join(d, e.name)]));
+    for (const [t, ext] of [['weapp', ['.js']], ['android', ['.kt']], ['arkts', ['.ets']], ['xcode', ['.swift']], ['flutter', ['.dart']], ['python', ['.py']], ['cpp', ['.cpp', '.h']], ['java', ['.java']], ['dotnet', ['.cs']]] as const) {
+      await exportProject(t, fixRoot, { apiBase: 'http://x', outRoot: join(scratch, 'runematrix-out') });
+      const files = walkFix(join(scratch, 'runematrix-out', t)).filter((f) => (ext as string[]).some((e) => f.endsWith(e)));
+      assert(files.length > 0, `${t} emitted the rune fixture`);
+      const leaks: string[] = [];
+      for (const f of files) {
+        for (const line of readFileSync(f, 'utf8').split('\n')) {
+          if (/^\s*(\/\/|#|\*|<!--)/.test(line)) continue;
+          for (const re of TEMPLATE_RUNES) if (re.test(line)) leaks.push(`${f.split(t)[1]}: ${String(re).slice(1, 20)}`);
+        }
+      }
+      assert(leaks.length === 0, `${t} leaves no raw rune in any generated file (${leaks.slice(0, 2).join('; ')})`);
+    }
+  }
+  // R176: a state initializer is an arbitrary JS expression that reaches the page
+  // through a path of its own - not the template translator and not the handler
+  // translator. `let nc = $state(s() ?? 'x')` and `let c = $state(1 === 1)` both
+  // emitted the raw JS: `??` is not an operator in Kotlin/Java/C++/ArkTS and
+  // `===` is not one in any of them. The literal emitters now normalize both.
+  {
+    const initRoot = join(scratch, 'initmatrix');
+    mkdirSync(join(initRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(initRoot, 'src/pages/i.rose'), `<script>
+  let s = $state('hi');
+  let nc = $state(s() ?? 'nc');
+  let orv = $state(s() || 'fallback');
+  let cmp = $state(1 === 1);
+  let plain = $state('x');
+</script>
+<p>{nc()} {orv()} {cmp()} {plain()}</p>
+`);
+    const INIT_SPECS: Array<[string, string, string]> = [
+      ['android', 'app/src/main/java/dev/rosezm/app/pages/IPage.kt', "(s != null ? s : 'nc')"],
+      ['java', 'src/main/java/dev/rosezm/app/pages/IPage.java', '(s != null ? s : "nc")'],
+      ['cpp', 'src/pages/IPage.cpp', 'rose_is_null(s)'],
+      ['arkts', 'entry/src/main/ets/pages/IPage.ets', "!== null ?"],
+      ['python', 'pages/i.py', '1 == 1'],
+    ];
+    for (const [t, rel, needle] of INIT_SPECS) {
+      const dir = join(scratch, 'init-' + t);
+      await exportProject(t, initRoot, { apiBase: 'http://x', outRoot: dir });
+      const txt = readFileSync(join(dir, t, rel), 'utf8');
+      assert(txt.includes(needle), `${t} spells the state initializer's ?? in its own idiom`);
+      // Only the initializer itself must be free of === - the kit's own patch
+      // application legitimately uses a strict comparison.
+      const initLines = txt.split('\n').filter((l) => /@State|var \w+ by remember|state\.putIfAbsent|app\.state\(\)\[/.test(l));
+      assert(initLines.every((l) => !/===/.test(l)), `${t} normalizes === in a state initializer`);
+      assert(txt.includes('"x"') || txt.includes("'x'"), `${t} still emits a plain literal initializer untouched`);
+    }
+    // R177: `s() || 'x'` is the case R176 could not fix - the emptiness test must
+    // land on a real method call, not a mangled reference. The bug was a regex
+    // whose `(?!\s*\()` lookahead is defeated by backtracking, so `s.toString()`
+    // became `s["toStrin"]g()` in seven emitters.
+    {
+      const so2 = await import('../src/export/state-ops.js') as Record<string, unknown>;
+      const rmr = so2.rewriteMemberReads as ((c: string, s: (o: string, k: string) => string) => string) | undefined;
+      assert(typeof rmr === 'function', 'state-ops exports rewriteMemberReads');
+      const mapRead = (o: string, k: string) => `${o}["${k}"]`;
+      assert(rmr!('s.toString().isNotEmpty()', mapRead) === 's.toString().isNotEmpty()', 'a method call is not mistaken for a map read');
+      assert(rmr!('store.likes', mapRead) === 'store["likes"]', 'a real map read is still rewritten');
+      assert(rmr!('Math.max(1, n)', mapRead) === 'Math.max(1, n)', 'a namespaced call is not mistaken for a map read');
+      for (const [t2, rel2, needle2] of [
+        ['android', 'app/src/main/java/dev/rosezm/app/pages/IPage.kt', "s.toString().isNotEmpty() ? s : 'fallback'"],
+        ['java', 'src/main/java/dev/rosezm/app/pages/IPage.java', '!RoseTheme.text(s).isEmpty() ? s : "fallback"'],
+      ] as const) {
+        const txt2 = readFileSync(join(scratch, 'init-' + t2, t2, rel2), 'utf8');
+        assert(txt2.includes(needle2), `${t2} spells the state initializer's || as a real emptiness test`);
+        assert(!/\["toStrin"\]|Get\(RoseTheme, "tex"\)/.test(txt2), `${t2} leaves no mangled method reference`);
+      }
+    }
+  }
+  // R178: the README is the file a developer opens first, so it is the one place
+  // a limitation must appear. The mini program had no README at all, dotnet's
+  // named a file that does not exist ("RepoKit"), and no target folded the
+  // export warnings into it - so a construct that silently degraded was
+  // invisible unless you read the exporter's stdout.
+  {
+    const so3 = await import('../src/export/state-ops.js') as Record<string, unknown>;
+    const rws = so3.renderWarningSection as ((w: string[]) => string) | undefined;
+    assert(typeof rws === 'function', 'state-ops exports renderWarningSection');
+    assert(rws!([]) === '', 'no warnings, no section');
+    assert(rws!(['a', 'a', 'b']).includes('- a (x2)'), 'a repeated warning collapses to one line with a count');
+    const readmeDirs: Record<string, string> = { weapp: result.outDir, android: android.outDir, arkts: arkts.outDir, xcode: xcode.outDir, flutter: flutter.outDir, python: pdir, cpp: cdir, java: jdir, dotnet: ndir };
+    for (const [name, dir] of Object.entries(readmeDirs)) {
+      const txt = readFileSync(join(dir, 'README.md'), 'utf8');
+      assert(txt.includes('## Notes from this export'), `${name} folds the export warnings into its README`);
+      assert(/\.rose/.test(txt) && /Server:/.test(txt), `${name} README states how to build and where the server base URL lives`);
+    }
+    assert(!/RepoKit/.test(readFileSync(join(ndir, 'README.md'), 'utf8')), 'the .NET README names the file that actually exists');
+    assert(readFileSync(join(result.outDir, 'README.md'), 'utf8').includes('WeChat DevTools'), 'the mini program README names the IDE that opens it');
+  }
+  // R179: collection chains in a state initializer and in a direct-value state
+  // write. `list().map(...)` / `.filter(...)` / `.reduce(...)` used to reach the
+  // compiled targets as raw JS, because the only expression translator was
+  // wired to the *arrow* form of $setState and to the template path - never to
+  // the initializer or the value form.
+  {
+    const collRoot = join(scratch, 'collops');
+    mkdirSync(join(collRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(collRoot, 'src/pages/c.rose'), `<script>
+  let list = $state([1, 2, 3]);
+  let doubled = $state(list().map((x) => x * 2));
+  let evens = $state(list().filter((x) => x > 1));
+  let total = $state(list().reduce((a, b) => a + b, 0));
+  function drop() { $setState('list', list().filter((x) => x !== 1)); }
+</script>
+<p>{doubled().length} {evens().length} {total()}</p>
+<button on:click={drop}>drop</button>
+`);
+    const COLL: Array<[string, string, string]> = [
+      ['android', 'app/src/main/java/dev/rosezm/app/pages/CPage.kt', 'list.map { x -> x * 2 }'],
+      ['java', 'src/main/java/dev/rosezm/app/pages/CPage.java', 'RoseTheme.mapList(list, x -> x * 2)'],
+      ['cpp', 'src/pages/CPage.cpp', 'rose_map(list, [](const RoseValue& x) { return x * 2; })'],
+      ['arkts', 'entry/src/main/ets/pages/CPage.ets', 'roseMap(list, (x: Object) => x * 2)'],
+      ['dotnet', 'Pages/CPage.cs', 'RoseTheme.Map(list, delegate(object x) { return x * 2; })'],
+      ['python', 'pages/c.py', '[x * 2 for x in list]'],
+      ['flutter', 'lib/pages/c.dart', '.map((x) => x * 2)'],
+    ];
+    for (const [t, rel, needle] of COLL) {
+      const dir = join(scratch, 'coll-' + t);
+      await exportProject(t, collRoot, { apiBase: 'http://x', outRoot: dir });
+      const txt = readFileSync(join(dir, t, rel), 'utf8');
+      assert(txt.includes(needle), `${t} translates .map in a state initializer`);
+      const leaks = txt.split('\n').filter((l) => /\.(?:map|filter|reduce)\((?:\(|\w)/.test(l) && !/^\s*(\/\/|\*)/.test(l));
+      // Dart's own arrow syntax looks like JS, so it is exempt from the scan.
+      if (t !== 'flutter') assert(leaks.length === 0, `${t} leaves no raw JS collection chain`);
+    }
+    // The kit helpers the compiled dialects call must actually exist. Dart was
+    // the find of this round: it called roseAppend/roseConcat/roseMapIdx that
+    // its kit never defined.
+    for (const [t, needle] of [
+      ['java', 'filterList'],
+      ['cpp', 'rose_filter'],
+      ['arkts', 'roseFilter'],
+      ['dotnet', 'Filter'],
+      ['flutter', 'roseAppend'],
+      ['android', 'roseFilter'],
+    ] as const) {
+      const dir = join(scratch, 'coll-' + t);
+      const walkDir = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walkDir(join(d, e.name)) : [join(d, e.name)]));
+      const hit = walkDir(dir).find((p) => readFileSync(p, 'utf8').includes(needle));
+      assert(!!hit, `${t} ships the collection kit helper it calls`);
+    }
+    // Swift's kit is emitted by the xcode export, spelled `xcode` above.
+    assert(readFileSync(join(xcode.outDir, 'rosezmApp/Kit/RoseKit.swift'), 'utf8').includes('roseFilter'), 'xcode ships the collection kit helper it calls');
+  }
+  // R180: kit reachability. Every kit-prefixed call a generated page makes must
+  // have a declaration in that target's kit, or the project does not compile.
+  // This round found two: Kotlin pages called roseThrow (the {@catch} escape
+  // hatch) that the kit never defined, and Flutter pages called roseMerge that
+  // rosezm.dart never defined. Both were latent - nothing had reached those
+  // code paths until earlier rounds widened what the emitters emit.
+  {
+    const walkReach = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walkReach(join(d, e.name)) : [join(d, e.name)]));
+    // Windows paths use backslashes; normalise before matching.
+    const inPages = (f: string) => /[\\/]pages[\\/]/.test(f);
+    const REACH: Array<{ t: string; exts: string[]; prefixes: string[]; isPage: (f: string) => boolean }> = [
+      { t: 'android', exts: ['kt'], prefixes: ['rose'], isPage: inPages },
+      { t: 'java', exts: ['java'], prefixes: ['RoseTheme\\.'], isPage: inPages },
+      { t: 'dotnet', exts: ['cs'], prefixes: ['RoseTheme\\.'], isPage: inPages },
+      { t: 'cpp', exts: ['cpp', 'h'], prefixes: ['rose_'], isPage: inPages },
+      { t: 'arkts', exts: ['ets'], prefixes: ['rose'], isPage: inPages },
+      { t: 'xcode', exts: ['swift'], prefixes: ['rose'], isPage: inPages },
+      { t: 'flutter', exts: ['dart'], prefixes: ['rose', 'rosezm'], isPage: inPages },
+      { t: 'python', exts: ['py'], prefixes: ['rose', 'rosezm'], isPage: inPages },
+    ];
+    for (const { t, exts, prefixes, isPage } of REACH) {
+      const dir = join(scratch, 'reach-' + t);
+      await exportProject(t, example, { apiBase: 'http://x', outRoot: dir });
+      const files = walkReach(join(dir, t));
+      assert(files.length > 0, `${t} emits files`);
+      // Declarations come from every non-page source file: a target may split its
+      // kit across several files (dotnet keeps the helpers in RoseTheme.cs and
+      // the app shell in RoseKit.cs), so keying on one file name is fragile.
+      const defined = new Set<string>();
+      for (const f of files) {
+        if (!exts.includes(f.split('.').pop() ?? '')) continue;
+        if (isPage(f)) continue;
+        const txt = readFileSync(f, 'utf8');
+        for (const m of txt.matchAll(/(?:^|[\s>])([A-Za-z_]\w*)\s*[(<]/gm)) defined.add(m[1]);
+        for (const m of txt.matchAll(/\b(\w+)\.(\w+)\s*\(/g)) defined.add(m[2]);
+      }
+      const missing = new Set<string>();
+      for (const f of files) {
+        if (!exts.includes(f.split('.').pop() ?? '')) continue;
+        for (const m of readFileSync(f, 'utf8').matchAll(new RegExp(`\\b(${prefixes.join('|')}\\w*)\\s*\\(`, 'g'))) {
+          const raw = m[1];
+          const name = raw.includes('.') ? raw.split('.')[1] : raw;
+          if (!defined.has(name) && !defined.has(raw)) missing.add(raw);
+        }
+      }
+      assert(missing.size === 0, `${t} every kit call resolves (missing: ${[...missing].slice(0, 4).join(', ')})`);
+    }
+  }
+  // R181: a state initializer that reads another state must be emitted after it.
+  // The web compiler places declarations in source order, so `let doubled =
+  // $state(list().map(...))` written above `let list = $state([...])` produced a
+  // call to `list()` before its `const` existed - a temporal-dead-zone
+  // ReferenceError on every render. This is the same "a separate code path" bug
+  // the export targets had, on the side of the framework this audit had not
+  // touched yet.
+  {
+    const { compileComponent } = await import('../src/compiler/index.js') as typeof import('../src/compiler/index.js');
+    const orderRoot = join(scratch, 'declorder');
+    mkdirSync(join(orderRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(orderRoot, 'src/pages/o.rose'), `<script>
+  let doubled = $state(list().map((x) => x * 2));
+  let list = $state([1, 2, 3]);
+  let evens = $state(list().filter((x) => x > 1));
+</script>
+<p>{doubled().length} {evens().length}</p>
+`);
+    const r = await compileComponent(join(orderRoot, 'src/pages/o.rose'), '', 'o', false, [], new Map());
+    const src = (r as { client?: string }).client ?? '';
+    const at = (needle: string): number => src.indexOf(needle);
+    assert(at('const [list') >= 0 && at('const [doubled') >= 0, 'the client bundle declares both state fields');
+    assert(at('const [list') < at('const [doubled'), 'a state field is declared before the field that reads it');
+    // A component with a $data field too: the placeholder count then differs
+    // from the state-declaration count, and a wrong reorder emits a duplicate.
+    const mixedRoot = join(scratch, 'declorder-mixed');
+    mkdirSync(join(mixedRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(mixedRoot, 'src/pages/m.rose'), `<script>
+  let ticks = $state(0);
+  let remote = $data(async () => ({ ok: true }));
+  let ticks2 = $state(ticks() + 1);
+</script>
+<p>{ticks()} {ticks2()} {remote().ok}</p>
+`);
+    const r2 = await compileComponent(join(mixedRoot, 'src/pages/m.rose'), '', 'm', false, [], new Map());
+    const src2 = (r2 as { client?: string }).client ?? '';
+    const declCount = (src2.match(/const \[ticks, setTicks\] = state\(/g) ?? []).length;
+    assert(declCount === 1, `a mixed state/data script declares each field exactly once (got ${declCount})`);
+    assert(src2.indexOf('const [ticks,') < src2.indexOf('const [ticks2,'), 'a dependent state field still follows the field it reads');
+  }
+  // R182: {@html x} on the web compiler. `callifyStateReads` rewrote the bare
+  // identifier inside the directive, producing `(@html() html())` - invalid
+  // JavaScript - so the raw-HTML path never ran and the page threw on render.
+  // The `@` prefix marks a template directive whose argument is not a state read.
+  {
+    const { compileComponent } = await import('../src/compiler/index.js') as typeof import('../src/compiler/index.js');
+    const rawRoot = join(scratch, 'rawhtml');
+    mkdirSync(join(rawRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(rawRoot, 'src/pages/r.rose'), `<script>
+  let html = $state('<b>bold</b>');
+  let html2 = $state('<i>it</i>');
+</script>
+<p>{@html html()}</p>
+<p>{@html html2()}</p>
+<p>{html().length}</p>
+`);
+    const r = await compileComponent(join(rawRoot, 'src/pages/r.rose'), '', 'r', false, [], new Map());
+    const ssr = (r as { ssr?: string }).ssr ?? '';
+    assert(ssr.includes('rawMark(__c, () => (html()))'), 'a raw-HTML directive emits the runtime rawMark, not a mangled call');
+    assert(ssr.includes('rawMark(__c, () => (html2()))'), 'every raw-HTML directive takes the raw path');
+    assert(!/@html\(\)/.test(ssr), 'the directive keyword is never rewritten into a call');
+    // The plain text read of the same state must still be a getter call.
+    assert(ssr.includes('textMark(__c, () => (html().length))'), 'a plain {html().length} read still becomes a getter call');
+  }
+  // R183: `total={n()}` in TEXT. The template compiler decided "text ends with
+  // name=, therefore this is an attribute value", so `total={n()}` emitted an
+  // attrMark and DROPPED the visible text - the label never rendered. The test
+  // has to be "are we inside an open tag", which is a `<name` whose `>` has not
+  // arrived yet. Both directions are pinned: text that looks like an attribute
+  // is text, and a real attribute is still an attribute.
+  {
+    const { compileComponent } = await import('../src/compiler/index.js') as typeof import('../src/compiler/index.js');
+    const textRoot = join(scratch, 'textattr');
+    mkdirSync(join(textRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(textRoot, 'src/pages/t.rose'), `<script>
+  let n = $state(1);
+  let href = $state('/x');
+</script>
+<p>total={n()}</p>
+<p>n={n()}</p>
+<p>x= {n()}</p>
+<p>count: {n()}</p>
+<a href={href()}>{n()}</a>
+`);
+    const r = await compileComponent(join(textRoot, 'src/pages/t.rose'), '', 't', false, [], new Map());
+    const ssr = (r as { ssr?: string }).ssr ?? '';
+    // Each label must appear in a static chunk immediately followed by a
+    // textMark - the shape "visible text, then the reactive value".
+    for (const label of ['total=', 'n=', 'x= ', 'count: ']) {
+      assert(new RegExp(`${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}";\\s*\\nh \\+= textMark\\(__c, \\(\\) => \\(n\\(\\)\\)\\)`).test(ssr), `text ${JSON.stringify(label)} is emitted as visible text`);
+    }
+    assert(!/attrMark\(__c, \(\) => \(n\(\)\), 'total'\)/.test(ssr), 'total= is not mistaken for an attribute');
+    assert(!/attrMark\(__c, \(\) => \(n\(\)\), 'n'\)/.test(ssr), 'n= is not mistaken for an attribute');
+    assert(!/attrMark\(__c, \(\) => \(n\(\)\), 'x'\)/.test(ssr), 'x= is not mistaken for an attribute');
+    assert(ssr.includes("attrMark(__c, () => (href()), 'href')"), 'a real attribute value still emits an attrMark');
+  }
+  // R184: a SECOND reactive attribute on the same tag. R183's `insideOpenTag`
+  // looked only at the text before the span, so `<a href={x} title={y}>` had a
+  // second span whose preceding text was just ` title=` - no `<a` in it - and
+  // the second attribute fell through to the TEXT path. It emitted a literal
+  // `title=` into the tag and rendered the value as body text. The compiler
+  // suite had two assertions for exactly this and they were already failing.
+  {
+    const { compileComponent } = await import('../src/compiler/index.js') as typeof import('../src/compiler/index.js');
+    const attrRoot = join(scratch, 'multiattr');
+    mkdirSync(join(attrRoot, 'public'), { recursive: true });
+    mkdirSync(join(attrRoot, 'p'), { recursive: true });
+    const f = join(attrRoot, 'p/m.rose');
+    writeFileSync(f, `<script>
+  let hv = $state('/a');
+  let tv = $state('T1');
+  let n = $state(1);
+</script>
+<div><a href={hv} title={tv}>link</a></div>
+<img src="/a.png" alt="s" width={n()}>
+<p>total={n()}</p>
+`, 'utf-8');
+    const r = await compileComponent(f, join(attrRoot, 'public'), 'multiattr', false, [], new Map());
+    const ssr = (r as { ssr?: string }).ssr ?? '';
+    assert(ssr.includes("attrMark(__c, () => (hv()), 'href')"), 'the first reactive attribute emits an attrMark');
+    assert(ssr.includes("attrMark(__c, () => (tv()), 'title')"), 'the SECOND reactive attribute on the same tag also emits an attrMark');
+    assert(ssr.includes("attrMark(__c, () => (n()), 'width')"), 'a reactive attribute after static ones still emits an attrMark');
+    // The text cases from R183 must still be text.
+    assert(new RegExp('total=";\\s*\\nh \\+= textMark\\(__c, \\(\\) => \\(n\\(\\)\\)\\)').test(ssr), 'total= is still text, not an attribute');
+  }
+  // R186: the Electron shell's path guard. `resolved.startsWith(DIST)` is a
+  // STRING-prefix test, not a path-boundary test: a request for
+  // `/../dist-secrets/key.txt` resolves to a SIBLING directory that still starts
+  // with the DIST string, so the guard served it - and the URL-encoded
+  // `/..%2F...` form escaped too. The Node servers are not affected (they strip
+  // leading `..` segments after normalize, which re-anchors inside dist/); this
+  // was specific to the desktop shell.
+  {
+    const elDir = join(scratch, 'electron-guard');
+    await exportProject('electron', example, { apiBase: 'http://x', outRoot: elDir });
+    const main = readFileSync(join(elDir, 'electron/main.cjs'), 'utf8');
+    assert(main.includes('resolved.startsWith(DIST + path.sep)'), 'the Electron shell tests the path BOUNDARY, not the string prefix');
+    assert(/resolved === DIST \|\|/.test(main), 'the boundary test still allows DIST itself');
+    assert(!/return resolved\.startsWith\(DIST\) \?/.test(main), 'the prefix-only guard is gone');
+    // The dist copy must not carry precompressed siblings: the shell has no
+    // content-negotiation, so a .br file would be served as raw bytes.
+    const walkEl = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walkEl(join(d, e.name)) : [join(d, e.name)]));
+    const brs = walkEl(join(elDir, 'electron/dist')).filter((f) => f.endsWith('.br'));
+    assert(brs.length === 0, `the Electron dist carries no .br siblings (${brs.length})`);
+  }
+  // R187: `$query()` in a state initializer. Five targets blanked the rune to
+  // null/nil/"" before the leak check ran, so `let q = $state($query().q ?? '')`
+  // seeded the fallback and the query string was silently dropped. The rune now
+  // survives to each target's own spelling, and Python defers it into a lambda
+  // because STATE is built before any RoseApp exists.
+  {
+    const qRoot = join(scratch, 'qinit');
+    mkdirSync(join(qRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(qRoot, 'src/pages/q.rose'), `<script>
+  let q = $state($query().q ?? '');
+</script>
+<p>{q()}</p>
+`);
+    const QINIT: Array<[string, string, string]> = [
+      ['android', 'app/src/main/java/dev/rosezm/app/pages/QPage.kt', 'params["q"]'],
+      ['arkts', 'entry/src/main/ets/pages/QPage.ets', 'this.params["q"]'],
+      ['java', 'src/main/java/dev/rosezm/app/pages/QPage.java', 'app.param("q")'],
+      ['dotnet', 'Pages/QPage.cs', 'app.Param("q")'],
+      ['cpp', 'src/pages/QPage.cpp', 'app.param("q")'],
+      ['xcode', 'rosezmApp/Pages/QView.swift', 'params["q"]'],
+      ['flutter', 'lib/pages/q.dart', "roseIndex(__params, \"q\")"],
+      ['python', 'pages/q.py', "lambda: "],
+    ];
+    for (const [t, rel, needle] of QINIT) {
+      const dir = join(scratch, 'qinit-' + t);
+      const r = await exportProject(t, qRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+      const txt = readFileSync(join(dir, t, rel), 'utf8');
+      assert(txt.includes(needle), `${t} seeds a $query() state initializer from the launch parameters`);
+      // The leak warning must not fire for a query read: it is a framework rune,
+      // not an unresolvable module binding.
+      assert(!(r.warnings ?? []).some((w) => /module-level state/.test(w) && /query/.test(w)), `${t} does not warn about a $query() read in a state initializer`);
+    }
+    // Python's deferred seed must actually resolve inside build().
+    const py = readFileSync(join(scratch, 'qinit-python', 'python/pages/q.py'), 'utf8');
+    assert(/for __k, __v in list\(STATE\.items\(\)\):/.test(py) && /if callable\(__v\)/.test(py), 'the Python page resolves a deferred state seed inside build()');
+  }
+  // R188: a module bind read from a mini-program template. A mustache resolves
+  // against page DATA, and an exported const is not page data - it is a `const`
+  // in the page's JS closure. `{{store.likes + likes}}` rendered
+  // `undefined + null` in the view while the JS scope had the real value. The
+  // read is now hoisted into a `__cN` computed, which runs inside `definitions`
+  // where the closure is in scope. Two fixes were needed: the emit-time check
+  // that rejects a mustache referencing a module bind, and scriptConstsFor's
+  // regex, which skipped the `export` keyword and so never saw the bind at all.
+  {
+    const mpRoot = join(scratch, 'mpbind');
+    mkdirSync(join(mpRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(mpRoot, 'src/pages/rich.rose'), `<script>
+  let likes = $state(0);
+  export const store = { likes: 41 };
+</script>
+<p>{store.likes + likes()}</p>
+`);
+    const MP_TARGETS = [
+      ['weapp', 'pages/rich/rich.wxml'],
+      ['alipay', 'pages/rich/rich.axml'],
+      ['baidu', 'pages/rich/rich.swan'],
+      ['toutiao', 'pages/rich/rich.ttml'],
+    ] as const;
+    for (const [t, rel] of MP_TARGETS) {
+      const dir = join(scratch, 'mpbind-' + t);
+      await exportProject(t, mpRoot, { apiBase: 'http://x', outRoot: dir });
+      const tpl = readFileSync(join(dir, t, rel), 'utf8');
+      assert(!/store\.likes/.test(tpl), `${t} does not inline a module-bind read into a mustache`);
+      assert(/\{\{__c0\}\}/.test(tpl), `${t} hoists a module-bind read into a computed`);
+    }
+  }
+  // R189: a module bind read inside a HANDLER body. The handler is the third
+  // code path (after the template and the state initializer), and the
+  // member-read rewrite was missing from it on every target - `store.likes`
+  // reached the file verbatim, which no target's compiler accepts. Java, C#,
+  // C++ even discarded their `known` parameter (`void known`), so the names
+  // they needed were dropped on the floor. Only a BIND is rewritten: a state
+  // read has already become a typed accessor with no member left, and a
+  // state array keeps its native `.count`/`.length`.
+  {
+    const hRoot = join(scratch, 'hbind');
+    mkdirSync(join(hRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(hRoot, 'src/pages/h.rose'), `<script>
+  export const store = { likes: 41 };
+  let count = $state(0);
+  function bump() { $setState('count', count() + store.likes); }
+</script>
+<button on:click={bump}>bump</button>
+`);
+    const HBIND: Array<[string, string, string]> = [
+      ['android', 'app/src/main/java/dev/rosezm/app/pages/HPage.kt', 'count + store["likes"]'],
+      ['arkts', 'entry/src/main/ets/pages/HPage.ets', "this.count + store['likes']"],
+      ['java', 'src/main/java/dev/rosezm/app/pages/HPage.java', 'RoseTheme.get(store, "likes")'],
+      ['dotnet', 'Pages/HPage.cs', 'RoseTheme.Get(store, "likes")'],
+      ['cpp', 'src/pages/HPage.cpp', 'rose_get(store, "likes")'],
+      ['xcode', 'rosezmApp/Pages/HView.swift', 'Self.store["likes"]'],
+      ['flutter', 'lib/pages/h.dart', "store['likes']"],
+    ];
+    for (const [t, rel, needle] of HBIND) {
+      const dir = join(scratch, 'hbind-' + t);
+      await exportProject(t, hRoot, { apiBase: 'http://x', outRoot: dir });
+      const txt = readFileSync(join(dir, t, rel), 'utf8');
+      assert(txt.includes(needle), `${t} rewrites a module-bind read inside a handler body`);
+      assert(!/\bstore\.likes\b/.test(txt), `${t} leaves no raw store.likes in the handler body`);
+    }
+    // The mini program runs real JS, so the closure read is already correct.
+    const wdir = join(scratch, 'hbind-weapp');
+    await exportProject('weapp', hRoot, { apiBase: 'http://x', outRoot: wdir });
+    const wjs = readFileSync(join(wdir, 'weapp/pages/h/h.js'), 'utf8');
+    assert(/store\.likes/.test(wjs), 'the mini-program handler keeps its native JS closure read');
+    // Python's handler body spells the bind read as a dict subscript.
+    const pdir = join(scratch, 'hbind-python');
+    await exportProject('python', hRoot, { apiBase: 'http://x', outRoot: pdir });
+    const py = readFileSync(join(pdir, 'python/pages/h.py'), 'utf8');
+    assert(/store\['likes'\]/.test(py), 'python rewrites a module-bind read inside a handler body');
+  }
+  // R169: a JS ternary whose condition is a bare truthiness test is a boolean in
+  // JS for any operand, but Kotlin, ArkTS, Swift, Java and C# require the
+  // condition to *be* a boolean - the same class as `||` (R161), in the
+  // construct that appears far more often. `admin.rose`'s `{user() ? ... : ...}`
+  // emitted a bare `Any?`/`Object` condition into six targets.
+  {
+    const so = await import('../src/export/state-ops.js') as Record<string, unknown>;
+    const rtt = so.rewriteTernaryTruth as ((c: string, t: (o: string) => string, s?: (n: string) => boolean) => string) | undefined;
+    assert(typeof rtt === 'function', 'state-ops exports rewriteTernaryTruth');
+    const nn = (o: string) => `${o} != null`;
+    const isState = (n: string) => n === 'user';
+    assert(rtt!('user ? "a" : "b"', nn) === 'user != null ? "a" : "b"', 'a bare operand gets a null test');
+    assert(rtt!('user() ? "a" : "b"', nn, isState) === 'user() != null ? "a" : "b"', 'a state getter gets a null test');
+    assert(rtt!('other() ? "a" : "b"', nn, isState) === 'other() ? "a" : "b"', 'a non-state call is left alone');
+    assert(rtt!('a === b ? "a" : "b"', nn) === 'a === b ? "a" : "b"', 'an existing comparison is not corrupted');
+    assert(rtt!('a !== b ? "a" : "b"', nn) === 'a !== b ? "a" : "b"', 'a !== comparison is not corrupted');
+    assert(rtt!('count > 0 ? "a" : "b"', nn) === 'count > 0 ? "a" : "b"', 'a numeric comparison is not corrupted');
+    assert(rtt!('!flag ? "a" : "b"', nn) === '!flag ? "a" : "b"', 'a negation is not corrupted');
+    assert(rtt!('null ? "a" : "b"', nn) === 'null ? "a" : "b"', 'a literal is not corrupted');
+    assert(rtt!('a.b ? "a" : "b"', nn) === 'a.b != null ? "a" : "b"', 'a member read gets a null test');
+    for (const [name, rel, cond] of [
+      ['android', 'android/app/src/main/java/dev/rosezm/app/pages/AdminPage.kt', 'user != null'],
+      ['arkts', 'arkts/entry/src/main/ets/pages/AdminPage.ets', 'this.user != null'],
+      ['xcode', 'xcode/rosezmApp/Pages/AdminView.swift', 'user != nil'],
+      ['java', 'java/src/main/java/dev/rosezm/app/pages/AdminPage.java', 'app.v("user") != null'],
+      ['dotnet', 'dotnet/Pages/AdminPage.cs', 'app.V("user") != null'],
+    ] as const) {
+      const txt = readFileSync(join(({ android: android.outDir, arkts: arkts.outDir, xcode: xcode.outDir, java: java.outDir, dotnet: dotnet.outDir } as Record<string, string>)[name], rel.split('/').slice(1).join('/')), 'utf8');
+      assert(txt.includes(cond), `${name} emits a boolean ternary condition`);
+      assert(!/(^|[^!=<>])\buser\s*\?/.test(txt), `${name} leaves no bare-truthiness ternary condition`);
+    }
+  }
+  // R168: a content read can also appear inline in a template, not just as a
+  // module const. Only the module-const path was rewritten, so `docs.rose`'s
+  // `{@html ...get(...)}` emitted the raw server global into every target's
+  // generated UI code - a NameError in Python and a compile error everywhere
+  // else. The expression translators now rewrite it too, and the server-side
+  // interpolation map is dropped rather than emitted as a JS object literal.
+    // `{@html ...get(...)}` emitted the raw server global into every target's
+    // generated UI code - a NameError in Python and a compile error everywhere
+    // else. The expression translators now rewrite it too, and the server-side
+    // interpolation map is dropped rather than emitted as a JS object literal.
+    for (const [name, page] of [
+      ['python', 'python/pages/docs.py'], ['android', 'android/app/src/main/java/dev/rosezm/app/pages/DocsPage.kt'],
+      ['arkts', 'arkts/entry/src/main/ets/pages/DocsPage.ets'], ['xcode', 'xcode/rosezmApp/Pages/DocsView.swift'],
+      ['flutter', 'flutter/lib/pages/docs.dart'], ['cpp', 'cpp/src/pages/DocsPage.cpp'],
+      ['java', 'java/src/main/java/dev/rosezm/app/pages/DocsPage.java'], ['dotnet', 'dotnet/Pages/DocsPage.cs'],
+    ] as const) {
+      const txt = kitAt(page);
+      assert(!txt.includes('__rosezmContent'), `${name} leaves no raw content global in the generated page`);
+      assert(!txt.includes('siteName'), `${name} drops the server-side interpolation map`);
+      assert(!/;;/.test(txt), `${name} emits one statement terminator per binding`);
+    }
+    assert(kitAt('cpp/src/pages/DocsPage.cpp').includes('roseContentGet("docs", "getting-started")'), 'C++ does not double-wrap a content call in RoseValue(...)');
+    // The mini program resolves the bridge from the baked collections.
+    assert(read('utils/rosezm.js').includes('function installContentBridge(collections)'), 'the mini program installs the content bridge from the baked collections');
+    assert(existsSync(join(result.outDir, 'data/content.json')), 'the content collections are baked into data/content.json');
+    const baked = JSON.parse(readFileSync(join(result.outDir, 'data/content.json'), 'utf8')) as Record<string, Array<Record<string, unknown>>>;
+    assert(Object.keys(baked).sort().join(',') === 'docs,posts', 'the baked file carries every collection');
+    assert(baked.posts[0]?.slug === 'hello' && !('body' in (baked.posts[0] ?? {})), 'a baked entry keeps its frontmatter and drops the markdown body');
+    // And the bridge actually serves it, executed.
+    const contentPage = read('pages/content-demo/content-demo.js');
+    assert(contentPage.includes("require('../../data/content.json')") && contentPage.includes('content: __content'), 'the page passes the baked collections to the bridge');
+  }
+  // R160: the demo's await head is a Promise.resolve/reject literal, which
+  // normalizes to a value - so it must NOT warn. A head that is a real promise
+  // (a call) cannot be awaited on a target with no async runtime there, and each
+  // of the eight page-emitting targets now says so instead of silently putting a
+  // promise object into a state field.
+  assert(!(result.warnings ?? []).some((w) => /#await\} head is a promise/.test(w)), 'the literal Promise.resolve/reject await head raises no warning');
+  // R163: the build scaffolding is part of "complete and runnable", and it is the
+  // one part no page-level assertion covers. These locks prove each target ships
+  // the files a build actually needs, and that the generated ones reference the
+  // generated sources - a page that exists on disk but is absent from the build
+  // file is a page that silently never ships.
+  {
+    const walkTree = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walkTree(join(d, e.name)) : [join(d, e.name)]));
+    const bname = (p: string) => p.split(/[\\/]/).pop()!;
+    // Every target ships its build entry point.
+    const scaffoldRoots: Record<string, string> = {
+      android: android.outDir, arkts: arkts.outDir, xcode: xcode.outDir, cpp: cpp.outDir,
+      java: java.outDir, dotnet: dotnet.outDir, flutter: flutter.outDir, weapp: result.outDir,
+    };
+    for (const [t, files] of [
+      ['android', ['app/build.gradle.kts', 'settings.gradle.kts', 'gradle.properties', 'app/src/main/AndroidManifest.xml']],
+      ['arkts', ['build-profile.json5', 'oh-package.json5', 'entry/hvigorfile.ts', 'AppScope/app.json5', 'entry/src/main/module.json5', 'entry/src/main/resources/base/profile/main_pages.json']],
+      ['xcode', ['rosezmApp.xcodeproj/project.pbxproj', 'rosezmApp/Info.plist']],
+      ['cpp', ['CMakeLists.txt']],
+      ['java', ['pom.xml']],
+      ['dotnet', ['rosezmApp.csproj']],
+      ['flutter', ['pubspec.yaml']],
+      ['weapp', ['project.config.json', 'app.json']],
+    ] as const) {
+      for (const rel of files) assert(existsSync(join(scaffoldRoots[t], rel)), `${t} ships ${rel}`);
+    }
+    // Xcode: every generated Swift file is referenced by the project (pbxproj
+    // keys on basename, and a duplicate basename would silently drop one).
+    const pbx = readFileSync(join(xcode.outDir, 'rosezmApp.xcodeproj/project.pbxproj'), 'utf8');
+    const swiftNames = [...new Set(walkTree(xcode.outDir).filter((f) => f.endsWith('.swift')).map(bname))];
+    assert(swiftNames.every((n) => pbx.includes(n)), 'every generated Swift file is referenced by project.pbxproj');
+    assert(new Set(swiftNames).size === swiftNames.length, 'no two generated Swift files share a basename');
+    // C++: CMake does not glob, so every source must be listed explicitly.
+    const cmake = readFileSync(join(cpp.outDir, 'CMakeLists.txt'), 'utf8');
+    assert(walkTree(cpp.outDir).filter((f) => f.endsWith('.cpp')).every((f) => cmake.includes(bname(f))), 'every generated C++ source is listed in CMakeLists.txt');
+    // HarmonyOS: main_pages.json must name every generated page.
+    const mainPages = JSON.parse(readFileSync(join(arkts.outDir, 'entry/src/main/resources/base/profile/main_pages.json'), 'utf8')) as { src?: string[] };
+    const etsPages = walkTree(join(arkts.outDir, 'entry/src/main/ets/pages')).map((f) => 'pages/' + bname(f).replace(/\.ets$/, ''));
+    assert(etsPages.every((p) => (mainPages.src ?? []).includes(p)), 'every generated ArkTS page is listed in main_pages.json');
+    // WeChat: app.json must name every generated page directory.
+    const appPages = (JSON.parse(readFileSync(join(result.outDir, 'app.json'), 'utf8')) as { pages?: string[] }).pages ?? [];
+    const weappDirs = [...new Set(walkTree(join(result.outDir, 'pages')).filter((f) => f.endsWith('.js')).map((f) => f.slice(f.indexOf('pages'), f.length - 3).replace(/\\/g, '/')))];
+    assert(weappDirs.every((d) => appPages.includes(d)), 'every generated mini-program page is listed in app.json');
+    // .NET is SDK-style: UseWPF globs **/*.cs and **/*.xaml implicitly, so the
+    // csproj must NOT disable that, or none of the generated code would compile.
+    const csproj = readFileSync(join(dotnet.outDir, 'rosezmApp.csproj'), 'utf8');
+    assert(/Sdk="Microsoft\.NET\.Sdk"/.test(csproj) && /<UseWPF>true</.test(csproj) && !/EnableDefaultItems/.test(csproj), 'the WPF project keeps SDK-style default globbing so every generated file compiles');
+    // R164: a CSS generic family is honoured on the four desktop toolkits, each
+    // through its own always-available mechanism - a custom family still cannot
+    // be (it needs the font on the host), which the warning says.
+    const genProj = join(scratch, 'genfontproj');
+    mkdirSync(join(genProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(genProj, 'src/pages/index.rose'), `<style>
+.mono { font-family: monospace; font-size: 20px; font-weight: bold; }
+.serif { font-family: Georgia, serif; }
+.sans { font-family: system-ui, sans-serif; }
+</style>
+<p class="mono">m</p><p class="serif">s</p><p class="sans">n</p>
+`);
+    await exportProject('python', genProj, { apiBase: 'x', outRoot: join(scratch, 'genfontpy') });
+    const pyFont = readFileSync(join(scratch, 'genfontpy', 'python/styles.py'), 'utf8');
+    assert(pyFont.includes("'mono__index': {'font': ('Courier New', 13, 'bold')}"), 'Tk maps a monospace stack and keeps the size and weight');
+    assert(pyFont.includes("'serif__index': {'font': ('Times New Roman', 11)}"), 'Tk falls back to the generic family in a stack');
+    await exportProject('java', genProj, { apiBase: 'x', outRoot: join(scratch, 'genfontjava') });
+    const javaFont = readFileSync(join(scratch, 'genfontjava', 'java/src/main/java/dev/rosezm/app/RoseTheme.java'), 'utf8');
+    assert(javaFont.includes('STYLES.put("mono__Index", new Style(20, "#222222", null, 0, true, "left", "Monospaced", "", 0))'), 'Swing maps monospace onto the JDK Monospaced font');
+    assert(javaFont.includes('widget.setFont(new Font(style.fontName, style.bold ? Font.BOLD : Font.PLAIN, style.fontSize))'), 'Swing applies the logical font name');
+    await exportProject('dotnet', genProj, { apiBase: 'x', outRoot: join(scratch, 'genfontnet') });
+    const netFont = readFileSync(join(scratch, 'genfontnet', 'dotnet/RoseTheme.cs'), 'utf8');
+    assert(netFont.includes('["mono__Index"] = new RoseStyle { FontSize = 20, FontWeight = 700, FontFamily = "Consolas" }'), 'WPF maps monospace onto Consolas');
+    assert(!/##/.test(netFont), 'WPF emits a valid single-# color');
+    assert(netFont.includes('block.FontFamily = new FontFamily(style.FontFamily);'), 'WPF applies the font family');
+    await exportProject('cpp', genProj, { apiBase: 'x', outRoot: join(scratch, 'genfontcpp') });
+    assert(readFileSync(join(scratch, 'genfontcpp', 'cpp/src/rose.h'), 'utf8').includes('{"mono__Index", {20, "#222222", "", 0, true, "Monospace", "", 0, 0, 0, 0, 0, "", 0, "", "", 1'), 'Qt maps monospace onto its Monospace style hint');
+    assert(readFileSync(join(scratch, 'genfontcpp', 'cpp/src/rose.cpp'), 'utf8').includes('font.setStyleHint(rose_font_hint(style.fontFamily))'), 'Qt applies the style hint');
+  }
+  // R151: a custom font-family in a stylesheet cannot be honored from CSS alone
+  // (the font file has to be registered with the platform), so every target
+  // says so instead of silently rendering the default. Generic families are the
+  // platform default and are not reported.
+  {
+    const so = await import('../src/export/state-ops.js') as Record<string, unknown>;
+    const customFontFamilies = so.customFontFamilies as ((css: string) => string[]) | undefined;
+    assert(typeof customFontFamilies === 'function', 'state-ops exports customFontFamilies');
+    const found = customFontFamilies!('.rcard { font-family: "Brand Sans", serif; }\n.b { font-family: monospace; }\n.c { font-family: Inter, sans-serif }');
+    assert(found.length === 2 && found[0] === 'Brand Sans' && found[1] === 'Inter', 'a custom font-family is detected, the generic ones in the same list are not');
+    assert(customFontFamilies!('.x { font-family: system-ui, sans-serif }').length === 0, 'a pure generic stack reports nothing');
+    const fontWarns = [...(flutter.warnings ?? []), ...(python.warnings ?? []), ...(arkts.warnings ?? []), ...(android.warnings ?? []), ...(xcode.warnings ?? []), ...(java.warnings ?? []), ...(dotnet.warnings ?? []), ...(cpp.warnings ?? [])].filter((w) => /font-family '.*' needs/.test(w));
+    assert(fontWarns.length === 0, 'the demo asks for no custom font, so no target reports one');
+    // R152: an @font-face family is really registered on Flutter - the file is
+    // copied into assets/fonts and pubspec declares it, so the face renders.
+    const fontFaces = so.fontFaces as ((css: string) => Array<{ family: string; file: string }>) | undefined;
+    assert(typeof fontFaces === 'function', 'state-ops exports fontFaces');
+    const faces = fontFaces!('@font-face { font-family: "Brand Sans"; src: url("/BrandSans.woff2") format("woff2"); }');
+    assert(faces.length === 1 && faces[0].family === 'Brand Sans' && faces[0].file === '/BrandSans.woff2', 'an @font-face rule is parsed into family + file');
+    // The demo declares no @font-face, so its pubspec carries no fonts section.
+    assert(!/^  fonts:/m.test(fread('pubspec.yaml')), 'a project with no @font-face emits no fonts section');
+    // R152 (end to end): a project that DOES declare one gets the font file
+    // copied into assets/fonts and a pubspec fonts entry naming it - so the
+    // custom face actually renders instead of silently falling back.
+    const fontProj = join(scratch, 'fontproj');
+    mkdirSync(join(fontProj, 'src/pages'), { recursive: true });
+    mkdirSync(join(fontProj, 'public'), { recursive: true });
+    writeFileSync(join(fontProj, 'public/BrandSans.woff2'), 'FAKE-FONT');
+    writeFileSync(join(fontProj, 'src/pages/index.rose'), `<style>
+@font-face { font-family: "Brand Sans"; src: url("/BrandSans.woff2") format("woff2"); }
+.brand { font-family: "Brand Sans", sans-serif; }
+</style>
+<h1 class="brand">Branded</h1>
+`);
+    const fontOut = await exportProject('flutter', fontProj, { apiBase: 'x', outRoot: join(scratch, 'fontout') });
+    assert(existsSync(join(fontOut.outDir, 'assets/fonts/BrandSans.woff2')), 'a declared font file is copied into the Flutter bundle');
+    const fontPubspec = readFileSync(join(fontOut.outDir, 'pubspec.yaml'), 'utf8');
+    assert(/  fonts:\n    - family: Brand Sans\n      fonts:\n        - asset: assets\/fonts\/BrandSans\.woff2/.test(fontPubspec), 'the declared font family is registered in pubspec.yaml');
+    assert(!/    - assets\/fonts\//.test(fontPubspec), 'the font is registered under fonts, not duplicated in the generic assets list');
+    assert(/fontFamily: "Brand Sans"/.test(readFileSync(join(fontOut.outDir, 'lib/styles.dart'), 'utf8')), 'a rule using the declared family maps to fontFamily');
+    assert(!(fontOut.warnings ?? []).some((w) => /font-family/.test(w)), 'a declared font family raises no warning');
+    // R153: Android registers fonts through res/font, which accepts .ttf/.otf but
+    // not .woff2 - the copy, the R.font reference and that refusal are all real.
+    const andProj = join(scratch, 'andfontproj');
+    mkdirSync(join(andProj, 'src/pages'), { recursive: true });
+    mkdirSync(join(andProj, 'public'), { recursive: true });
+    writeFileSync(join(andProj, 'public/BrandSans.ttf'), 'FAKE-TTF');
+    writeFileSync(join(andProj, 'public/WebOnly.woff2'), 'FAKE-WOFF2');
+    writeFileSync(join(andProj, 'src/pages/index.rose'), `<style>
+@font-face { font-family: "Brand Sans"; src: url("/BrandSans.ttf"); }
+@font-face { font-family: "Web Only"; src: url("/WebOnly.woff2"); }
+.brand { font-family: "Brand Sans", sans-serif; }
+</style>
+<h1 class="brand">Branded</h1>
+`);
+    const andOut = await exportProject('android', andProj, { apiBase: 'x', outRoot: join(scratch, 'andfontout') });
+    assert(existsSync(join(andOut.outDir, 'app/src/main/res/font/brand_sans.ttf')), 'a declared .ttf is copied into res/font');
+    assert(/fontFamily = FontFamily\(Font\(R\.font\.brand_sans\)\)/.test(readFileSync(join(andOut.outDir, 'app/src/main/java/dev/rosezm/app/pages/IndexPage.kt'), 'utf8')), 'an Android rule using the family maps to the R.font resource');
+    const andFontWarns = (andOut.warnings ?? []).filter((w) => /font-family/.test(w));
+    assert(andFontWarns.length === 1 && /Web Only.*woff2/.test(andFontWarns[0]), 'a .woff2 face is refused once, naming the format Android cannot register');
+    // R154: SwiftUI registers a bundled font by listing it under UIAppFonts in
+    // Info.plist, then refers to it by name with .font(.custom(...)).
+    const swProj = join(scratch, 'swfontproj');
+    mkdirSync(join(swProj, 'src/pages'), { recursive: true });
+    mkdirSync(join(swProj, 'public'), { recursive: true });
+    writeFileSync(join(swProj, 'public/BrandSans.ttf'), 'FAKE-TTF');
+    writeFileSync(join(swProj, 'src/pages/index.rose'), `<style>
+@font-face { font-family: "Brand Sans"; src: url("/BrandSans.ttf"); }
+.brand { font-family: "Brand Sans", sans-serif; }
+.orphan { font-family: "No Face"; }
+</style>
+<h1 class="brand">Branded</h1>
+<p class="orphan">Orphan</p>
+`);
+    const swOut = await exportProject('xcode', swProj, { apiBase: 'x', outRoot: join(scratch, 'swfontout') });
+    assert(existsSync(join(swOut.outDir, 'rosezmApp/Resources/BrandSans.ttf')), 'a declared font is copied into the Xcode Resources');
+    const swPlist = readFileSync(join(swOut.outDir, 'rosezmApp/Info.plist'), 'utf8');
+    assert(/<key>UIAppFonts<\/key>\s*<array>\s*<string>BrandSans\.ttf<\/string>/.test(swPlist), 'Info.plist declares the font under UIAppFonts');
+    // R219: an h1 carries the browser's own type scale, so the custom family
+    // comes with the heading's size instead of the body default.
+    assert(/\.font\(\.custom\("Brand Sans", size: 32\)\)/.test(readFileSync(join(swOut.outDir, 'rosezmApp/Pages/IndexView.swift'), 'utf8')), 'a SwiftUI rule using the family maps to .font(.custom(...))');
+    assert((swOut.warnings ?? []).some((w) => /'No Face' has no @font-face/.test(w)), 'an undeclared family is reported, not silently dropped');
+    // R155: a mini-program cannot load a font by path - WXSS resolves url()
+    // against its own package - so the bytes are inlined as a data URI, which is
+    // the one way the platform ships a custom font offline.
+    const mpProj = join(scratch, 'mpfontproj');
+    mkdirSync(join(mpProj, 'src/pages'), { recursive: true });
+    mkdirSync(join(mpProj, 'public'), { recursive: true });
+    const smallFont = Buffer.alloc(2048, 7);
+    writeFileSync(join(mpProj, 'public/BrandSans.woff2'), smallFont);
+    writeFileSync(join(mpProj, 'public/Huge.ttf'), Buffer.alloc(200 * 1024, 3));
+    writeFileSync(join(mpProj, 'src/pages/index.rose'), `<style>
+@font-face { font-family: "Brand Sans"; src: url("/BrandSans.woff2") format("woff2"); }
+@font-face { font-family: "Huge"; src: url("/Huge.ttf"); }
+.brand { font-family: "Brand Sans", sans-serif; }
+</style>
+<h1 class="brand">Branded</h1>
+`);
+    const mpOut = await exportProject('weapp', mpProj, { apiBase: 'x', outRoot: join(scratch, 'mpfontout') });
+    const mpWxss = readFileSync(join(mpOut.outDir, 'pages/index/index.wxss'), 'utf8');
+    assert(mpWxss.includes(`url(data:font/woff2;base64,${smallFont.toString('base64')})`), 'a mini-program font is inlined as a base64 data URI');
+    assert(mpWxss.includes('.rose-index .brand'), 'the inlined font does not disturb the page scoping');
+    assert(!mpWxss.includes('url(data:font/ttf'), 'a font over the inline limit is not inlined');
+    assert((mpOut.warnings ?? []).some((w) => /'Huge' could not be inlined.*96 KB inline limit/.test(w)), 'an over-limit font is reported with its size and the limit');
+    // R160: a non-literal {#await} head is a real promise. On a target that
+    // evaluates the block synchronously it would land in the state field as a
+    // promise object, so every page-emitting target says so.
+    const awaitProj = join(scratch, 'awaitproj');
+    mkdirSync(join(awaitProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(awaitProj, 'src/pages/index.rose'), `<script>
+  async function loadPosts() { return ['a']; }
+</script>
+{#await loadPosts()}
+  <p>Loading</p>
+{:then posts}
+  <ul>{#each posts as p}<li>{p}</li>{/each}</ul>
+{:catch err}
+  <p>Failed</p>
+{/await}
+`);
+    for (const [t, outName] of [['android', 'awaitand'], ['arkts', 'awaitark'], ['xcode', 'awaitsw'], ['flutter', 'awaitfl'], ['java', 'awaitjava'], ['dotnet', 'awaitnet'], ['cpp', 'awaitcpp'], ['python', 'awaitpy']] as const) {
+      const r = await exportProject(t as 'android', awaitProj, { apiBase: 'x', outRoot: join(scratch, outName) });
+      assert((r.warnings ?? []).some((w) => /#await\} head is a promise this target cannot await/.test(w)), `${t} warns that a non-literal {#await} head cannot be awaited`);
+    }
+    // R156: HarmonyOS has no font-resource registry, so a face becomes available
+    // to .fontFamily(name) by calling font.registerFont with the rawfile.
+    const arkProj = join(scratch, 'arkfontproj');
+    mkdirSync(join(arkProj, 'src/pages'), { recursive: true });
+    mkdirSync(join(arkProj, 'public'), { recursive: true });
+    writeFileSync(join(arkProj, 'public/BrandSans.ttf'), 'FAKE-TTF');
+    writeFileSync(join(arkProj, 'src/pages/index.rose'), `<style>
+@font-face { font-family: "Brand Sans"; src: url("/BrandSans.ttf"); }
+.brand { font-family: "Brand Sans", sans-serif; }
+.orphan { font-family: "No Face"; }
+</style>
+<h1 class="brand">Branded</h1>
+<p class="orphan">Orphan</p>
+`);
+    const arkOut = await exportProject('arkts', arkProj, { apiBase: 'x', outRoot: join(scratch, 'arkfontout') });
+    assert(existsSync(join(arkOut.outDir, 'entry/src/main/resources/rawfile/BrandSans.ttf')), 'a declared font is copied into HarmonyOS rawfile');
+    const arkEts = readFileSync(join(arkOut.outDir, 'entry/src/main/ets/pages/IndexPage.ets'), 'utf8');
+    assert(arkEts.includes("import { font } from '@kit.ArkUI';"), 'the page imports the font API only when a font is declared');
+    assert(/font\.registerFont\(\{ familyName: "Brand Sans", familySrc: \$rawfile\("BrandSans\.ttf"\) \}\);/.test(arkEts), 'aboutToAppear registers the family with the rawfile');
+    assert(/\.fontFamily\("Brand Sans"\)/.test(arkEts), 'a rule using the family maps to .fontFamily');
+    assert((arkOut.warnings ?? []).some((w) => /'No Face' has no @font-face/.test(w)), 'an undeclared family is reported, not silently dropped');
+  }
+  // R148: Tk (R147), Swing, WPF, Qt and Flutter each got a real store this round -
+  // a setter hook that mirrors the write and a load path that seeds the field.
+  assert(pread('app.py').includes('class RoseState(dict)'), 'Tk keeps its JSON-backed store');
+  assert(jread(`${japp}/RoseApp.java`).includes('prefs.put("rosezm:" + key') && jread(`${japp}/RoseApp.java`).includes('PERSIST_KEYS'), 'Swing mirrors $persist into Preferences');
+  assert(nread('RoseApp.cs').includes('.rosezm-state.json') && nread('RoseApp.cs').includes('PersistKeys'), 'WPF mirrors $persist into a JSON store');
+  assert(cread('src/main.cpp').includes('window.setPersisted({"theme"})') && cread('src/rose.cpp').includes('QSettings'), 'Qt mirrors $persist into QSettings');
+  assert(fread('lib/rosezm.dart').includes('dynamic rosezmLoad(String key)') && /rosezmLoad\("rosezm:theme"\)/.test(fread('lib/pages/persist_demo.dart')), 'Flutter mirrors $persist into a JSON store');
+  // R149: Compose has no setter hook on a `mutableStateOf`, so it uses the
+  // idiomatic pair - seed from SharedPreferences, mirror with LaunchedEffect.
+  assert(kread('app/src/main/java/dev/rosezm/app/pages/PersistDemoPage.kt').includes('getSharedPreferences("rosezm", android.content.Context.MODE_PRIVATE)'), 'Compose reads SharedPreferences for $persist');
+  assert(/mutableStateOf<String>\(__rosezmPrefs\.getString\("rosezm:theme", null\) \?\: "light"\)/.test(kread('app/src/main/java/dev/rosezm/app/pages/PersistDemoPage.kt')), 'a Compose $persist field seeds from SharedPreferences');
+  assert(/LaunchedEffect\(theme\) \{ __rosezmPrefs\.edit\(\)\.putString\("rosezm:theme", theme\.toString\(\)\)\.apply\(\) \}/.test(kread('app/src/main/java/dev/rosezm/app/pages/PersistDemoPage.kt')), 'a Compose $persist write is mirrored into SharedPreferences');
+  // R150: SwiftUI seeds from UserDefaults and mirrors with .onChange; ArkTS uses
+  // the @Watch decorator plus the preferences kit.
+  const swiftPersist = xread('rosezmApp/Pages/PersistDemoView.swift');
+  assert(/UserDefaults\.standard\.string\(forKey: "rosezm:theme"\) \?\? "light"/.test(swiftPersist), 'a SwiftUI $persist field seeds from UserDefaults');
+  assert(/\.onChange\(of: theme\) \{ _, new in UserDefaults\.standard\.set\(new, forKey: "rosezm:theme"\) \}/.test(swiftPersist), 'a SwiftUI $persist write is mirrored into UserDefaults');
+  const arktsPersist = aread('entry/src/main/ets/pages/PersistDemoPage.ets');
+  assert(/@State @Watch\('__persist_theme'\) theme: string = 'light';/.test(arktsPersist), 'an ArkTS $persist field carries a @Watch handler');
+  assert(/__persist_theme\(\): void \{[\s\S]*preferences\.getPreferencesSync[\s\S]*putSync\("rosezm:theme", this\.theme\)/.test(arktsPersist), 'the ArkTS @Watch handler writes the field into preferences');
+  assert(/if \(__rosezmP\.hasSync\("rosezm:theme"\)\) this\.theme = String\(__rosezmP\.getSync\("rosezm:theme", this\.theme\)\);/.test(arktsPersist), 'an ArkTS $persist field is seeded from preferences at load');
+  // R142: Swift and ArkTS each render a toggling control that keeps the array.
+  assert(/VStack\(alignment: \.leading, spacing: 4\) \{/.test(xread('rosezmApp/Pages/DeftestView.swift')) && /list\.append\("x"\)/.test(xread('rosezmApp/Pages/DeftestView.swift')), 'Swift renders toggling buttons for a <select multiple>, keeping the array shape');
+  assert(/Toggle\(\{ type: ToggleType\.Checkbox, isOn: this\.selm\.indexOf\("x"\) >= 0 \}\)/.test(aread('entry/src/main/ets/pages/DeftestPage.ets')), 'ArkTS renders checkbox Toggles for a <select multiple>, keeping the array shape');
+
+  // R141: the four imperative targets each get a native multi-select list whose
+  // selection is mirrored back into the array state (not a single-choice control).
+  assert(pread('pages/deftest.py').includes("tk.Listbox(") && pread('pages/deftest.py').includes("selectmode='multiple'") && /st\.__setitem__\('selm', \[\["x", "y"\]\[__i\] for __i in __lb_selm\.curselection\(\)\]\)/.test(pread('pages/deftest.py')), 'Tk uses a multiple-selection Listbox mirrored into the array state');
+  assert(readFileSync(join(jdir, japp, 'pages', 'DeftestPage.java'), 'utf8').includes('setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION)'), 'Swing uses a multi-selection JList');
+  assert(nread('Pages/DeftestPage.cs').includes('SelectionMode = SelectionMode.Multiple') && nread('Pages/DeftestPage.cs').includes('.SelectedItems.Cast<ListBoxItem>()'), 'WPF uses a multi-select ListBox whose SelectedItems are mirrored back');
+  assert(cread('src/pages/DeftestPage.cpp').includes('setSelectionMode(QAbstractItemView::MultiSelection)') && cread('src/pages/DeftestPage.cpp').includes('rose_contains('), 'Qt uses a multi-selection QListWidget seeded from the array state');
+
+
+  // 15. component slots on every target: the default children and every
+  // `slot="x"` child reach the component, and a named slot's scoped props
+  // resolve at the call site. Card.rose declares both kinds; about.rose fills
+  // them (`tone="green"` so the scoped prop resolves to a literal everywhere).
+  const wCard = readFileSync(join(result.outDir, 'components', 'Card', 'Card.wxml'), 'utf8');
+  assert(wCard.includes('<slot></slot>') && wCard.includes('<slot name="foot">'), 'the mini-program component template keeps both slot kinds');
+  const wAbout = readFileSync(join(result.outDir, 'pages', 'about', 'about.wxml'), 'utf8');
+  assert(wAbout.includes('slot="foot"') && wAbout.includes('{{"green"}}'), 'WXML routes the named child and the scoped prop resolves at the call site');
+  const dCard = readFileSync(join(flutter.outDir, 'lib', 'components', 'card.dart'), 'utf8');
+  const dAbout = readFileSync(join(flutter.outDir, 'lib', 'pages', 'about.dart'), 'utf8');
+  assert(dCard.includes('final Widget slotDefault;') && dCard.includes("final Widget Function(Map<String, dynamic>)? slotFoot;") && dCard.includes("slotFoot!({'note': tone})"), 'Flutter declares both slot params and calls the named slot with scoped props');
+  assert(dAbout.includes("slotDefault: roseBox(") && dAbout.includes("slotFoot: (props) =>") && (dAbout.includes("props['note']") || dAbout.includes('roseIndex(props, "note")')), 'Flutter passes the slot content as builders');
+  const ktCard = readFileSync(join(kdir, 'app/src/main/java/dev/rosezm/app/components/Card.kt'), 'utf8');
+  const ktAbout = readFileSync(join(kdir, 'app/src/main/java/dev/rosezm/app/pages/AboutPage.kt'), 'utf8');
+  assert(ktCard.includes('slotDefault: @Composable () -> Unit = {}') && ktCard.includes('slotFoot: @Composable (Map<String, Any?>) -> Unit = {}') && ktCard.includes('slotFoot(mapOf("note" to tone))'), 'Compose declares both slot lambdas and calls the named slot with scoped props');
+  assert(ktAbout.includes('slotDefault = {') && ktAbout.includes('slotFoot = { props ->') && ktAbout.includes('props["note"]'), 'Compose passes the slot content as lambdas');
+  const swCard = readFileSync(join(xcode.outDir, 'rosezmApp', 'Components', 'CardView.swift'), 'utf8');
+  const swAbout = readFileSync(join(xcode.outDir, 'rosezmApp', 'Pages', 'AboutView.swift'), 'utf8');
+  assert(swCard.includes('var slotDefault: AnyView = AnyView(EmptyView())') && swCard.includes('(_ props: [String: Any]) -> AnyView') && swCard.includes('slotFoot(["note": tone as Any])'), 'SwiftUI declares both slots and calls the named slot with scoped props');
+  assert(swAbout.includes('slotDefault: AnyView(') && swAbout.includes('slotFoot: { props in') && swAbout.includes('props["note"]'), 'SwiftUI passes the slot content as closures');
+  const etsCard = readFileSync(join(arkts.outDir, 'entry/src/main/ets/components/CardPage.ets'), 'utf8');
+  const etsAbout = readFileSync(join(arkts.outDir, 'entry/src/main/ets/pages/AboutPage.ets'), 'utf8');
+  assert(etsCard.includes('@BuilderParam slotDefault: (props: Record<string, Object>) => void;') && etsCard.includes("@BuilderParam slotFoot: (props: Record<string, Object>) => void;") && etsCard.includes("this.slotFoot({ 'note': tone })"), 'ArkTS declares both builder params and calls the named slot with scoped props');
+  assert(etsAbout.includes('slotDefault: this.__sb') && etsAbout.includes('slotFoot: this.__sb') && etsAbout.includes("props['note']"), 'ArkTS passes the slot content as @Builder methods');
+  const jCard = readFileSync(join(java.outDir, 'src/main/java/dev/rosezm/app/components/CardView.java'), 'utf8');
+  const jAbout = readFileSync(join(java.outDir, 'src/main/java/dev/rosezm/app/pages/AboutPage.java'), 'utf8');
+  assert(jCard.includes('java.util.function.Consumer<JPanel> slotDefault') && jCard.includes('java.util.function.BiConsumer<Map<String, Object>, JPanel> slotFoot') && jCard.includes('slotFoot.accept(Map.of("note", tone)'), 'Swing declares both slot callbacks and calls the named slot with scoped props');
+  assert(jAbout.includes('__slot -> {') && jAbout.includes('(props, __slot) -> {') && jAbout.includes('props.get("note")'), 'Swing passes the slot content as lambdas');
+  const nCard = readFileSync(join(dotnet.outDir, 'Components/CardView.cs'), 'utf8');
+  const nAbout = readFileSync(join(dotnet.outDir, 'Pages/AboutPage.cs'), 'utf8');
+  assert(nCard.includes('Action<Panel> slotDefault') && nCard.includes('Action<IDictionary<string, object?>, Panel> slotFoot') && nCard.includes('slotFoot(new Dictionary<string, object?> { { "note", tone } }'), 'WPF declares both slot actions and calls the named slot with scoped props');
+  assert(nAbout.includes('__slot => {') && nAbout.includes('(props, __slot) => {') && nAbout.includes('props["note"]'), 'WPF passes the slot content as lambdas');
+  const cCard = readFileSync(join(cpp.outDir, 'src/components/CardView.cpp'), 'utf8');
+  const cAbout = readFileSync(join(cpp.outDir, 'src/pages/AboutPage.cpp'), 'utf8');
+  assert(cCard.includes('const std::function<void(QWidget*)>& slotDefault') && cCard.includes('const std::function<void(const std::map<std::string, RoseValue>&, QWidget*)>& slotFoot') && cCard.includes('slotFoot({ { "note", RoseValue(tone) } }'), 'Qt declares both slot callables and calls the named slot with scoped props');
+  assert(cAbout.includes('[](QWidget* __slot) {') && cAbout.includes('[](const std::map<std::string, RoseValue>& props, QWidget* __slot) {') && cAbout.includes('rose_get(props, "note")'), 'Qt passes the slot content as lambdas');
+  const pyAbout = readFileSync(join(python.outDir, 'pages', 'about.py'), 'utf8');
+  assert(pyAbout.includes("default slot: the caller's children render here") && pyAbout.includes("the foot sees note: {rose_text(lambda: 'green')}"), 'Tkinter inlines the component with both slots filled and the scoped prop resolved');
+  assert(!/<slot|slot=|\{#snippet|\{@render/.test(pyAbout), 'no slot syntax survives into the inlined Python');
+
+  // 16. {#await} loading states: the promise is evaluated by the page's own
+  // lifecycle and the three branches render by the settle state.
+  const dAwait = readFileSync(join(flutter.outDir, 'lib', 'pages', 'await_demo.dart'), 'utf8');
+  assert(dAwait.includes('__await0Done ? (__await0Err != null ?') && dAwait.includes('__runAwait0();') && dAwait.includes('roseThrow('), 'Flutter runs the promise in initState and renders the settle state');
+  const kAwait = readFileSync(join(kdir, 'app/src/main/java/dev/rosezm/app/pages/AwaitDemoPage.kt'), 'utf8');
+  // R174: the head must keep its query read live. The old assertion pinned
+  // `(false ? roseThrow(` - the constant-folded ternary that made `?broken=1`
+  // unreachable - so it is corrected to assert the live condition instead.
+  assert(kAwait.includes('params.broken == "1" ? roseThrow(') && kAwait.includes('LaunchedEffect(Unit) {') && kAwait.includes('if (__await0Done) {'), 'Compose evaluates the live promise head in a LaunchedEffect and renders the settle state');
+  assert(!kAwait.includes('rosezm_query'), 'Compose spells $query() as the route params, not an invented helper');
+  const sAwait = readFileSync(join(xcode.outDir, 'rosezmApp', 'Pages', 'AwaitDemoView.swift'), 'utf8');
+  assert(sAwait.includes('.task { await loadData(); await __runAwait0() }') && sAwait.includes('if __await0Done {') && sAwait.includes('roseThrow('), 'SwiftUI runs the promise in the .task modifier and renders the settle state');
+  const aAwait = readFileSync(join(arkts.outDir, 'entry/src/main/ets/pages/AwaitDemoPage.ets'), 'utf8');
+  assert(aAwait.includes('this.__runAwait0();') && aAwait.includes('if (this.__await0Done) {') && aAwait.includes('roseThrow('), 'ArkTS runs the promise in aboutToAppear and renders the settle state');
+  const pAwait = readFileSync(join(python.outDir, 'pages', 'await_demo.py'), 'utf8');
+  assert(pAwait.includes('threading.Thread(target=__await0_run') && pAwait.includes("if globals().get('__await0_done'):") && pAwait.includes('roseThrow('), 'Tkinter evaluates the promise on a thread and re-renders on settle');
+  const jAwait = readFileSync(join(java.outDir, 'src/main/java/dev/rosezm/app/pages/AwaitDemoPage.java'), 'utf8');
+  assert(jAwait.includes('__await0Value = (app.param("broken") == "1" ? roseThrow(') && jAwait.includes('} catch (Exception e) {') && jAwait.includes('if (__await0Failed) {'), 'Swing evaluates the live promise head synchronously and renders the settle state');
+  const nAwait = readFileSync(join(dotnet.outDir, 'Pages/AwaitDemoPage.cs'), 'utf8');
+  assert(nAwait.includes('__await0Value = (app.Param("broken") == "1" ? roseThrow(') && nAwait.includes('catch (Exception e)') && nAwait.includes('if (__await0Failed)'), 'WPF evaluates the live promise head synchronously and renders the settle state');
+  const cAwait = readFileSync(join(cpp.outDir, 'src/pages/AwaitDemoPage.cpp'), 'utf8');
+  assert(cAwait.includes('__await0Value = (app.param("broken") == RoseValue("1") ? roseThrow(') && cAwait.includes('} catch (const std::exception& e) {') && cAwait.includes('if (__await0Failed) {'), 'Qt evaluates the live promise head synchronously and renders the settle state');
+  const wAwait = readFileSync(join(result.outDir, 'pages', 'await-demo', 'await-demo.wxml'), 'utf8');
+  const wAwaitJs = readFileSync(join(result.outDir, 'pages', 'await-demo', 'await-demo.js'), 'utf8');
+  assert(wAwait.includes('wx:if="{{__await0Failed}}"') && wAwait.includes('wx:elif="{{__await0Done}}"') && wAwait.includes('wx:else>'), 'the mini program renders the await branches by state');
+  assert(wAwaitJs.includes('awaits: [{ expr: ') && wAwaitJs.includes('roseThrow('), 'the mini program page evaluates the promise in onLoad');
+  assert(readFileSync(join(result.outDir, 'utils', 'rosezm.js'), 'utf8').includes('function roseThrow'), 'the mini-program runtime ships roseThrow');
+
+  // 17. two-way component props: a call-site `bind:value={state}` rides the
+  // value in through the prop and the edits back out through the generated
+  // change callback.
+  const twDart = readFileSync(join(flutter.outDir, 'lib', 'components', 'text_field.dart'), 'utf8');
+  const twDBind = readFileSync(join(flutter.outDir, 'lib', 'pages', 'bind_demo.dart'), 'utf8');
+  assert(twDart.includes('final void Function(dynamic)? onValueChange;') && twDart.includes('onValueChange?.call(value)'), 'Flutter declares the implicit change callback and wires the input to it');
+  assert(twDBind.includes('onValueChange: (v) => __set(\'name\', v)'), 'Flutter writes the parent state from the change callback');
+  const twKt = readFileSync(join(kdir, 'app/src/main/java/dev/rosezm/app/components/TextField.kt'), 'utf8');
+  const twKBind = readFileSync(join(kdir, 'app/src/main/java/dev/rosezm/app/pages/BindDemoPage.kt'), 'utf8');
+  assert(twKt.includes('onValueChange: (Any?) -> Unit = {}') && twKt.includes('onValueChange = { v -> onValueChange(v) }'), 'Compose declares the implicit change callback and wires the input to it');
+  assert(twKBind.includes('onValueChange = { v -> name = v }'), 'Compose writes the parent state from the change callback');
+  const twSwift = readFileSync(join(xcode.outDir, 'rosezmApp', 'Components', 'TextFieldView.swift'), 'utf8');
+  const twSBind = readFileSync(join(xcode.outDir, 'rosezmApp', 'Pages', 'BindDemoView.swift'), 'utf8');
+  assert(twSwift.includes('var onValueChange: (Any?) -> Void = { _ in }') && twSwift.includes('set: { v in onValueChange(v) }'), 'SwiftUI declares the implicit change closure and wires the input to it');
+  assert(twSBind.includes('onValueChange: { v in name = v }'), 'SwiftUI writes the parent state from the change closure');
+  const twArk = readFileSync(join(arkts.outDir, 'entry/src/main/ets/components/TextFieldPage.ets'), 'utf8');
+  const twABind = readFileSync(join(arkts.outDir, 'entry/src/main/ets/pages/BindDemoPage.ets'), 'utf8');
+  assert(twArk.includes('onValueChange: (v: Object) => void = () => {};') && twArk.includes('this.onValueChange(value);'), 'ArkTS declares the implicit change callback and wires the input to it');
+  assert(twABind.includes('onValueChange: (v: Object) => { this.name = v; }'), 'ArkTS writes the parent state from the change callback');
+  const twPy = readFileSync(join(python.outDir, 'pages', 'bind_demo.py'), 'utf8');
+  assert(twPy.includes("__var_name = tk.StringVar(value=st.get('name', ''))") && twPy.includes("__var_name.trace_add('write', lambda *_: st.__setitem__('name', __var_name.get()))"), 'Tkinter binds the inlined component input to the parent state');
+  const twJava = readFileSync(join(java.outDir, 'src/main/java/dev/rosezm/app/components/TextFieldView.java'), 'utf8');
+  const twJBind = readFileSync(join(java.outDir, 'src/main/java/dev/rosezm/app/pages/BindDemoPage.java'), 'utf8');
+  assert(twJava.includes('java.util.function.Consumer<Object> onValueChange') && twJava.includes('onValueChange.accept(field.getText())'), 'Swing declares the implicit change callback and wires the field to it');
+  assert(twJBind.includes('v -> { app.set("name", v); app.render(); }'), 'Swing writes the parent state from the change callback');
+  const twNet = readFileSync(join(dotnet.outDir, 'Components/TextFieldView.cs'), 'utf8');
+  const twNBind = readFileSync(join(dotnet.outDir, 'Pages/BindDemoPage.cs'), 'utf8');
+  assert(twNet.includes('Action<object?> onValueChange') && twNet.includes('onValueChange(box.Text)'), 'WPF declares the implicit change callback and wires the box to it');
+  assert(twNBind.includes('v => { app.Set("name", v); app.Render(); }'), 'WPF writes the parent state from the change callback');
+  const twCpp = readFileSync(join(cpp.outDir, 'src/components/TextFieldView.cpp'), 'utf8');
+  const twCBind = readFileSync(join(cpp.outDir, 'src/pages/BindDemoPage.cpp'), 'utf8');
+  const twHeader = readFileSync(join(cpp.outDir, 'src/pages.h'), 'utf8');
+  assert(twCpp.includes('const std::function<void(const RoseValue&)>& onValueChange') && twCpp.includes('onValueChange(RoseValue(t.toStdString()))'), 'Qt declares the implicit change callback and wires the editor to it');
+  assert(twCBind.includes('app.set("name", v); app.render();'), 'Qt writes the parent state from the change callback');
+  assert(twHeader.includes('buildTextFieldView(RoseApp& app, QWidget* parent, const RoseValue& value, const RoseValue& placeholder, const std::function<void(const RoseValue&)>& onValueChange)'), 'the Qt header declares the two-way callback');
+  const twMpWxml = readFileSync(join(result.outDir, 'components', 'TextField', 'TextField.wxml'), 'utf8');
+  const twMpJs = readFileSync(join(result.outDir, 'components', 'TextField', 'TextField.js'), 'utf8');
+  const twMpPage = readFileSync(join(result.outDir, 'pages', 'bind-demo', 'bind-demo.wxml'), 'utf8');
+  const twMpPageJs = readFileSync(join(result.outDir, 'pages', 'bind-demo', 'bind-demo.js'), 'utf8');
+  assert(twMpWxml.includes('bindinput=') && twMpJs.includes('this.triggerEvent("valuechange"'), 'the mini-program component reports its edits as an event');
+  assert(twMpPage.includes('bind:valuechange="__bp0"') && twMpPageJs.includes('__bp0: function (e) { this.__set("name", e.detail); }'), 'the mini-program call site binds the change event to the parent state');
+
+  // R120: two-way CHECKBOX and GROUP props on a component - the gap the
+  // remaining-depth list named. The state rides on the NAMED prop, the edit
+  // comes back as the component's change event.
+  assert(twMpPage.includes('<check-field checked="{{subscribed}}" bind:checkedchange="__bp1" group="{{colors}}" bind:groupchange="__bp2"'), 'the mini-program call site passes checked/group on their OWN props with the change events bound');
+  const cgMpJs = readFileSync(join(result.outDir, 'components', 'CheckField', 'CheckField.js'), 'utf8');
+  assert(cgMpJs.includes('triggerEvent("checkedchange", v)') && cgMpJs.includes('var own = ["red","blue"]') && cgMpJs.includes('triggerEvent("groupchange", next)'), 'the mini-program component converts the checkbox bool and MERGES its group options into the parent array');
+  const cgMpWxml = readFileSync(join(result.outDir, 'components', 'CheckField', 'CheckField.wxml'), 'utf8');
+  assert(cgMpWxml.includes(`checked="{{(group || []).indexOf('red') !== -1}}"`), 'the group checkbox reads the property directly (no flag data a component never has)');
+  const cgDart = readFileSync(join(flutter.outDir, 'lib', 'components', 'check_field.dart'), 'utf8');
+  assert(cgDart.includes('onCheckedChange') && cgDart.includes('onGroupChange'), 'Flutter declares both implicit change callbacks');
+  const cgKt = readFileSync(join(kdir, 'app/src/main/java/dev/rosezm/app/components/CheckField.kt'), 'utf8');
+  assert(cgKt.includes('onCheckedChange') && cgKt.includes('onGroupChange'), 'Compose declares both implicit change callbacks');
+
+  // 14. inline handlers (R99): the bare signal form
+  // `on:click={taps.set(taps() + 1)}` and the arrow form
+  // `on:click={() => $setState('stamped', total)}` must leave as a real state
+  // write in EVERY target - before R99 eight of the ten dropped them with a
+  // warning and the exported button did nothing. The demo carries both forms
+  // (bare.rose / const-demo.rose), so the same source proves all ten.
+  const inlineTargets: Array<[string, string, string]> = [
+    ['weapp', 'pages/bare/bare.js', "__setState('taps', state.taps + 1)"],
+    ['weapp', 'pages/const-demo/const-demo.js', "__setState('stamped', total)"],
+    ['alipay', 'pages/bare/bare.js', "__setState('taps', state.taps + 1)"],
+    ['alipay', 'pages/const-demo/const-demo.js', "__setState('stamped', total)"],
+    ['flutter', 'lib/pages/bare.dart', "__set('taps', taps + 1)"],
+    ['flutter', 'lib/pages/const_demo.dart', "__set('stamped', total)"],
+    ['python', 'pages/bare.py', "st['taps'] = st.get('taps') + 1"],
+    ['python', 'pages/const_demo.py', "st['stamped'] = total"],
+    ['arkts', 'entry/src/main/ets/pages/BarePage.ets', 'this.taps = this.taps + 1;'],
+    ['arkts', 'entry/src/main/ets/pages/ConstDemoPage.ets', 'this.stamped = total;'],
+    ['android', 'app/src/main/java/dev/rosezm/app/pages/BarePage.kt', 'taps = taps + 1'],
+    ['android', 'app/src/main/java/dev/rosezm/app/pages/ConstDemoPage.kt', 'stamped = total'],
+    ['xcode', 'rosezmApp/Pages/BareView.swift', 'taps = taps + 1'],
+    ['xcode', 'rosezmApp/Pages/ConstDemoView.swift', 'stamped = total'],
+    ['java', 'src/main/java/dev/rosezm/app/pages/BarePage.java', 'app.set("taps", RoseTheme.integer(app.v("taps")) + 1)'],
+    ['java', 'src/main/java/dev/rosezm/app/pages/ConstDemoPage.java', 'app.set("stamped", total)'],
+    ['dotnet', 'Pages/BarePage.cs', 'app.Set("taps", RoseTheme.Int(app.V("taps")) + 1)'],
+    ['dotnet', 'Pages/ConstDemoPage.cs', 'app.Set("stamped", total)'],
+    ['cpp', 'src/pages/BarePage.cpp', 'app.set("taps", app.v("taps") + 1)'],
+    ['cpp', 'src/pages/ConstDemoPage.cpp', 'app.set("stamped", total)'],
+  ];
+  const inlineDirs: Record<string, string> = { weapp: result.outDir, alipay: alipay.outDir, flutter: flutter.outDir, python: pdir, arkts: adir2, android: kdir, xcode: xdir, java: java.outDir, dotnet: dotnet.outDir, cpp: cpp.outDir };
+  for (const [target, rel, needle] of inlineTargets) {
+    assert(readFileSync(join(inlineDirs[target], rel), 'utf8').includes(needle), `${target} translates the inline handler into a real state write (${needle.slice(0, 44)})`);
+  }
+  const inlineWarnings = [...(result.warnings ?? []), ...(flutter.warnings ?? []), ...(python.warnings ?? []), ...(arkts.warnings ?? []), ...(android.warnings ?? []), ...(xcode.warnings ?? []), ...(java.warnings ?? []), ...(dotnet.warnings ?? []), ...(cpp.warnings ?? [])]
+    .filter((w) => /inline handler/.test(w));
+  assert(inlineWarnings.length === 0, `no target leaves an inline handler untranslated (${inlineWarnings.length} warnings)`);
+
+  // 15b. SVG vectors (R100): /logo.svg used to be SKIPPED on six targets and
+  // referenced a media file that was never copied on the rest - the exported
+  // logo was a placeholder everywhere. One shared path parser now feeds a
+  // native drawing per target: the SAME svg file, ten real renderings.
+  const vectorTargets: Array<[string, string, string]> = [
+    ['weapp', 'pages/about/about.wxml', '<canvas type="2d" id="__vec0"'],
+    ['weapp', 'pages/about/about.js', 'c.bezierCurveTo('],
+    ['alipay', 'pages/about/about.axml', '<canvas type="2d" id="__vec0"'],
+    ['flutter', 'lib/pages/about.dart', 'RoseSvgPainter(ops: roseLogoVectorOps'],
+    ['flutter', 'lib/vectors.dart', 'const List<List<double>> roseLogoVectorOps = const ['],
+    ['python', 'pages/about.py', '.create_polygon('],
+    ['arkts', 'entry/src/main/ets/pages/AboutPage.ets', 'Canvas(this.__vec0)'],
+    ['android', 'app/src/main/res/drawable/logo.xml', 'android:pathData="M140.19,224.81'],
+    ['android', 'app/src/main/java/dev/rosezm/app/pages/AboutPage.kt', 'painterResource(id = R.drawable.logo)'],
+    ['xcode', 'rosezmApp/Pages/AboutView.swift', 'p.addCurve(to: CGPoint('],
+    ['java', 'src/main/java/dev/rosezm/app/pages/AboutPage.java', 'RoseTheme.vector('],
+    ['java', 'src/main/java/dev/rosezm/app/RoseTheme.java', 'class RoseVector extends JComponent'],
+    ['dotnet', 'Pages/AboutPage.cs', 'RoseTheme.Vector('],
+    ['dotnet', 'RoseTheme.cs', 'public static Grid Vector('],
+    ['cpp', 'src/pages/AboutPage.cpp', 'rose_vector('],
+    ['cpp', 'src/rose.h', 'class RoseVector : public QWidget'],
+  ];
+  const vectorDirs: Record<string, string> = { weapp: result.outDir, alipay: alipay.outDir, flutter: flutter.outDir, python: pdir, arkts: adir2, android: kdir, xcode: xdir, java: java.outDir, dotnet: dotnet.outDir, cpp: cpp.outDir };
+  for (const [target, rel, needle] of vectorTargets) {
+    assert(readFileSync(join(vectorDirs[target], rel), 'utf8').includes(needle), `${target} draws the SVG logo natively (${needle.slice(0, 40)})`);
+  }
+  const svgWarnings = [...(result.warnings ?? []), ...(flutter.warnings ?? []), ...(python.warnings ?? []), ...(arkts.warnings ?? []), ...(android.warnings ?? []), ...(xcode.warnings ?? []), ...(java.warnings ?? []), ...(dotnet.warnings ?? []), ...(cpp.warnings ?? [])]
+    .filter((w) => /svg|SVG|logo/i.test(w));
+  assert(svgWarnings.length === 0, `no target skips or placeholders the SVG logo (${svgWarnings.length} warnings)`);
+  // R136: `<use href="#id">` inlines the referenced <path> (re-based by x/y), and
+  // a <defs> shape is drawn only through such a reference - so icon sprites parse
+  // on every target with no emitter change. (The parser used to refuse `<use>`.)
+  {
+    const { parseSvg } = await import('../src/export/svg-path.js');
+    const sprite = parseSvg('<svg viewBox="0 0 100 100"><defs><path id="dot" d="M0,0 L10,0 L10,10 L0,10 Z" fill="#ff0000"/></defs><use href="#dot" x="20" y="30"/><use href="#dot" x="50" y="30" fill="#0000ff"/></svg>');
+    assert(sprite.shape !== null && sprite.shape.subPaths.length === 2, 'a <use> referencing a defs path inlines it (two subpaths, defs not drawn in place)');
+    assert(sprite.shape!.subPaths[0].fill === '#ff0000' && sprite.shape!.subPaths[0].ops[0].op === 'move' && sprite.shape!.subPaths[0].ops[0].x === 20 && sprite.shape!.subPaths[0].ops[0].y === 30, 'the use x/y re-bases the inlined ops');
+    assert(sprite.shape!.subPaths[1].fill === '#0000ff', 'a fill on the <use> overrides the definition fill');
+    const noDefs = parseSvg('<svg viewBox="0 0 10 10"><defs><path id="hidden" d="M0,0 L5,5"/></defs></svg>');
+    assert(noDefs.shape === null && /no drawable/.test(noDefs.reason ?? ''), 'a <defs> path is never drawn unless a <use> references it');
+    // R137: linear/radial gradients are resolved; fill=url(#id) carries the
+    // gradient and the first stop as a solid fallback for targets that cannot
+    // paint one. (Gradients used to be refused, skipping the whole asset.)
+    const lin = parseSvg('<svg viewBox="0 0 100 100"><defs><linearGradient id="g" x1="0" y1="0" x2="100" y2="0"><stop offset="0" stop-color="#ff0000"/><stop offset="1" stop-color="#0000ff"/></linearGradient></defs><path d="M0,0 L10,10 Z" fill="url(#g)"/></svg>');
+    assert(lin.shape !== null && lin.shape.subPaths[0].gradient?.type === 'linear', 'a linearGradient resolves onto the path');
+    assert(lin.shape!.subPaths[0].fill === '#ff0000' && lin.shape!.subPaths[0].gradient!.stops.length === 2 && lin.shape!.subPaths[0].gradient!.stops[1].color === '#0000ff', 'the first stop is the solid fallback, the gradient carries every stop');
+    assert(lin.shape!.subPaths[0].gradient!.x2 === 100, 'the gradient coordinates are in viewBox units');
+    const rad = parseSvg('<svg viewBox="0 0 100 100"><defs><radialGradient id="r" cx="50" cy="50" r="40"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#000000"/></radialGradient></defs><path d="M0,0 L10,10 Z" fill="url(#r)"/></svg>');
+    assert(rad.shape!.subPaths[0].gradient?.type === 'radial' && rad.shape!.subPaths[0].gradient!.r === 40, 'a radialGradient resolves with its radius');
+  }
+  // The mini-program package now ships its public rasters at the root, so a
+  // page's src="/rose.png" resolves as it does on the web.
+  assert(existsSync(join(result.outDir, 'rose.png')), 'the mini-program package copies its public raster assets to the root');
+
+  // R193: the style engine. The exporter used to read the FIRST class of an
+  // element and nothing about layout, so a page styled in .rose came out as a
+  // stack of default widgets. This fixture exercises the whole contract once:
+  // a flex container with gap/alignment, a descendant selector, a multi-class
+  // element, a media guard, and the dynamic half (class={state} and
+  // style:prop={state}) that must become real runtime code.
+  const styleProj = join(scratch, 'styleproj');
+  mkdirSync(join(styleProj, 'src/pages'), { recursive: true });
+  writeFileSync(join(styleProj, 'src/pages/index.rose'), `<script>
+  let count = $state(0);
+  let tone = $state('primary');
+  let accent = $state('#ff0000');
+  function inc() { $setState('count', count() + 1); }
+</script>
+<style>
+  .hero { display: flex; flex-direction: row; justify-content: space-between; align-items: center; gap: 12px; background: #123456; padding: 1rem 2rem; border-radius: 8px; }
+  .strip { display: flex; gap: 8px; }
+  .hd { color: #123456; }
+  .hero .title { font-size: 2rem; font-weight: 700; color: #ffffff; text-transform: uppercase; letter-spacing: 0.5px; }
+  .btn { background: #e91e63; color: #ffffff; padding: 8px 16px; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3); }
+  .primary { border: 2px solid #000000; }
+  .muted { color: #999999; }
+  @media (max-width: 480px) { .hero { flex-direction: column; gap: 4px; } }
+  .strip > .pill { color: #00ff00; font-weight: 700; }
+  .card:hover { color: #ff0000; }
+  @keyframes pulse { from { opacity: 0.5; } to { opacity: 1; } }
+  .pulse { animation: pulse 1s ease-in-out infinite; }
+</style>
+<div class="hero">
+  <span class="title muted">Hello Rose</span>
+  <button class="btn primary" on:click={inc}>{count}</button>
+</div>
+<div class="strip"><span class="pill">pill</span><span>one</span><span>two</span></div>
+<span class="pill">loose</span>
+<h2 class="hd">Head</h2>
+<p class={tone} style:color={accent}>bound</p>
+<p style="padding: 3px 4px 5px 6px; opacity: 0.4">inline</p>
+<p class={{ on: count > 1, off: count <= 1, always: true, never: false }} style={{ color: accent, 'font-size': '20px' }}>shorthand</p>
+<p class={{ a: true, b: false, c: 1 }} style={{ color: 'red', margin: 0 }}>literal</p>
+<p class="card" style="color: #111111; padding: 9px" style:color={accent}>merged</p>
+<span class="pulse">beat</span>
+`);
+  const styleOut = await exportProject('flutter', styleProj, { apiBase: 'x', outRoot: join(scratch, 'styleout') });
+  const stStyles = readFileSync(join(styleOut.outDir, 'lib/styles.dart'), 'utf8');
+  const stIndex = readFileSync(join(styleOut.outDir, 'lib/pages/index.dart'), 'utf8');
+  assert(/'hero__index': RoseStyle\(/.test(stStyles), 'a flex rule reaches the style map as a layout, not just colour');
+  assert(stStyles.includes("direction: 'column'") && stStyles.includes("justify: 'between'") && stStyles.includes("items: 'center'"), 'flex direction, main-axis and cross-axis all survive');
+  assert(stStyles.includes('gap: 4'), 'the gap reaches the layout as a number - and the media-guarded 4px wins at the reference width');
+  assert(stStyles.includes("'muted__index'"), 'the second class of the element has its own entry (no class is dropped)');
+  assert(stStyles.includes("'title__index'") && stStyles.includes('fontSize: 32') && stStyles.includes("transform: 'uppercase'"), 'typography: size, weight and text-transform reach the model');
+  assert(stStyles.includes('letterSpacing: 0.5'), 'letter-spacing survives');
+  assert(stStyles.includes('border: Border.all(color: Color(0xFF000000), width: 2)'), "the second class's border arrives as a real Border");
+  assert(stStyles.includes('BoxShadow') && stStyles.includes('blurRadius: 6'), 'a box-shadow becomes a real shadow with its blur');
+  assert(/roseResolve\(const <String>\['title', 'muted'\], 'index'/.test(stIndex), 'every literal class is passed to the resolver, not just the first');
+  assert(stIndex.includes('roseFlex('), 'the styled container emits a layout driven by the style');
+  assert(stIndex.includes('roseStyles[\'hero__index\']') || stIndex.includes('roseResolve('), 'the element resolves through its scoped class entry');
+  // The dynamic half: a class bound to state and a style:prop bound to state
+  // must be a runtime call, never a warning.
+  assert(stIndex.includes('roseResolve('), 'a state-bound class becomes a runtime roseResolve call');
+  assert(/roseResolve\(<String>\[tone\]/.test(stIndex), 'the bound class name is passed as an expression, not baked');
+  // R200: Dart only allows literals inside a `const` list, so a read of a state
+  // variable has to drop the keyword - `const <String>[tone]` is a compile error
+  // ("constant list elements must be constants") that no shape check can see.
+  assert(!/roseResolve\(const <String>\[tone\]/.test(stIndex), 'a state-bound class list is not emitted as a const list');
+  assert(/props: <String, dynamic>\{'color': accent\}/.test(stIndex), 'style:color={accent} becomes a runtime property override');
+  assert(/inline: RoseStyle\(padding: EdgeInsets\.fromLTRB\(6, 3, 4, 5\), opacity: 0\.4\)/.test(stIndex), 'a literal style="" is compiled into the same resolve call');
+  assert(!/^\s*void\s+[A-Za-z_$][\w$]*\s*;/m.test(stIndex), 'no value is discarded on the way out');
+  // Nothing about this fixture may be reported as unsupported: it is exactly
+  // what the engine exists for.
+  const styleWarns = (styleOut.warnings ?? []).filter((w) => /hero|btn|title|muted|primary/.test(w));
+  assert(styleWarns.length === 0, `the rich fixture exports without warnings (${styleWarns[0] ?? 'clean'})`);
+  // R212: the flex direction the CSS default gives (display:flex, no
+  // flex-direction = a row) reaches the compiled table, and the heading's
+  // optional base TextStyle keeps its comma - a jammed `...resolve(...)base:`
+  // is not valid Dart and the project would not compile.
+  assert(stStyles.includes("direction: 'row'"), 'a display:flex class with no flex-direction carries the CSS-default row in the compiled table (.strip)');
+  assert(stIndex.includes("roseResolve(const <String>['strip'], 'index', 'div'), roseFlex("), 'the strip flex container resolves its class and lays out as a runtime flex');
+  assert(stIndex.includes(', base: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)'), 'the styled h2 base TextStyle rides as a proper named argument after a comma');
+
+  // The same fixture through Android/Compose: the shared engine reaches Compose
+  // the same way - a scoped theme table, Compose's own Text parameters and
+  // Modifier chain, and a runtime roseResolve for the bound half.
+  const styleAnd = await exportProject('android', styleProj, { apiBase: 'x', outRoot: join(scratch, 'styleout-a') });
+  const saTheme = readFileSync(join(styleAnd.outDir, 'app/src/main/java/dev/rosezm/app/kit/RoseTheme.kt'), 'utf8');
+  const saIndex = readFileSync(join(styleAnd.outDir, 'app/src/main/java/dev/rosezm/app/pages/IndexPage.kt'), 'utf8');
+  assert(/"hero__Index" to RoseStyle\(/.test(saTheme), 'a flex rule reaches the Compose theme as a layout, not just colour');
+  assert(saTheme.includes('direction = "column"') && saTheme.includes('justify = "between"') && saTheme.includes('items = "center"'), 'flex direction, main-axis and cross-axis reach Compose');
+  assert(saTheme.includes('gap = 4f'), 'the media-guarded gap wins at the reference width on Compose too');
+  assert(saTheme.includes('"muted__Index"') && saTheme.includes('"title__Index"'), 'every class of the element has its own theme entry');
+  assert(saTheme.includes('fontSize = 32f') && saTheme.includes('weight = FontWeight.Bold') && saTheme.includes('letterSpacing = 0.5f'), 'typography reaches the theme');
+  assert(saTheme.includes('borderWidth = 2f') && saTheme.includes('borderColor = Color(0xFF000000)'), "the second class's border arrives as a stroke");
+  assert(saIndex.includes('Text("Hello Rose", color = Color(0xFFFFFFFF), fontSize = 32.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp)'), 'the descendant selector reaches Compose: specificity picks the title colour, and the text half is Compose parameters');
+  assert(saIndex.includes('.clip(RoundedCornerShape(8.dp))') && saIndex.includes('.background(Color(0xFF123456))'), 'the styled container emits a Modifier chain');
+  assert(saIndex.includes('verticalArrangement = Arrangement.SpaceBetween') && saIndex.includes('horizontalAlignment = Alignment.CenterHorizontally'), 'the container lays out by its style, not by the tag name - and the cross-axis constants are the legal ones for a Column');
+  assert(/Button\(onClick = \(\) -> inc\(\), colors = ButtonDefaults\.buttonColors\(containerColor = Color\.Transparent\)/.test(saIndex), 'a styled button keeps its class: its fill comes from the style, not the theme');
+  assert(/roseResolve\("p", listOf\(tone\), "Index", props = mapOf\("color" to accent\)\)/.test(saIndex), 'the bound class and style:prop become a runtime resolve with a property override, and the tag is carried so element rules apply');
+  assert(saIndex.includes('roseTextStyle(') && saIndex.includes('Modifier.roseBox('), 'the resolved style drives both the text half and the box half');
+  assert(/Text\("inline", modifier = Modifier\.graphicsLayer \{ alpha = 0\.4f \}\.padding\(start = 6\.dp, top = 3\.dp, end = 4\.dp, bottom = 5\.dp\)\)/.test(saIndex), 'a literal style="" reaches Text as a Modifier, padding axes in order');
+  assert(!/^\s*void\s+[A-Za-z_$][\w$]*\s*;/m.test(saIndex), 'no value is discarded on the Compose path either');
+  const saWarns = (styleAnd.warnings ?? []).filter((w) => /hero|btn|title|muted|primary/.test(w));
+  assert(saWarns.length === 0, `the rich fixture exports clean on Compose (${saWarns[0] ?? 'clean'})`);
+
+  // The same fixture through Xcode/SwiftUI: the engine's model compiles into
+  // the RoseStyle table for the runtime half and into concrete SwiftUI
+  // modifiers for the static half - and the element chain (`.hero .title`) is
+  // tracked, so specificity picks the winner, not source order alone.
+  const styleX = await exportProject('xcode', styleProj, { apiBase: 'x', outRoot: join(scratch, 'styleout-x') });
+  const sxTheme = readFileSync(join(styleX.outDir, 'rosezmApp/Kit/RoseTheme.swift'), 'utf8');
+  const sxIndex = readFileSync(join(styleX.outDir, 'rosezmApp/Pages/IndexView.swift'), 'utf8');
+  assert(sxTheme.includes('let roseStyles: [String: RoseStyle] = [') && sxTheme.includes('func roseResolve('), 'the SwiftUI kit carries the compiled table and the runtime resolver');
+  assert(sxTheme.includes('func roseBox(') && sxTheme.includes('func roseText('), 'the box half and the text half are View modifiers for a resolved style');
+  assert(sxTheme.includes('"hero__IndexView": RoseStyle(') && sxTheme.includes('gap: 4') && sxTheme.includes('direction: "column"') && sxTheme.includes('justify: "between"'), 'the flex rule reaches the scoped table with the media-guarded gap');
+  assert(sxTheme.includes('"muted__IndexView"') && sxTheme.includes('"title__IndexView"'), 'every class has its own table entry');
+  assert(sxTheme.includes('letterSpacing: 0.5') && sxTheme.includes('weight: 700'), 'typography reaches the table');
+  assert(sxTheme.includes('borderWidth: 2, borderColor: "#000000"'), "the second class's border arrives as a stroke");
+  assert(sxTheme.includes('shadowBlur: 6') && sxTheme.includes('shadowColor: "#0000004d"'), 'a box-shadow keeps its blur and colour at runtime');
+  assert(sxIndex.includes('VStack(alignment: .center, spacing: 4)'), 'the styled container lays out by its style: direction, cross-axis and gap');
+  // R212: the media guard (max-width: 480px at the 390 reference width) wins,
+  // so the flex row stacks into a VStack at export width - and without the
+  // media guard a display:flex container is an HStack, the CSS default.
+  assert(!sxIndex.includes('HStack(alignment: .center, spacing: 12)'), 'the media-guarded column wins over the row the unguarded rule states');
+  assert(/VStack\(alignment: \.center, spacing: 4\) \{\n\s*Text\("Hello Rose"\)[^\n]*\n\s*Spacer\(\)\n\s*Button\(/.test(sxIndex), 'justify-between distributes the visible children with one spacer each (whitespace nodes do not count)');
+  assert(sxIndex.includes('Text("Hello Rose").foregroundColor(Color.rose("ffffff")).font(.system(size: 32)).fontWeight(.bold).kerning(0.5)'), 'the descendant selector reaches the page and specificity picks the title colour over .muted');
+  assert(sxIndex.includes('Button(action: { inc() }) { Text('), 'a styled button routes through a real Button action');
+  assert(sxIndex.includes('background(Color.rose("e91e63"))') && sxIndex.includes('strokeBorder(Color.rose("000000"), lineWidth: 2)'), 'the button keeps its class: fill and border from the style');
+  assert(sxIndex.includes('.shadow(color: Color.rose("0000004d"), radius: 6, x: 0, y: 2)'), 'the box-shadow becomes a real SwiftUI shadow with its blur and offset');
+  assert(/\.roseText\(roseResolve\("p", \[tone\], "IndexView", props: \[String: Any\]\("color": accent\)\)\)/.test(sxIndex) && sxIndex.includes('.roseBox(roseResolve('), 'the bound class and style:prop become a runtime resolve driving both halves, carrying the tag');
+  assert(sxIndex.includes('Text("inline").padding(EdgeInsets(top: 3, leading: 6, bottom: 5, trailing: 4)).opacity(0.4)'), 'a literal style="" reaches Text as its own modifiers, padding axes in order');
+  assert(!/^\s*void\s+[A-Za-z_$][\w$]*\s*;/m.test(sxIndex), 'no value is discarded on the way out to SwiftUI');
+  const sxWarns = (styleX.warnings ?? []).filter((w) => /hero|btn|title|muted|primary/.test(w));
+  assert(sxWarns.length === 0, `the rich fixture exports clean on SwiftUI (${sxWarns[0] ?? 'clean'})`);
+
+  // The mini-program family ships CSS natively, so its contract is: the
+  // wrapper class exists in the template (without it every scoped rule
+  // matched nothing), media guards survive whole with their inner rules
+  // scoped (the old split('}') dropped the closing brace), and the dynamic
+  // half rides WXML mustaches.
+  const styleW = await exportProject('weapp', styleProj, { apiBase: 'x', outRoot: join(scratch, 'styleout-w') });
+  const swWxss = readFileSync(join(styleW.outDir, 'pages/index/index.wxss'), 'utf8');
+  const swWxml = readFileSync(join(styleW.outDir, 'pages/index/index.wxml'), 'utf8');
+  assert(/<view class="rose-index">\n?<view class="hero">/.test(swWxml), 'the page wrapper class the scoped rules select on is actually in the template');
+  assert(swWxss.includes('.rose-index .hero {') && swWxss.includes('.rose-index .hero .title'), 'page CSS is scoped under the wrapper class, descendant selectors included');
+  assert(swWxss.includes('@media (max-width: 480px) {.rose-index .hero { flex-direction: column; gap: 4px; }}'), 'the media guard survives whole, with its inner rule scoped too');
+  {
+    const opens = (swWxss.match(/\{/g) ?? []).length;
+    const closes = (swWxss.match(/\}/g) ?? []).length;
+    assert(opens === closes, `the scoped stylesheet is brace-balanced (${opens} vs ${closes})`);
+  }
+  // R258: the element carries its semantic name as a class too, so the
+  // mustache binds the user's class AND the semantic one.
+  assert(swWxml.includes("class=\"{{'rose-p ' + ((tone))}}\""), 'a state-bound class becomes a WXML mustache');
+  assert(swWxml.includes('style="color:{{accent}}"'), 'style:color={accent} becomes a mustache attribute');
+  assert(swWxml.includes('style="padding: 3px 4px 5px 6px;opacity: 0.4"'), 'a literal style="" rides through as native attribute text');
+  assert(!(styleW.warnings ?? []).some((w) => /attribute style has no mini-program equivalent/.test(w)), 'a literal style attribute is no longer reported as dropped');
+  const swWarns = (styleW.warnings ?? []).filter((w) => /hero|btn|title|muted|primary/.test(w));
+  assert(swWarns.length === 0, `the rich fixture exports clean on weapp (${swWarns[0] ?? 'clean'})`);
+
+  // R194: ArkTS joins the shared engine. The same fixture exports through
+  // HarmonyOS too: the cascade picks the title colour over .muted, the
+  // media-guarded gap wins at the reference width, the flex container becomes
+  // a real Column with its space and axis alignment, and a literal style=""
+  // lands as native modifiers instead of a warning.
+  const styleK = await exportProject('arkts', styleProj, { apiBase: 'x', outRoot: join(scratch, 'styleout-k') });
+  const skIndex = readFileSync(join(styleK.outDir, 'entry/src/main/ets/pages/IndexPage.ets'), 'utf8');
+  assert(/Column\(\{ space: 4 \}\)/.test(skIndex), 'the media-guarded gap wins at the reference width on ArkTS, and the container keeps its space option');
+  assert(/\.justifyContent\(FlexAlign\.SpaceBetween\)\.alignItems\(HorizontalAlign\.Center\)/.test(skIndex), 'the flex main axis and cross axis reach ArkUI');
+  assert(/\.backgroundColor\('#123456'\)/.test(skIndex) && /\.padding\(\{ top: 16, right: 32, bottom: 16, left: 32 \}\)/.test(skIndex) && /\.borderRadius\(8\)/.test(skIndex), "the container's fill, rem-converted padding and radius all survive");
+  assert(/Text\("Hello Rose"\)\.fontColor\('#ffffff'\)\.fontSize\(32\)\.fontWeight\(FontWeight\.Bold\)\.letterSpacing\(0\.5\)\.textCase\(TextCase\.UpperCase\)/.test(skIndex), 'the descendant selector reaches the page: specificity picks the title colour over .muted, and typography is native');
+  assert(/Button\(`\$\{this\.count\}`\)\.backgroundColor\('#e91e63'\)/.test(skIndex), 'a styled button keeps its own fill rather than the platform default');
+  assert(/\.border\(\{ width: \{ top: 2, right: 2, bottom: 2, left: 2 \}, color: '#000000', style: BorderStyle\.Solid \}\)/.test(skIndex), "the second class's border arrives as a real ArkUI border");
+  assert(/\.shadow\(\{ radius: 6, color: '#4d000000', offsetX: 0, offsetY: 2 \}\)/.test(skIndex), 'a box-shadow becomes a real ArkUI shadow with blur and offset');
+  assert(/Text\("inline"\)\.padding\(\{ top: 3, right: 4, bottom: 5, left: 6 \}\)\.opacity\(0\.4\)/.test(skIndex), 'a literal style="" reaches Text as modifiers, padding axes in order');
+  const skWarns = (styleK.warnings ?? []).filter((w) => /hero|btn|title|muted|primary/.test(w));
+  assert(skWarns.length === 0, `the rich fixture exports clean on ArkTS (${skWarns[0] ?? 'clean'})`);
+
+  // R195: Python leaves the single-class parser behind and runs the SAME
+  // cascade as the web build. The fixture comes back as a scoped Tk option
+  // table (fonts as tuples, borders as highlight rings), flexbox baked into
+  // pack side/anchor/fill/expand with one invisible spacer per gap, and a
+  // runtime resolver for the state-bound class and style property.
+  const styleP = await exportProject('python', styleProj, { apiBase: 'x', outRoot: join(scratch, 'styleout-p') });
+  const spStyles = readFileSync(join(styleP.outDir, 'styles.py'), 'utf8');
+  const spIndex = readFileSync(join(styleP.outDir, 'pages/index.py'), 'utf8');
+  assert(spStyles.includes("'hero__index': {'bg': '#123456', 'padx': 32, 'pady': 16}"), 'a flex rule reaches the Tk table as its fill and rem-converted padding');
+  assert(spStyles.includes("'title__index': {'fg': '#ffffff', 'font': ('Segoe UI', 21, 'bold')}"), 'the descendant selector wins on Tk too, and typography becomes a real Tk font tuple');
+  assert(spStyles.includes("'primary__index': {'highlightbackground': '#000000', 'highlightthickness': 2}"), "the second class's border arrives as a highlight ring");
+  assert(spStyles.includes("'muted__index': {'fg': '#999999'}"), 'every class of the element keeps its own table entry');
+  assert(/tk\.Frame\(parent, bg='#123456', padx=32, pady=16\)/.test(spIndex), 'the styled container is a Frame carrying its fill and both padding axes');
+  // R256: the label inherits its container's fill, so the constructor may carry
+  // a trailing bg= - the cascade and the text-transform are still asserted.
+  assert(/tk\.Label\(__f\d+_\d+, text="HELLO ROSE", wraplength=680, fg='#ffffff', font=\('Segoe UI', 21, 'bold'\)(, bg='[^']*')?\)/.test(spIndex), 'text-transform and the winning cascade reach the label');
+  assert(/tk\.Frame\(__f\d+_\d+, width=1, height=1, bg='#123456'\)\.pack\(expand=True\)/.test(spIndex), 'justify-between emits one spacer, painted the container surface so it is invisible');
+  assert(/\.pack\(anchor='center', side='bottom', pady=\(4, 0\)/.test(spIndex), 'the last visible child is pinned to the far edge - trailing whitespace is not a child');
+  assert(/rose_button\(__f\d+_\d+, f"\{rose_text\(lambda: st\.get\('count'\)\)\}", inc, '', \{"bg": '#e91e63', "fg": '#ffffff', "font": \('Segoe UI', 11\)/.test(spIndex), 'a styled button is a real Tk button painted from its class, not the stock grey one');
+  assert(spIndex.includes('from rosezm import roseThrow, rose_text, rose_button, rose_entry, rose_html_label, rose_resolve, rose_apply'), 'the page imports the runtime resolver it actually uses');
+  assert(/rose_apply\(__w\d+, rose_resolve\(rose_join\(\[rose_tokens\(st\.get\('tone'\)\)\]\), 'index', \{"color": st\.get\('accent'\)\}\)\)/.test(spIndex), 'the bound class and style:prop resolve through the scoped table at runtime');
+  assert(spIndex.includes('padx=5, pady=4') && !spIndex.includes('opacity'), 'a literal style="" reaches Tk as its padding axes; opacity is warned, not invented');
+  const spWarns = styleP.warnings ?? [];
+  assert(spWarns.some((w) => /border-radius on <div class="hero">/.test(w)), 'the radius Tk cannot draw is named with its element');
+  assert(spWarns.some((w) => /box-shadow on <button class="btn primary">/.test(w)), 'the shadow Tk cannot draw is named with its element');
+  assert(spWarns.some((w) => /opacity on <p>/.test(w)), 'the alpha Tk lacks is named with its element');
+  assert(spWarns.filter((w) => /border-radius on/.test(w)).length === 1, 'each unsupported feature is named once per page, not once per element');
+  assert(!spWarns.some((w) => /no runtime style resolution|has no native translation|is not a single class/.test(w)), 'nothing the shared engine carries is reported as dropped');
+  {
+    const pyFiles = walk(styleP.outDir).filter((f) => f.endsWith('.py'));
+    const compile = spawnSync('python', ['-m', 'py_compile', ...pyFiles], { encoding: 'utf8' });
+    if (!compile.error) assert(compile.status === 0, `the styled Python export byte-compiles (${(compile.stderr ?? '').slice(0, 200)})`);
+  }
+
+  // R200: the same fixture through Qt. The last legacy parser is gone, so the
+  // C++ build is the same design: the flex container becomes a real box layout
+  // with the media-guarded gap and both axes, the descendant selector wins over
+  // the later .muted, the button carries its class's fill and border, and a
+  // literal style="" lands as padding plus alpha.
+  const styleC = await exportProject('cpp', styleProj, { apiBase: 'x', outRoot: join(scratch, 'styleout-c') });
+  const scIndex = readFileSync(join(styleC.outDir, 'src/pages/IndexPage.cpp'), 'utf8');
+  const scLine = (needle: string) => scIndex.split('\n').find((l) => l.includes(needle)) ?? '';
+  assert(/QWidget\* panel\d+ = rose_flex\(parent, RoseStyle\{14, "#222222", "#123456", 32, false, "SansSerif", "", 0, 16, 32, 16, 32, "column", 4, "between", "center", 1/.test(scIndex), 'the styled container is a real flex box: the media-guarded gap wins and both axes reach Qt');
+  assert(scIndex.includes('rose_apply_flex('), 'the flex layout is applied to the box, not only its paint');
+  assert(/rose_apply_text\(__l, RoseStyle\{32, "#ffffff"/.test(scIndex), 'the descendant selector reaches the page: specificity picks the title colour over .muted');
+  assert(/rose_button\(panel\d+, rose_str\(app\.v\("count"\)\), \[&app = app\]\(\) \{ inc\(app\); \}, RoseStyle\{16, "#ffffff", "#e91e63", 16, false, "SansSerif", "#000000", 2, 8, 16, 8, 16/.test(scIndex), 'a styled button keeps its own fill and border rather than the platform default');
+  assert(/rose_apply_text\(__l, RoseStyle\{14, "#222222", "", 6, false, "SansSerif", "", 0, 3, 4, 5, 6, "", 0, "", "", 0\.4/.test(scIndex), 'a literal style="" reaches the label as its padding axes and alpha');
+  const scWarns = styleC.warnings ?? [];
+  assert(scWarns.some((w) => /cpp: border-radius on <div class="hero">/.test(w)), 'the radius Qt cannot draw is named with its element');
+  assert(scWarns.some((w) => /cpp: box-shadow on <button class="btn primary">/.test(w)), 'the shadow Qt cannot draw is named with its element');
+  assert(!scWarns.some((w) => /is not a single class|is behind a @media guard|has no native translation/.test(w)), 'nothing the shared engine carries is reported as dropped on Qt');
+  assert(scWarns.filter((w) => /border-radius on/.test(w)).length === 1, 'each unsupported feature is named once per page, not once per element');
+
+  // The same fixture through WPF: the shared cascade arrives as a generated
+  // flex panel (RosePanel) and a real RoseStyle object, so the desktop build is
+  // the same design, not a pile of stock WPF controls.
+  const styleN = await exportProject('dotnet', styleProj, { apiBase: 'x', outRoot: join(scratch, 'styleout-n') });
+  const snTheme = readFileSync(join(styleN.outDir, 'RoseTheme.cs'), 'utf8');
+  const snIndex = readFileSync(join(styleN.outDir, 'Pages/IndexPage.cs'), 'utf8');
+  const snLine = (needle: string) => snIndex.split('\n').find((l) => l.includes(needle)) ?? '';
+  assert(/\["hero__Index"\] = new RoseStyle \{ Background = "#123456"/.test(snTheme), 'a flex rule reaches the WPF class table with its fill');
+  assert(snTheme.includes('Gap = 4') && snTheme.includes('Direction = "column"') && snTheme.includes('Justify = "between"') && snTheme.includes('Align = "center"'), 'the media-guarded gap and every flex axis reach the table');
+  assert(snTheme.includes('["muted__Index"] = new RoseStyle { Color = "#999999" }') && snTheme.includes('["primary__Index"] = new RoseStyle { BorderWidth = new double[] { 2, 2, 2, 2 }'), 'every class of the element keeps its own scoped entry');
+  assert(snTheme.includes('["btn__Index"] = new RoseStyle') && snTheme.includes('new RoseShadow(0, 2, 6, 0, "#0000004d")'), 'a shadow reaches the table as a real shadow');
+  assert(!/,\s*,/.test(snTheme), 'the table separates its entries with exactly one comma (the array-interpolation bug)');
+  const snCard = snLine('RoseTheme.Card(pageRoot');
+  assert(snCard.includes('Background = "#123456"') && snCard.includes('Padding = new double[] { 16, 32, 16, 32 }') && snCard.includes('Gap = 4') && snCard.includes('Direction = "column"') && snCard.includes('Justify = "between"'), 'the styled container is one generated flex panel carrying the whole model');
+  const snTitle = snLine('"HELLO ROSE"');
+  assert(snTitle.includes('Color = "#ffffff"') && snTitle.includes('FontSize = 32') && snTitle.includes('FontWeight = 700'), "the descendant selector wins on WPF: the title's own colour and size override the base text");
+  const snButton = snLine('RoseTheme.Button(');
+  assert(snButton.includes('Background = "#e91e63"') && snButton.includes('Padding = new double[] { 8, 16, 8, 16 }') && snButton.includes('BorderColor = "#000000"') && snButton.includes('new RoseShadow(0, 2, 6, 0, "#0000004d")'), 'a styled button is painted from both of its classes, border and shadow included');
+  assert(/RoseTheme\.ApplyClass\(text1, "Index", RoseTheme\.Str\(app\.V\("tone"\)\)\)/.test(snIndex) && snIndex.includes('RoseTheme.Inline(text1, "color", RoseTheme.Str(app.V("accent")))'), 'the bound class and style:color resolve against the scoped table at runtime');
+  // R200: the template writes those reads BARE (`class={tone}`), and the web
+  // build is what callifies them. Forwarding the source spelling to C# emits an
+  // identifier the page never declares - CS0103, a project that will not build,
+  // invisible to every shape check because the shape is fine.
+  assert(!/ApplyClass\([^)]*, tone\)/.test(snIndex) && !/Inline\([^)]*, accent\)/.test(snIndex), 'no bare state identifier survives a WPF style call');
+  const snInline = snLine('"inline"');
+  assert(snInline.includes('Padding = new double[] { 3, 4, 5, 6 }') && snInline.includes('Opacity = 0.4'), 'a literal style="" reaches the label as padding and alpha');
+  assert(!snIndex.includes('new StackPanel') && !snIndex.includes('new WrapPanel'), 'the page is not a pile of native WPF panels');
+  assert(snIndex.includes('public static Panel Build(') && snIndex.includes('return pageRoot;'), 'the page hands back its root panel so the host can drop it in the window');
+  const snWarns = styleN.warnings ?? [];
+  assert(snWarns.filter((w) => /letter-spacing on <span class="title muted">/.test(w)).length === 1, 'the one property WPF cannot paint is named once, with its element');
+  assert(!snWarns.some((w) => /no runtime style resolution|has no native translation|is not a single class/.test(w)), 'nothing the shared engine carries is reported as dropped on WPF');
+  assert(!/,\s*,/.test(walk(styleN.outDir).filter((f) => f.endsWith('.cs')).map((f) => readFileSync(f, 'utf8')).join('\n')), 'no emitted .cs file has a doubled comma anywhere');
+
+  // R202: the OBJECT shorthand in class= and style=. Svelte semantics: the
+  // truthy keys of `class={{ on: flag }}` ARE the classes, and the entries of
+  // `style={{ color: c }}` ARE the declarations. No target can hold the object
+  // itself - Python stringifies it into `{'on': True}`, Kotlin/Swift/Dart want a
+  // typed list, WXML prints `[object Object]`, and Java/Qt used to drop it. So
+  // the engine expands it once: literal entries fold into the static class list
+  // (zero runtime cost, the same first frame the browser paints), dynamic entries
+  // become `(cond) ? 'key' : ''` - exactly the shape `class:foo={bar}` already
+  // emits, so every target's own expression translator carries them - and a
+  // style-object entry lands on the inline cascade or the `style:prop` channel.
+  {
+    const styleJ = await exportProject('java', styleProj, { apiBase: 'x', outRoot: join(scratch, 'styleout-j') });
+    const sjIndex = readFileSync(join(styleJ.outDir, 'src/main/java/dev/rosezm/app/pages/IndexPage.java'), 'utf8');
+    // The class half. Literal entries are static, false entries vanish, and the
+    // two conditionals ride the runtime class lookup as `'on' : ''` pairs.
+    assert(swWxml.includes(`class="{{'always rose-p ' + ((count > 1) ? 'on' : '') + ((count <= 1) ? 'off' : '')}}"`) && swWxml.includes('style="color:{{accent}};font-size:20px"'), 'weapp: a class object contributes its truthy keys and a style object its declarations, as mustaches');
+    assert(swWxml.includes('<text class="a c rose-p" style="color:red;margin:0">'), 'weapp: an all-literal class object folds into static text, never into a mustache');
+    assert(/roseResolve\(<String>\['always', \(count > 1\) \? 'on' : '', \(count <= 1\) \? 'off' : ''\], 'index', inline: RoseStyle\(fontSize: 20\)/.test(stIndex), 'flutter: the shorthand expands into the resolver list it already uses, and font-size reaches the style');
+    assert(stIndex.includes("roseResolve(const <String>['a', 'c'], 'index', inline: RoseStyle(color: Color(0xFFFF0000)"), 'flutter: literal entries fold into a const list with the color as a real Color');
+    assert(saIndex.includes('roseResolve("p", listOf("always", (if ((count > 1)) "on" else ""), (if ((count <= 1)) "off" else "")), "Index"'), 'android: the conditional class names are Kotlin if-expressions inside the runtime list, with the tag carried');
+    assert(saIndex.includes('Text("literal", color = Color(0xFFFF0000)'), 'android: the literal style object paints the text');
+    assert(/roseResolve\("p", \["always", \(count > 1\) \? "on" : "", \(count <= 1\) \? "off" : ""\], "IndexView"/.test(sxIndex), 'xcode: the shorthand expands into the SwiftUI resolver array, conditionals included, with the tag carried');
+    assert(sxIndex.includes('Text("literal").foregroundColor(Color.rose("ff0000"))'), 'xcode: the literal style object paints the text');
+    assert(spIndex.includes(`rose_join(["always", rose_tokens(('on' if (st.get('count') > 1) else '')), rose_tokens(('off' if (st.get('count') <= 1) else ''))])`), 'python: the dynamic entries are conditional class names the kit tokenises');
+    assert(spIndex.includes("tk.Label(parent, text=\"literal\", wraplength=680, fg='#ff0000'"), 'python: the literal style object paints the label');
+    // The precedence guard: a bare `cond ? "on" : "" + " "` would concatenate
+    // onto the "" arm and hand a String to a boolean test, so each conditional
+    // has to be parenthesised and the separator is its own `+ " " +` operand.
+    assert(/applyClass\([^,]+, "Index", \(\(RoseTheme\.integer\(app\.v\("count"\)\) > 1\) \? "on" : ""\) \+ " " \+ \(\(RoseTheme\.integer\(app\.v\("count"\)\) <= 1\) \? "off" : ""\)\)/.test(sjIndex), 'java: each conditional class name is PARENTHESISED - `a ? "on" : "" + " " + b` would feed a String to a boolean test');
+    assert(/ApplyClass\(text2, "Index", \(\(RoseTheme\.Int\(app\.V\("count"\)\) > 1\) \? "on" : ""\) \+ " " \+ \(\(RoseTheme\.Int\(app\.V\("count"\)\) <= 1\) \? "off" : ""\)\)/.test(snIndex), 'dotnet: the same precedence guard on C#');
+    // The two targets with no runtime style resolution keep the static half and
+    // name the dynamic half, which is the honest version of the same loss.
+    assert(skIndex.includes('Text("shorthand").fontSize(20)') && skIndex.includes("Text(\"literal\").margin({ top: 0, right: 0, bottom: 0, left: 0 }).fontColor('#ff0000')"), 'arkts: the static entries of both objects are native ArkUI modifiers');
+    // R220: ArkTS now carries the dynamic half too - the compiled style table
+    // and the runtime resolver are emitted, so a class bound to state re-applies
+    // instead of being named and dropped.
+    const skStyles = readFileSync(join(styleK.outDir, 'entry/src/main/ets/kit/RoseStyles.ets'), 'utf8');
+    const skMod = readFileSync(join(styleK.outDir, 'entry/src/main/ets/kit/RoseModifier.ets'), 'utf8');
+    assert(skStyles.includes('export function roseResolve(') && skStyles.includes('export function roseModifier('), 'arkts: the kit exports the runtime resolver and the AttributeModifier wrapper');
+    assert(skStyles.includes("'hero__IndexPage'") && skStyles.includes("'title__IndexPage'") && skStyles.includes("'btn__IndexPage'"), 'arkts: the sheet classes are compiled into the table, keyed class__scope');
+    assert(skMod.includes('export class RoseModifier') && skMod.includes('apply(prop: string, value: string): void'), 'arkts: RoseModifier.ets is the resolved-attribute holder the cascade fills');
+    assert(skIndex.includes(".attributeModifier(roseModifier('p', ['always', ((this.count > 1) ? 'on' : '')"), 'arkts: the dynamic class list rides the runtime resolver through .attributeModifier()');
+    assert(!(styleK.warnings ?? []).some((w) => /no runtime style resolution/.test(w)), 'arkts: nothing the shared engine carries is reported as dropped any more');
+    // R221: Qt resolves the bound class list at runtime now, so nothing is dropped.
+    assert(/rose_resolve\(\{"always", \(rose_bool\(\(.*count.*> 1\)\) \? "on" : ""\)/.test(scIndex), 'cpp: the dynamic class list is merged by rose_resolve at runtime');
+    assert(/rose_resolve\(/.test(readFileSync(join(styleC.outDir, 'src/rose.h'), 'utf8')), 'cpp: the kit ships rose_resolve so a bound class paints the same style as the browser');
+    assert(/rose_apply_prop\(/.test(scIndex), 'cpp: a style:prop binding is overlaid by rose_apply_prop');
+    assert(!(styleC.warnings ?? []).some((w) => /no runtime style resolution|cannot be applied at runtime/.test(w)), 'cpp: no dynamic style is reported as dropped any more');
+    const shWarns = [styleOut, styleAnd, styleX, styleP, styleN, styleJ].flatMap((r) => r.warnings ?? []).filter((w) => /shorthand|object/i.test(w) && !/no runtime style resolution/.test(w));
+    assert(shWarns.length === 0, `no target reports the shorthand itself as unmappable (${shWarns[0] ?? 'clean'})`);
+  }
+
+  // The targets that keep their old single-class parser must not be SILENT about
+  // what it cannot carry: every dropped construct is named - selectors, hover
+  // halves, width guards, keyframes, feature tests - and so is the dynamic half
+  // and a literal style="" it has nowhere to apply.
+  // (ArkTS left this list in R194, Python in R195, WPF in R196 and Swing in R199:
+  // all four resolve the shared engine now.)
+  const legacyProj = join(scratch, 'legacyproj');
+  mkdirSync(join(legacyProj, 'src/pages'), { recursive: true });
+  writeFileSync(join(legacyProj, 'src/pages/index.rose'), `<script>
+  let tone = $state('a');
+  let accent = $state('#ff0000');
+</script>
+<style>
+  .a .b { color: #ff0000; }
+  .c:hover { color: #00ff00; }
+  @keyframes pulse { from { opacity: 0; } to { opacity: 1; } }
+  @supports (display: grid) { .e { color: #0000ff; } }
+  @media (max-width: 600px) { .f { color: #111111; } }
+</style>
+<div class={tone} style:color={accent}>bound</div>
+<p style="margin: 4px">plain</p>
+`);
+  // The last target on the legacy parser was C++/Qt. R200 carried it onto the
+  // shared cascade, so the fixture above is now CARRIED, not dropped: what Qt
+  // genuinely cannot paint (a hover half, keyframes, a feature test) is still
+  // named once each, the descendant chain and the width guard resolve, and the
+  // dynamic half is reported rather than invented. A second fixture puts a real
+  // `.a .b` chain and a media-guarded class on actual elements, so the resolved
+  // values are asserted on the emitted page.
+  for (const target of ['cpp'] as const) {
+    const legacyOut = await exportProject(target, legacyProj, { apiBase: 'x', outRoot: join(scratch, `legacy-${target}`) });
+    const lw = (legacyOut.warnings ?? []).join('\n');
+    // R251: the :hover half compiles now, so only keyframes and @supports are
+    // still named - the hover rule rides a rose_styles entry plus a filter.
+    assert(!lw.includes(`${target}: selector ".c:hover" has a :hover half`), `${target}: a :hover rule is no longer linted as dropped`);
+    assert(lw.includes(`${target}: @keyframes "pulse"`), `${target}: dropped keyframes are named`);
+    assert(lw.includes(`${target}: an @supports block`), `${target}: a dropped @supports block is named`);
+    assert(!/cpp: selector "\.a \.b"|cpp: "\.f" is behind a @media guard|is not a single class/.test(lw), `${target}: a descendant selector and a width guard are carried by the cascade, not reported as drops`);
+    // R221: the dynamic half is resolved at runtime, so it is no longer a drop.
+    const legacyPage = readFileSync(join(legacyOut.outDir, 'src/pages/IndexPage.cpp'), 'utf8');
+    assert(/rose_resolve\(\{app\.v\("tone"\)\}, "Index"\)/.test(legacyPage), `${target}: a state-bound class resolves at runtime, not dropped`);
+    assert(/rose_apply_prop\(rose_resolve\(\{app\.v\("tone"\)\}, "Index"\), "color", rose_str\(app\.v\("accent"\)\)\)/.test(legacyPage), `${target}: a state-bound style property rides rose_apply_prop`);
+    assert(!/has no runtime style resolution|cannot be applied at runtime/.test(lw), `${target}: no dynamic style is reported as a drop`);
+  }
+  {
+    const chainProj = join(scratch, 'chainproj');
+    mkdirSync(join(chainProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(chainProj, 'src/pages/index.rose'), `<style>
+  .a .b { color: #ff0000; }
+  @media (max-width: 600px) { .f { color: #111111; } }
+</style>
+<div class="a"><span class="b">deep</span></div>
+<p class="f">guarded</p>
+<p style="padding: 4px">plain</p>
+`);
+    const chainOut = await exportProject('cpp', chainProj, { apiBase: 'x', outRoot: join(scratch, 'legacy-chain') });
+    const chain = readFileSync(join(chainOut.outDir, 'src/pages/IndexPage.cpp'), 'utf8');
+    assert(/rose_apply_text\(__l, RoseStyle\{14, "#ff0000"/.test(chain), 'the descendant chain resolves on Qt: .a .b paints the span');
+    assert(/rose_apply_text\(__l, RoseStyle\{14, "#111111"/.test(chain), 'the media-guarded rule resolves on Qt at the reference width (600px matches)');
+    assert(/rose_apply_text\(__l, RoseStyle\{14, "#222222", "", 4/.test(chain), 'a literal style="" lands on the Qt label as its padding');
+  }
+  {
+    // R223: `display: grid` has no single native equivalent, so the engine
+    // models it as a wrapping flex row. Compose spells that FlowRow - a real
+    // wrapping layout - and its children must size to content, because a
+    // fillMaxWidth child would put every card on a row of its own.
+    const gridProj = join(scratch, 'gridproj');
+    mkdirSync(join(gridProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(gridProj, 'src/pages/index.rose'), `<style>
+  .grid { display: grid; gap: 8px; }
+  .card { background: #eeeeee; padding: 8px; }
+</style>
+<div class="grid"><div class="card">1</div><div class="card">2</div></div>
+`);
+    const gridOut = await exportProject('android', gridProj, { apiBase: 'x', outRoot: join(scratch, 'gridout') });
+    const gridKt = readFileSync(join(gridOut.outDir, 'app/src/main/java/dev/rosezm/app/pages/IndexPage.kt'), 'utf8');
+    assert(/FlowRow\(modifier = Modifier\.fillMaxWidth\(\), horizontalArrangement = Arrangement\.spacedBy\(8\.dp\), verticalArrangement = Arrangement\.spacedBy\(8\.dp\)\)/.test(gridKt), 'android: display:grid becomes a real FlowRow with both axes spaced');
+    assert(gridKt.includes('@file:OptIn(ExperimentalLayoutApi::class)'), 'android: the experimental FlowRow is opted in at file level');
+    assert(!/Column\(modifier = Modifier\.fillMaxWidth\(\)\.background\(Color\(0xFFEEEEEE\)\)/.test(gridKt), 'android: a card inside the grid sizes to content, so the row can wrap');
+    assert(!(gridOut.warnings ?? []).some((w) => /flex-wrap on/.test(w)), 'android: a wrapping row is no longer reported as unrenderable');
+    // ArkTS already expressed it natively; lock that in the same test so the two
+    // cannot drift apart again.
+    const gridArk = await exportProject('arkts', gridProj, { apiBase: 'x', outRoot: join(scratch, 'gridark') });
+    const gridEts = readFileSync(join(gridArk.outDir, 'entry/src/main/ets/pages/IndexPage.ets'), 'utf8');
+    assert(/Flex\(\{ direction: FlexDirection\.Row, wrap: FlexWrap\.Wrap, space: \{ main: 8, cross: 8 \} \}\)/.test(gridEts), 'arkts: display:grid is a native wrapping Flex with both axes spaced');
+  }
+  {
+    // R224: `position: absolute` used to be parsed and then thrown away with no
+    // warning - a styled floating element landed in the flow on every native
+    // target. It is modelled now and placed, with its z-index, on the three
+    // targets that can say it natively.
+    const posProj = join(scratch, 'posproj');
+    mkdirSync(join(posProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(posProj, 'src/pages/index.rose'), `<style>
+  .stack { position: absolute; top: 4px; left: 6px; z-index: 5; background: #eeeeee; }
+  .pct { position: absolute; bottom: 10px; right: 12px; }
+</style>
+<div class="stack">abs</div>
+<div class="pct">pct</div>
+`);
+    const posK = await exportProject('arkts', posProj, { apiBase: 'x', outRoot: join(scratch, 'pos-k') });
+    const pk = readFileSync(join(posK.outDir, 'entry/src/main/ets/pages/IndexPage.ets'), 'utf8');
+    assert(/\.position\(\{ x: 6, y: 4 \}\)\.zIndex\(5\)/.test(pk), 'arkts: an absolutely positioned box is placed from its top/left, z-index included');
+    assert(!/\.position\(\{ x: 0, y: 0 \}\)/.test(pk), 'arkts: a box positioned only by bottom/right stays in flow rather than being misplaced at the origin');
+    const posA = await exportProject('android', posProj, { apiBase: 'x', outRoot: join(scratch, 'pos-a') });
+    const pa = readFileSync(join(posA.outDir, 'app/src/main/java/dev/rosezm/app/pages/IndexPage.kt'), 'utf8');
+    assert(/\.offset\(x = 6\.dp, y = 4\.dp\)\.zIndex\(5f\)/.test(pa), 'android: the same box is offset with its z-index, not dropped into the flow');
+    assert(/\.offset\(x = 12\.dp, y = 10\.dp\)/.test(pa), 'android: a bottom/right inset is a relative offset, so it is placed too');
+    const posX = await exportProject('xcode', posProj, { apiBase: 'x', outRoot: join(scratch, 'pos-x') });
+    const px = walk(posX.outDir).filter((f) => f.endsWith('.swift')).map((f) => readFileSync(f, 'utf8')).join('\n');
+    assert(/\.offset\(x: 6, y: 4\)\.zIndex\(5\)/.test(px), 'xcode: the same box is offset with its z-index on SwiftUI');
+    const posWarns = [...(posK.warnings ?? []), ...(posA.warnings ?? []), ...(posX.warnings ?? [])];
+    assert(!posWarns.some((w) => /position/i.test(w)), 'no target reports position as dropped any more');
+    // R225: Qt places the same box by moving it, and the toolkit that genuinely
+    // cannot (Tk) says so instead of leaving the element in the flow silently.
+    const posC = await exportProject('cpp', posProj, { apiBase: 'x', outRoot: join(scratch, 'pos-c') });
+    const pc = readFileSync(join(posC.outDir, 'src/pages/IndexPage.cpp'), 'utf8');
+    assert(/rose_apply_box\(panel\d+, RoseStyle\{.*, true, 6, 4/.test(pc), 'cpp: the out-of-flow box carries absolute + its offset into Qt');
+    const posP = await exportProject('python', posProj, { apiBase: 'x', outRoot: join(scratch, 'pos-p') });
+    assert((posP.warnings ?? []).some((w) => /python: position: absolute on <div class="stack">/.test(w)), 'python: Tk names the position it cannot honour, rather than dropping it in silence');
+    const posN = await exportProject('dotnet', posProj, { apiBase: 'x', outRoot: join(scratch, 'pos-n') });
+    assert((posN.warnings ?? []).some((w) => /dotnet: position: absolute on <div class="stack">/.test(w)), 'dotnet: WPF names the position it cannot honour');
+    // R226: Flutter can place it for real - Positioned inside a Stack, which is
+    // the only place a Positioned is legal, so roseBox emits the Stack itself.
+    const posF = await exportProject('flutter', posProj, { apiBase: 'x', outRoot: join(scratch, 'pos-f') });
+    const pf = walk(posF.outDir).filter((f) => f.endsWith('.dart')).map((f) => readFileSync(f, 'utf8')).join('\n');
+    assert(pf.includes("'stack__index': RoseStyle(background: Color(0xFFEEEEEE), absolute: true, insetLeft: 6, insetTop: 4)"), 'flutter: the absolute box and its insets reach the compiled style table');
+    assert(/if \(s\.absolute\) \{\s*return Stack\(children: \[\s*Positioned\(/.test(pf), 'flutter: roseBox places an absolute style as a Positioned inside the Stack it needs');
+    const posJ = await exportProject('java', posProj, { apiBase: 'x', outRoot: join(scratch, 'pos-j') });
+    assert((posJ.warnings ?? []).some((w) => /java: position: absolute on <div class="stack">/.test(w)), 'java: Swing names the position it cannot honour');
+  }
+  {
+    // R227: overflow:auto used to be collapsed into "clip it", so a scrollable
+    // list was clipped on ArkTS and Qt and simply not scrollable on Tk. Now the
+    // engine models it as "this box scrolls" and each target says so.
+    const scrollProj = join(scratch, 'scrollproj');
+    mkdirSync(join(scrollProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(scrollProj, 'src/pages/index.rose'), `<script>
+  let items = $state([1, 2, 3]);
+</script>
+<style>
+  .list { overflow-y: auto; max-height: 200px; background: #fafafa; }
+  .row { padding: 8px; }
+</style>
+<div class="list">{#each items as it}<div class="row">row {it}</div>{/each}</div>
+`);
+    const scK = await exportProject('arkts', scrollProj, { apiBase: 'x', outRoot: join(scratch, 'scroll-k') });
+    const skIndex = readFileSync(join(scK.outDir, 'entry/src/main/ets/pages/IndexPage.ets'), 'utf8');
+    assert(/Scroll\(\) \{\s*Column\(\) \{/.test(skIndex), 'arkts: an overflow:auto box is a real Scroll around its column');
+    assert(/constraintSize\(\{ maxHeight: 200 \}\)/.test(skIndex), 'arkts: the max-height that makes it scroll still lands on the box');
+    const scC = await exportProject('cpp', scrollProj, { apiBase: 'x', outRoot: join(scratch, 'scroll-c') });
+    const scCpp = readFileSync(join(scC.outDir, 'src/pages/IndexPage.cpp'), 'utf8');
+    assert(/rose_scroll\(parent, panel\d+\);/.test(scCpp), 'cpp: the scrollable box is put in a QScrollArea instead of being clipped');
+    const scP = await exportProject('python', scrollProj, { apiBase: 'x', outRoot: join(scratch, 'scroll-p') });
+    assert((scP.warnings ?? []).some((w) => /overflow:auto on <div class="list">/.test(w)), 'python: Tk names the scrolling it cannot do, rather than clipping silently');
+    // R228: the other five put scrolling on the BOX, not only on the page.
+    const scA = await exportProject('android', scrollProj, { apiBase: 'x', outRoot: join(scratch, 'scroll-a') });
+    const sa = readFileSync(join(scA.outDir, 'app/src/main/java/dev/rosezm/app/pages/IndexPage.kt'), 'utf8');
+    assert(/heightIn\(max = 200\.dp\)\.verticalScroll\(rememberScrollState\(\)\)/.test(sa), 'android: the scrollable box carries its own max height and scroll state');
+    const scX = await exportProject('xcode', scrollProj, { apiBase: 'x', outRoot: join(scratch, 'scroll-x') });
+    const sx = walk(scX.outDir).filter((f) => f.endsWith('.swift')).map((f) => readFileSync(f, 'utf8')).join('\n');
+    assert(sx.includes('.roseScroll()'), 'xcode: the scrollable box gets SwiftUI scrolling, not just the page');
+    const scF = await exportProject('flutter', scrollProj, { apiBase: 'x', outRoot: join(scratch, 'scroll-f') });
+    const sf = walk(scF.outDir).filter((f) => f.endsWith('.dart')).map((f) => readFileSync(f, 'utf8')).join('\n');
+    assert(sf.includes('scrolls: true'), 'flutter: the scrollable box reaches the compiled style table');
+    assert(/if \(s\.scrolls\) \{\s*return Container\(/.test(sf), 'flutter: roseBox wraps the scrolling box in a SingleChildScrollView');
+    const scJ = await exportProject('java', scrollProj, { apiBase: 'x', outRoot: join(scratch, 'scroll-j') });
+    const sj = readFileSync(join(scJ.outDir, 'src/main/java/dev/rosezm/app/pages/IndexPage.java'), 'utf8');
+    assert(sj.includes('RoseTheme.scrolled('), 'java: the scrollable box is put in its own JScrollPane');
+    const scN = await exportProject('dotnet', scrollProj, { apiBase: 'x', outRoot: join(scratch, 'scroll-n') });
+    const sn = walk(scN.outDir).filter((f) => f.endsWith('IndexPage.cs')).map((f) => readFileSync(f, 'utf8')).join('\n');
+    assert(sn.includes('RoseTheme.Scrolled('), 'dotnet: the scrollable box is put in its own ScrollViewer');
+  }
+  {
+    // R229: a range used to fall through to the text-input branch, so a slider
+    // became a text box bound to a number - draggable nowhere, and the value
+    // arrived as a string. Each target now emits its own slider.
+    const formProj = join(scratch, 'formproj');
+    mkdirSync(join(formProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(formProj, 'src/pages/index.rose'), `<script>
+  let level = $state(3);
+  let bio = $state('');
+</script>
+<div><input type="range" bind:value={level} min="0" max="10" /></div>
+<div><textarea bind:value={bio}></textarea></div>
+`);
+    const fK = await exportProject('arkts', formProj, { apiBase: 'x', outRoot: join(scratch, 'form-k') });
+    const fk = readFileSync(join(fK.outDir, 'entry/src/main/ets/pages/IndexPage.ets'), 'utf8');
+    assert(/Slider\(\{ value: this\.level, min: 0, max: 10 \}\)/.test(fk) && /onChange\(\(value: number\) => \{ this\.level = value; \}\)/.test(fk), 'arkts: a range is a Slider over its min/max, not a text field');
+    const fF = await exportProject('flutter', formProj, { apiBase: 'x', outRoot: join(scratch, 'form-f') });
+    const ff = walk(fF.outDir).filter((f) => f.endsWith('.dart')).map((f) => readFileSync(f, 'utf8')).join('\n');
+    assert(/roseSlider\(.*\blevel, 0, 10/.test(ff), 'flutter: a range is a roseSlider seeded from the bound state');
+    // R246: an `async` handler must carry the `async` modifier. The signature was
+    // already `Future<void>`, so Dart refused the `await` inside it - every async
+    // handler in every exported Flutter app was uncompilable.
+    const asyncProj = join(scratch, 'asyncproj');
+    mkdirSync(join(asyncProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(asyncProj, 'src/pages/index.rose'), `<script>
+  let msg = $state('');
+  async function load() { const r = await fetch('/api/x'); msg = await r.text(); }
+</script>
+<button on:click={load}>go</button>
+`);
+    const asyncOut = await exportProject('flutter', asyncProj, { apiBase: 'x', outRoot: join(scratch, 'async-f') });
+    const asyncDart = walk(asyncOut.outDir).filter((f) => /lib\/pages\/.*\.dart$/.test(f.replace(/\\/g, '/'))).map((f) => readFileSync(f, 'utf8')).join('\n');
+    assert(/Future<void> load\(\) async \{/.test(asyncDart), 'flutter: an async handler keeps its async modifier, so its own await compiles');
+    assert(!/Future<void> load\(\) \{/.test(asyncDart), 'flutter: no await-bearing handler is emitted without async');
+    // R247: `useNative` reaches EVERY target now, not just the first three. Each
+    // target spells the helper its own way, and a page that calls it must have no
+    // raw `useNative(` left in the emitted CODE (a mention inside a doc comment is
+    // fine - that is how the kit explains itself).
+    const nativeProj = join(scratch, 'nativeallproj');
+    mkdirSync(join(nativeProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(nativeProj, 'src/pages/index.rose'), `<script>
+  let shot = $state(null);
+  async function grab() { shot = await useNative('camera', { quality: 0.8 }); }
+</script>
+<button on:click={grab}>snap</button>
+`);
+    const stripComments = (t: string): string => t
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '')
+      .replace(/^\s*\*.*$/gm, '')
+      .replace(/^\s*#.*$/gm, '')
+      .replace(/"""[\s\S]*?"""/g, '');
+    const nativeHelpers: Record<string, RegExp> = {
+      weapp: /__rosezmNative\(/, flutter: /roseNative\(/, arkts: /roseNative\(/,
+      android: /roseNative\("camera"/, xcode: /roseNative\("camera"/,
+      java: /RoseKit\.roseNative\("camera"/, dotnet: /RoseKit\.RoseNative\("camera"/,
+      python: /rose_native\('camera'/, cpp: /rose_native\("camera"/,
+    };
+    for (const [target, helper] of Object.entries(nativeHelpers)) {
+      const n = await exportProject(target as never, nativeProj, { apiBase: 'x', outRoot: join(scratch, `native-${target}`) });
+      const body = walk(n.outDir).map((f) => { try { return readFileSync(f, 'utf8'); } catch { return ''; } }).join('\n');
+      assert(helper.test(body), `${target}: useNative('camera') becomes the target's own native helper call`);
+      assert(!/\buseNative\s*\(/.test(stripComments(body)), `${target}: no raw useNative( survives in the emitted code`);
+      assert(!(n.warnings ?? []).some((w) => /useNative/.test(w)), `${target}: a supported capability is not reported as unsupported`);
+      // And the other half: a project that never calls it emits nothing extra.
+      // The mini-program is the exception by design - it ships ONE shared kit file
+      // (utils/rosezm.js) that always carries every helper, the same way it always
+      // carries __rosezmConfirm/__rosezmOpen. The other eight inline per page, so
+      // for them "extra" means real repeated bytes and must be absent.
+      const clean = await exportProject(target as never, 'example', { apiBase: 'x', outRoot: join(scratch, `nativeclean-${target}`) });
+      const cleanBody = walk(clean.outDir).map((f) => { try { return readFileSync(f, 'utf8'); } catch { return ''; } }).join('\n');
+      assert(!/roseNative|rose_native|RoseNative/.test(cleanBody), `${target}: a project that never calls useNative emits no native bridge at all`);
+      if (target !== 'weapp') {
+        assert(!/__rosezmNative/.test(cleanBody), `${target}: no mini-program bridge leaks into a target that has its own`);
+      }
+      // Nothing CALLS it in a project that never asked - that is the real invariant.
+      assert(!/__rosezmNative\s*\(\s*['"]/.test(cleanBody), `${target}: no page calls the native bridge when the project never uses it`);
+    }
+    const fP = await exportProject('python', formProj, { apiBase: 'x', outRoot: join(scratch, 'form-p') });
+    const fp = walk(fP.outDir).filter((f) => f.endsWith('.py')).map((f) => readFileSync(f, 'utf8')).join('\n');
+    assert(/tk\.Scale\([^)]*from_=0, to=10/.test(fp), 'python: a range is a tk.Scale over its bounds');
+    const fJ = await exportProject('java', formProj, { apiBase: 'x', outRoot: join(scratch, 'form-j') });
+    const fj = readFileSync(join(fJ.outDir, 'src/main/java/dev/rosezm/app/pages/IndexPage.java'), 'utf8');
+    assert(fj.includes('RoseTheme.slider(panel'), 'java: a range is a real JSlider');
+    assert(fj.includes('RoseTheme.textArea('), 'java: a textarea is a multi-line area, not a one-line field');
+  }
+  {
+    // R230: a cross-target probe (one styled page, every target, the author's own
+    // numbers) found width:320px silently absent on Swing, Qt and Tk - each sized
+    // the widget from its content instead. Padding/background/colour survived
+    // everywhere, so this was a hole in one property, not a broken cascade.
+    const sizeProj = join(scratch, 'sizeproj');
+    mkdirSync(join(sizeProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(sizeProj, 'src/pages/index.rose'), `<style>
+  .wide { width: 320px; height: 48px; background: #123456; }
+</style>
+<div class="wide">sized</div>
+`);
+    const zJ = await exportProject('java', sizeProj, { apiBase: 'x', outRoot: join(scratch, 'size-j') });
+    const zj = readFileSync(join(zJ.outDir, 'src/main/java/dev/rosezm/app/RoseTheme.java'), 'utf8');
+    const zjPage = readFileSync(join(zJ.outDir, 'src/main/java/dev/rosezm/app/pages/IndexPage.java'), 'utf8');
+    assert(/\.size\(320, 48\)/.test(zj), 'java: an explicit width/height reaches the emitted Style');
+    assert(/setPreferredSize\(size\)/.test(zj), 'java: Swing pins the size it was given instead of sizing to content');
+    const zC = await exportProject('cpp', sizeProj, { apiBase: 'x', outRoot: join(scratch, 'size-c') });
+    const zc = readFileSync(join(zC.outDir, 'src/pages/IndexPage.cpp'), 'utf8');
+    assert(/width: 320, height: 48|, 320, 48|320,\s*48/.test(zc), 'cpp: the size reaches the emitted RoseStyle');
+    const zcKit = readFileSync(join(zC.outDir, 'src/rose.cpp'), 'utf8');
+    assert(/setFixedSize\(style\.width, style\.height\)/.test(zcKit), 'cpp: Qt sets the fixed size it was given');
+    const zP = await exportProject('python', sizeProj, { apiBase: 'x', outRoot: join(scratch, 'size-p') });
+    const zp = walk(zP.outDir).filter((f) => f.endsWith('.py')).map((f) => readFileSync(f, 'utf8')).join('\n');
+    assert(/width=320/.test(zp) && /height=48/.test(zp), 'python: Tk takes the width and height the CSS gave');
+  }
+
+  // R199: Swing resolves that same fixture through the shared engine too. What
+  // Swing genuinely cannot paint (a hover half, keyframes, a feature test) is
+  // still named; what the cascade carries is applied, and the dynamic half lands
+  // as a runtime lookup rather than a warning.
+  {
+    const swingLegacy = await exportProject('java', legacyProj, { apiBase: 'x', outRoot: join(scratch, 'legacy-swing') });
+    const sl = (swingLegacy.warnings ?? []).join('\n');
+    const slIndex = readFileSync(join(swingLegacy.outDir, 'src/main/java/dev/rosezm/app/pages/IndexPage.java'), 'utf8');
+    const slTheme = readFileSync(join(swingLegacy.outDir, 'src/main/java/dev/rosezm/app/RoseTheme.java'), 'utf8');
+    assert(!/is not a single class|@media guard|has no runtime style resolution|has no native translation/.test(sl), 'Swing carries the legacy fixture through the shared cascade and reports none of it as dropped');
+    // R250: the :hover half compiles now, so only the two constructs Swing
+    // genuinely cannot paint are still named.
+    assert(!/:hover half/.test(sl), 'a Swing :hover rule is no longer linted as dropped');
+    assert(/@keyframes "pulse"/.test(sl) && /an @supports block/.test(sl), 'keyframes and @supports - the constructs Swing really cannot paint - are still named');
+    assert(/RoseTheme\.applyClass\(panel\d+, "Index", RoseTheme\.text\(app\.v\("tone"\)\)\)/.test(slIndex) && /RoseTheme\.styleProp\(panel\d+, "color", RoseTheme\.text\(app\.v\("accent"\)\)\)/.test(slIndex), 'a state-bound class and style property are live runtime lookups on Swing, not warnings');
+    assert(!/applyClass\([^)]*,\s*tone\s*\)/.test(slIndex) && !/styleProp\([^)]*,\s*accent\s*\)/.test(slIndex), 'no bare state identifier survives a Swing style call');
+    assert(/STYLES\.put\("f__Index", new Style\(14, "#111111"/.test(slTheme), 'the media-guarded rule reaches the scoped style table at the reference width');
+  }
+
+
+  // those constructs may be reported as dropped - and the media-guarded rule is
+  // applied at the reference width, where it matches.
+  {
+    const netLegacy = await exportProject('dotnet', legacyProj, { apiBase: 'x', outRoot: join(scratch, 'legacy-net') });
+    const nl = (netLegacy.warnings ?? []).join('\n');
+    const nlIndex = readFileSync(join(netLegacy.outDir, 'Pages/IndexPage.cs'), 'utf8');
+    const nlTheme = readFileSync(join(netLegacy.outDir, 'RoseTheme.cs'), 'utf8');
+    assert(!/selector "|:hover half|@keyframes|@supports|@media guard|has no runtime style resolution|has no native translation|is not a single class/.test(nl), 'WPF carries the legacy fixture through the shared cascade and reports none of it as dropped');
+    assert(/RoseTheme\.ApplyClass\(panel\d+, "Index", RoseTheme\.Str\(app\.V\("tone"\)\)\)/.test(nlIndex) && /RoseTheme\.Inline\(panel\d+, "color", RoseTheme\.Str\(app\.V\("accent"\)\)\)/.test(nlIndex), 'a state-bound class and style property are live calls on WPF, not warnings');
+    assert(!/ApplyClass\([^)]*,\s*tone\s*\)/.test(nlIndex) && !/Inline\([^)]*,\s*accent\s*\)/.test(nlIndex), 'no bare state identifier reaches a WPF style call (CS0103)');
+    assert(nlIndex.includes('Margin = new double[] { 4, 4, 4, 4 }'), 'a literal style="" lands on the element');
+    assert(/\["f__Index"\] = new RoseStyle \{ Color = "#111111" \}/.test(nlTheme), 'the media-guarded rule is applied at the reference width (600px matches)');
+    assert(/\["c__Index"\] = new RoseStyle \{ Color = "#00ff00" \}/.test(nlTheme), 'a hover-only class keeps its hover in the runtime table');
+    assert(!nlTheme.split('public static class RoseTheme')[1].includes('new RoseStyle(),'), 'a class with only a hover half leaves no empty entry in the static table');
+  }
+
+  // R200: the mutation sugar. A `$state` reads like a value, so users write it
+  // like one - `count++`, `total += price`, `show = !show`, `on:click={() => count++}`.
+  // The shared pass folds every spelling into the canonical write at the two
+  // choke points, so no emitter sees an increment of a name nothing declares;
+  // and a self-assign of the increment (`n = ++n`) folds to arithmetic, because
+  // `++app.v("n")` - the increment of a dictionary lookup - is a compile error
+  // in Java and C# that no shape gate can see.
+  {
+    const sugarProj = join(scratch, 'sugarproj');
+    mkdirSync(join(sugarProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(sugarProj, 'src/pages/index.rose'), `<script>
+  let count = $state(0);
+  let total = $state(0);
+  let price = $state(3);
+  let show = $state(true);
+  let n = $state(1);
+  function bump() { count++; total += price(); n = ++n; show = !show; if (count() > 2) count -= 1; }
+</script>
+<button on:click={() => count++}>plus</button>
+<button on:click={bump}>bump</button>
+{#if show}<p>{count} {total}</p>{/if}
+`);
+    const sWeapp = await exportProject('weapp', sugarProj, { apiBase: 'x', outRoot: join(scratch, 'sugar-weapp') });
+    const sWeappJs = readFileSync(join(sWeapp.outDir, 'pages/index/index.js'), 'utf8');
+    assert(sWeappJs.includes('__setState("count", state.count + 1)') && sWeappJs.includes('__setState("total", state.total + state.price)') && sWeappJs.includes('__setState("show", !state.show)') && sWeappJs.includes('if (state.count > 2) __setState("count", state.count - 1);'), 'the mini program writes every sugar form through __setState, brace-less if included');
+    assert(!/count\+\+|\+\+count|total \+=/.test(sWeappJs), 'no raw increment leaks into the exported page script');
+
+    const sJava = await exportProject('java', sugarProj, { apiBase: 'x', outRoot: join(scratch, 'sugar-java') });
+    const sJavaSrc = readFileSync(join(sJava.outDir, 'src/main/java/dev/rosezm/app/pages/IndexPage.java'), 'utf8');
+    assert(sJavaSrc.includes('app.set("count", RoseTheme.integer(app.v("count")) + 1)') && sJavaSrc.includes('app.set("total", RoseTheme.integer(app.v("total")) + RoseTheme.integer(app.v("price")))') && sJavaSrc.includes('app.set("show", !RoseTheme.bool(app.v("show")))'), 'Swing writes the sugar as a typed read plus one');
+    assert(!sJavaSrc.includes('++RoseTheme') && !sJavaSrc.includes('count++'), 'Swing never increments a dictionary lookup (that is a Java compile error)');
+
+    const sNet = await exportProject('dotnet', sugarProj, { apiBase: 'x', outRoot: join(scratch, 'sugar-net') });
+    const sNetSrc = readFileSync(join(sNet.outDir, 'Pages/IndexPage.cs'), 'utf8');
+    assert(sNetSrc.includes('app.Set("count", RoseTheme.Int(app.V("count")) + 1)') && sNetSrc.includes('app.Set("n", RoseTheme.Int(app.V("n")) + 1)'), 'WPF writes the sugar as a typed read plus one');
+    assert(!sNetSrc.includes('++RoseTheme') && !sNetSrc.includes('count++'), 'WPF never increments a dictionary lookup (CS0203)');
+
+    const sDart = await exportProject('flutter', sugarProj, { apiBase: 'x', outRoot: join(scratch, 'sugar-dart') });
+    const sDartSrc = readFileSync(join(sDart.outDir, 'lib/pages/index.dart'), 'utf8');
+    assert(sDartSrc.includes('__set("count", count + 1)') && sDartSrc.includes('__set("total", total + price)') && sDartSrc.includes('__set("show", !show)'), 'Flutter writes the sugar through its own setter');
+    assert(!sDartSrc.includes('count++') && !sDartSrc.includes('total +='), 'Flutter never receives the raw JS sugar');
+
+    // An export is not the softer path: writing a `$derived` is refused here too,
+    // because left alone the sugar reaches a toolchain that reports it as an
+    // increment of a name no declaration introduces, with no mention of rosezm.
+    const derivedProj = join(scratch, 'derivedwrite');
+    mkdirSync(join(derivedProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(derivedProj, 'src/pages/index.rose'), `<script>
+  let zA = $state(1);
+  let zB = $derived(zA() * 2);
+  function bad() { zB++; }
+</script>
+<p>{zB}</p>
+`);
+    let derivedRefused = '';
+    try { await exportProject('java', derivedProj, { apiBase: 'x', outRoot: join(scratch, 'derived-write') }); }
+    catch (err: any) { derivedRefused = `${err?.code ?? ''}: ${String(err?.message ?? err)}`; }
+    assert(derivedRefused.startsWith('E-STATE:') && derivedRefused.includes('zB is a $derived value and is written here'), 'an export refuses a write to a $derived instead of emitting broken native code');
+  }
+
+  // R204: string coercion is now EVERY target's business, not just the desktop
+  // four. A template that mixes a string and a number - `{'Item ' + n + 1}` -
+  // ran on Java, C#, C++, Python and Dart handlers, but the template paths of
+  // Kotlin, ArkTS, Swift and Dart interpolated it verbatim into a template
+  // literal, where `$n` is a compile-time placeholder and the expression never
+  // ran. Every target now wraps the non-string operands of a string-bearing
+  // `+` chain, so the same source compiles and renders everywhere.
+  {
+    const concatProj = join(scratch, 'concatproj');
+    mkdirSync(join(concatProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(concatProj, 'src/pages/index.rose'), `<script>
+  let n = $state(3);
+  let name = $state('Rose');
+</script>
+<p>{'Row ' + n + 1}</p>
+<p>{n + 1 + ' items'}</p>
+<p>{name + ' v' + n}</p>
+`);
+    const concatOut = await exportProject('android', concatProj, { apiBase: 'x', outRoot: join(scratch, 'concat-kt') });
+    const kt = readFileSync(join(concatOut.outDir, 'app/src/main/java/dev/rosezm/app/pages/IndexPage.kt'), 'utf8');
+    assert(/Text\("\$\{"Row " \+ \(n\)\.toString\(\) \+ \(1\)\.toString\(\)\}"\)/.test(kt), 'Compose coerces a string+number chain instead of interpolating it verbatim');
+    assert(/Text\("\$\{\(n\)\.toString\(\) \+ \(1\)\.toString\(\) \+ " items"\}"\)/.test(kt), 'Compose coerces the number-first form too');
+    const concatK = await exportProject('arkts', concatProj, { apiBase: 'x', outRoot: join(scratch, 'concat-ets') });
+    const ets = readFileSync(join(concatK.outDir, 'entry/src/main/ets/pages/IndexPage.ets'), 'utf8');
+    assert(/Text\(`\$\{'Row ' \+ \(this\.n\)\.toString\(\) \+ \(1\)\.toString\(\)\}`\)/.test(ets), 'ArkTS coerces a string+number chain');
+    const concatX = await exportProject('xcode', concatProj, { apiBase: 'x', outRoot: join(scratch, 'concat-swift') });
+    const swift = readFileSync(join(concatX.outDir, 'rosezmApp/Pages/IndexView.swift'), 'utf8');
+    assert(swift.includes('"Row " + String(n) + String(1)'), 'SwiftUI coerces a string+number chain');    const concatF = await exportProject('flutter', concatProj, { apiBase: 'x', outRoot: join(scratch, 'concat-dart') });
+    const dart = readFileSync(join(concatF.outDir, 'lib/pages/index.dart'), 'utf8');
+    assert(/roseText\('\$\{'Row ' \+ \(n\)\.toString\(\) \+ \(1\)\.toString\(\)\}'/.test(dart), 'Flutter coerces a string+number chain in the template path (the handler path already did)');
+    // A pure-number chain is NOT a string concat and must stay untouched.
+    const numProj = join(scratch, 'numproj');
+    mkdirSync(join(numProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(numProj, 'src/pages/index.rose'), `<script>
+  let a = $state(1);
+  let b = $state(2);
+</script>
+<p>{a + b}</p>
+<p>{a() + b() + 4}</p>
+`);
+    const numKt = await exportProject('android', numProj, { apiBase: 'x', outRoot: join(scratch, 'num-kt') });
+    const ktNum = readFileSync(join(numKt.outDir, 'app/src/main/java/dev/rosezm/app/pages/IndexPage.kt'), 'utf8');
+    assert(/Text\("\$\{a \+ b\}"\)/.test(ktNum), 'a number-only chain keeps its plain arithmetic (no coercion is invented)');
+    assert(/Text\("\$\{a \+ b \+ 4\}"\)/.test(ktNum), 'a longer number-only chain stays arithmetic too');
+  }
+
+  // 16. falsification
+  let unknownRefused = false;
+  try { await exportProject('nope' as any, example, { outRoot: scratch }); } catch (err) { unknownRefused = /unknown export target/.test(String(err)); }
+  assert(unknownRefused, 'an unknown target refuses instead of guessing');
+  assert(Object.values(TARGETS).every((target) => target.status === 'ready'), 'every target in the registry is ready - the matrix has no planned placeholder left');
+
+  // R190: a `void x;` line is the compiler's own "I know this is unused" marker.
+  // In the emitters it means a value was computed and thrown away, which is
+  // either dead code (a computation nobody reads) or a rewrite that was planned
+  // and never landed - R189 found three targets discarding the very parameter
+  // their handler path needed. Only the documented decisions survive: the
+  // desktop targets deliberately run exported actions locally, so the action
+  // list they extract is intentionally unused.
+  {
+    const srcDir = new URL('src/export/', repo).pathname.replace(/^\/([A-Za-z]:)/, '$1');
+    const emitters = readdirSync(srcDir).filter((f) => f.endsWith('.ts'));
+    const offenders: string[] = [];
+    for (const f of emitters) {
+      const lines = readFileSync(join(srcDir, f), 'utf8').split('\n');
+      lines.forEach((line, i) => {
+        const m = /^\s*void\s+([A-Za-z_$][\w$]*)\s*;/.exec(line);
+        if (!m) return;
+        const name = m[1];
+        // The documented exception: an action list a desktop build runs locally.
+        const before = lines.slice(Math.max(0, i - 4), i).join('\n');
+        if (name === 'actions' && /runs locally|no backend|runs its own|desktop/i.test(before)) return;
+        offenders.push(`${f}:${i + 1} (${name})`);
+      });
+    }
+    assert(offenders.length === 0, `no emitter discards a computed value with a bare void: ${offenders.join(', ')}`);
+  }
+
+  // R191: a `$derived` value is a function of other state, so every read must
+  // re-evaluate it. Six targets emitted `state.put("doubled", count * 2)` once
+  // inside build() and read the snapshot forever after - a counter would double
+  // exactly once, then stick. arkts, flutter and the mini program were already
+  // live (a getter, a getter, a computed function); the other six now substitute
+  // the derived expression at the read site.
+  {
+    const dRoot = join(scratch, 'derived');
+    mkdirSync(join(dRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(dRoot, 'src/pages/d.rose'), `<script>
+  let count = $state(2);
+  let doubled = $derived(count() * 2);
+</script>
+<p>{doubled()}</p>
+`);
+    const DLIVE: Array<[string, string, string]> = [
+      ['android', 'app/src/main/java/dev/rosezm/app/pages/DPage.kt', '(count * 2)'],
+      ['java', 'src/main/java/dev/rosezm/app/pages/DPage.java', '(RoseTheme.integer(app.v("count")) * 2)'],
+      ['dotnet', 'Pages/DPage.cs', '(RoseTheme.Int(app.V("count")) * 2)'],
+      ['cpp', 'src/pages/DPage.cpp', '(app.v("count") * 2)'],
+      ['xcode', 'rosezmApp/Pages/DView.swift', '(count * 2)'],
+      ['python', 'pages/d.py', "rose_text(lambda: (st.get('count') * 2)"],
+    ];
+    for (const [t, rel, needle] of DLIVE) {
+      const dir = join(scratch, 'derived-' + t);
+      await exportProject(t, dRoot, { apiBase: 'http://x', outRoot: dir });
+      const txt = readFileSync(join(dir, t, rel), 'utf8');
+      assert(txt.includes(needle), `${t} reads a $derived value through its expression, not a snapshot`);
+    }
+    // The getter targets were already live; keep them honest.
+    const aDir = join(scratch, 'derived-arkts');
+    await exportProject('arkts', dRoot, { apiBase: 'http://x', outRoot: aDir });
+    assert(/get doubled\(\)[^{]*\{\s*return this\.count \* 2/.test(readFileSync(join(aDir, 'arkts', 'entry/src/main/ets/pages/DPage.ets'), 'utf8')), 'arkts keeps a $derived field as a live getter');
+    const fDir = join(scratch, 'derived-flutter');
+    await exportProject('flutter', dRoot, { apiBase: 'http://x', outRoot: fDir });
+    assert(/dynamic get doubled => count \* 2/.test(readFileSync(join(fDir, 'flutter', 'lib/pages/d.dart'), 'utf8')), 'flutter keeps a $derived field as a live getter');
+  }
+
+  // R245: Flutter `:hover`. A stylesheet hover half becomes a second style class
+  // keyed `__hover_<class>__<scope>` plus a MouseRegion that flips it on pointer
+  // enter/leave - the press state the web build has and Flutter's stylesheet
+  // cannot. Before this the rule was linted as dropped. The runtime Set keeps
+  // the flag; a touch target without a mouse simply never flips it.
+  {
+    const hRoot = join(scratch, 'hoverfl');
+    mkdirSync(join(hRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(hRoot, 'src/pages/h.rose'), `<style>
+  .btn { background: #eee; padding: 8px; }
+  .btn:hover { background: #e91e63; color: #fff; }
+</style>
+<button class="btn">press me</button>
+`);
+    const dir = join(scratch, 'hoverfl-out');
+    const r = await exportProject('flutter', hRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:hover has no Flutter equivalent/.test(w)), 'a Flutter :hover rule is no longer linted as dropped');
+    const styles = readFileSync(join(dir, 'flutter', 'lib/styles.dart'), 'utf8');
+    assert(/'__hover_btn__h': RoseStyle\(/.test(styles), 'the hover half compiles to a synthetic style class');
+    assert(/__hover_btn__h': RoseStyle\(color: Color\(0xFFFFFFFF\), background: Color\(0xFFE91E63\)\)/.test(styles), 'the hover half carries its own declarations');
+    const page = readFileSync(join(dir, 'flutter', 'lib/pages/h.dart'), 'utf8');
+    assert(/final Set<String> __hover = <String>\{\}/.test(page), 'the page carries the hover flag set');
+    assert(/void __setHover\(String key, bool on\)/.test(page), 'the page carries the hover toggle');
+    assert(/MouseRegion\(onEnter: \(e\) => __setHover\('__hover_btn__h', true\), onExit: \(e\) => __setHover\('__hover_btn__h', false\)/.test(page), 'the element is wrapped in a MouseRegion that flips the flag');
+    assert(/if \(__hover\.contains\('__hover_btn__h'\)\) '__hover_btn__h'/.test(page), 'the synthetic class joins the resolve list while hovered');
+    // The un-hovered const form must survive on a page with no hover rules: the
+    // keyword cannot ride along when the class list carries an `if` element.
+    const nhRoot = join(scratch, 'nohover');
+    mkdirSync(join(nhRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(nhRoot, 'src/pages/n.rose'), `<style>
+  .plain { color: #333; }
+</style>
+<p class="plain">no hover here</p>
+`);
+    const nhDir = join(scratch, 'nohover-out');
+    await exportProject('flutter', nhRoot, { apiBase: 'http://x', outRoot: nhDir });
+    assert(readFileSync(join(nhDir, 'flutter', 'lib/pages/n.dart'), 'utf8').includes("roseResolve(const <String>['plain'], 'n', 'p')"), 'a page with no hover rules keeps the const class list');
+  }
+
+  // R246: Compose `:hover`. The same shape as Flutter's - a second style class
+  // keyed `__hover_<class>__<scope>` plus a hoverable modifier whose
+  // InteractionSource feeds a collected state. Before this the rule was linted
+  // as dropped. A phone has no pointer, so the flag never flips there; a tablet
+  // or desktop Compose build is where it is real.
+  {
+    const kRoot = join(scratch, 'hoverkt');
+    mkdirSync(join(kRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(kRoot, 'src/pages/h.rose'), `<style>
+  .btn { background: #eee; padding: 8px; }
+  .btn:hover { background: #e91e63; color: #fff; }
+</style>
+<button class="btn">press me</button>
+`);
+    const dir = join(scratch, 'hoverkt-out');
+    const r = await exportProject('android', kRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:hover has no Compose equivalent/.test(w)), 'a Compose :hover rule is no longer linted as dropped');
+    const theme = readFileSync(join(dir, 'android', 'app/src/main/java/dev/rosezm/app/kit/RoseTheme.kt'), 'utf8');
+    assert(/"__hover_btn__H" to RoseStyle\(color = Color\(0xFFFFFFFF\), background = Color\(0xFFE91E63\)\)/.test(theme), 'the hover half compiles to a synthetic style entry');
+    const page = readFileSync(join(dir, 'android', 'app/src/main/java/dev/rosezm/app/pages/HPage.kt'), 'utf8');
+    assert(/val __hovered__hover_btn__HSource = remember \{ MutableInteractionSource\(\) \}/.test(page), 'the page carries the hover interaction source');
+    assert(/val __hovered__hover_btn__H by __hovered__hover_btn__HSource\.collectIsHoveredAsState\(\)/.test(page), 'the hover flag is a collected state');
+    assert(/\.hoverable\(__hovered__hover_btn__HSource\)/.test(page), 'the element is hoverable');
+    assert(/if \(__hovered__hover_btn__H\) "__hover_btn__H" else ""/.test(page), 'the synthetic class joins the resolve list while hovered');
+  }
+
+  // R247: SwiftUI `:hover`. The same shape a fourth time - a synthetic style
+  // class plus an .onHover closure flipping an @State flag. The declaration and
+  // the read must spell the SAME name (the first cut emitted two different
+  // spellings, which would not compile); the test pins the pair.
+  {
+    const sRoot = join(scratch, 'hoversw');
+    mkdirSync(join(sRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(sRoot, 'src/pages/h.rose'), `<style>
+  .btn { background: #eee; padding: 8px; }
+  .btn:hover { background: #e91e63; color: #fff; }
+</style>
+<button class="btn">press me</button>
+`);
+    const dir = join(scratch, 'hoversw-out');
+    const r = await exportProject('xcode', sRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:hover has no SwiftUI equivalent/.test(w)), 'a SwiftUI :hover rule is no longer linted as dropped');
+    const theme = readFileSync(join(dir, 'xcode', 'rosezmApp/Kit/RoseTheme.swift'), 'utf8');
+    assert(/"__hover_btn__HView": RoseStyle\(/.test(theme), 'the hover half compiles to a synthetic style entry');
+    const page = readFileSync(join(dir, 'xcode', 'rosezmApp/Pages/HView.swift'), 'utf8');
+    // The @State declaration and the resolve read must name the same flag.
+    const decl = /@State private var (__hovered_\w+): Bool = false/.exec(page)?.[1];
+    assert(!!decl, 'the page declares the hover flag');
+    assert(page.includes(`__hovered__hover_btn__HView ? "__hover_btn__HView" : ""`), 'the synthetic class joins the resolve list while hovered');
+    assert(decl === '__hovered__hover_btn__HView', 'the declared flag matches the name the resolve reads');
+    assert(/\.onHover \{ newValue in __hovered__hover_btn__HView = newValue \}/.test(page), 'the element carries an .onHover closure flipping the flag');
+  }
+
+  // R248: Tk `:hover`. The same shape a fifth time - a second style entry keyed
+  // `__hover_<class>__<scope>` plus <Enter>/<Leave> bindings that apply it
+  // through rose_apply and re-apply the base model on leave. Every widget goes
+  // through emitPack, so one hook covers buttons, labels and frames alike.
+  {
+    const tRoot = join(scratch, 'hovertk');
+    mkdirSync(join(tRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(tRoot, 'src/pages/h.rose'), `<style>
+  .btn { background: #eee; padding: 8px; }
+  .btn:hover { background: #e91e63; color: #fff; }
+</style>
+<button class="btn">press me</button>
+`);
+    const dir = join(scratch, 'hovertk-out');
+    const r = await exportProject('python', tRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:hover has no Tk equivalent/.test(w)), 'a Tk :hover rule is no longer linted as dropped');
+    const styles = readFileSync(join(dir, 'python', 'styles.py'), 'utf8');
+    assert(/'__hover_btn__h': \{'bg': '#e91e63', 'fg': '#ffffff'\}/.test(styles), 'the hover half compiles to a synthetic style entry');
+    const page = readFileSync(join(dir, 'python', 'pages/h.py'), 'utf8');
+    assert(page.includes(`rose_apply`), 'the page imports rose_apply for the hover apply');
+    // R263: the button is named `__b<n>` now (the active round's naming), so the
+    // hover bindings carry the button's own name instead of the generic `__w0`.
+    assert(/__b\d+\.bind\('<Enter>', lambda e: rose_apply\(__b\d+, STYLES\['__hover_btn__h'\]\)\)/.test(page), 'the element binds <Enter> to the hover half');
+    assert(/__b\d+\.bind\('<Leave>', lambda e: rose_apply\(__b\d+, STYLES\['btn__h'\]\)\)/.test(page), 'the element binds <Leave> back to the base model');
+    // The generated page must parse: a binding referencing an unknown import or
+    // an unparsable lambda would fail the whole app at launch.
+    const py = spawnSync('python', ['-c', `import ast; ast.parse(open(${JSON.stringify(join(dir, 'python', 'pages/h.py'))}, encoding='utf-8').read())`], { encoding: 'utf8' });
+    assert(py.status === 0, `the generated Tk page parses (${py.stderr.trim().slice(0, 80)})`);
+  }
+
+  // R252: `:focus` is a first-class variant in the shared style engine. The rule
+  // no longer vanishes with a "native tree cannot test it" warning: it lands on
+  // `rule.focus`, cascadeFor resolves it next to `hover`, and the base model
+  // stays clean - the input-state variant every native input can honour.
+  {
+    const engine = await import('../src/export/style-engine.ts');
+    const sheet = engine.parseStylesheet(`
+  .input { border: 1px solid #ccc; }
+  .input:focus { border-color: #e91e63; background: #fff; }
+  .btn:active { background: #ddd; }
+`);
+    const focusRule = sheet.rules.find((r: { selector: string }) => r.selector.trim() === '.input:focus');
+    assert(!!focusRule, 'a .input:focus rule is parsed, not skipped');
+    assert(focusRule && JSON.stringify(focusRule.focus) === '{"borderColor":"#e91e63","background":"#ffffff"}', 'the :focus half lands on rule.focus');
+    const res = engine.cascadeFor(sheet, { tag: 'input', classes: ['input'] }, [], { viewport: 390 });
+    assert(res.focus && (res.focus as Record<string, unknown>).borderColor === '#e91e63', 'cascadeFor resolves the :focus variant');
+    assert(!res.model.background, 'the :focus background does not bleed into the base model');
+    // R262: `:active` is a first-class variant now, same shape as focus - no
+    // skip warning, the half lands on rule.active and cascadeFor returns it.
+    const activeRule = sheet.rules.find((r: { selector: string }) => r.selector.trim() === '.btn:active');
+    assert(!!activeRule, 'a .btn:active rule is parsed, not skipped');
+    assert(activeRule && JSON.stringify(activeRule.active) === '{"background":"#dddddd"}', 'the :active half lands on rule.active');
+    assert(!(sheet.warnings as string[]).some((w) => w.includes(':active')), 'no :active skip warning - the variant is modelled');
+    const activeRes = engine.cascadeFor(sheet, { tag: 'button', classes: ['btn'] }, [], { viewport: 390 });
+    assert(activeRes.active && (activeRes.active as Record<string, unknown>).background === '#dddddd', 'cascadeFor resolves the :active variant');
+    assert(!activeRes.model.background, 'the :active background does not bleed into the base model');
+  }
+
+  // R253: Tk consumes the variant. An input with a `:focus` half gets
+  // <FocusIn>/<FocusOut> bindings that apply the focus model through
+  // rose_apply and re-apply the base model on blur; the focus border rides
+  // highlightcolor (Tk's focused-border slot), with the base model's border
+  // width adopted when the half only recolors.
+  {
+    const fRoot = join(scratch, 'focustk');
+    mkdirSync(join(fRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(fRoot, 'src/pages/h.rose'), `<script>
+  let name = $state('');
+</script>
+<style>
+  .field { border: 1px solid #ccc; background: #fff; padding: 8px; }
+  .field:focus { border-color: #e91e63; background: #fff7fa; }
+</style>
+<input class="field" bind:value={name} placeholder="your name">
+<textarea class="field"></textarea>
+`);
+    const dir = join(scratch, 'focustk-out');
+    const r = await exportProject('python', fRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:focus/.test(w)), 'a Tk :focus rule is no longer linted as skipped');
+    const page = readFileSync(join(dir, 'python', 'pages/h.py'), 'utf8');
+    assert(page.includes(`.bind('<FocusIn>', lambda e: rose_apply(`), 'the input binds <FocusIn> to the focus model');
+    assert(page.includes(`.bind('<FocusOut>', lambda e: rose_apply(`), 'the input binds <FocusOut> back to the base model');
+    assert(page.includes(`"highlightcolor": '#e91e63'`), 'the focus border rides highlightcolor');
+    assert(page.includes(`"highlightthickness": 1`), 'the base border width is adopted for the focused border');
+    assert(page.includes(`rose_apply`), 'the page imports rose_apply for the focus apply');
+    const py = spawnSync('python', ['-c', `import ast; ast.parse(open(${JSON.stringify(join(dir, 'python', 'pages/h.py'))}, encoding='utf-8').read())`], { encoding: 'utf8' });
+    assert(py.status === 0, `the generated Tk focus page parses (${py.stderr.trim().slice(0, 80)})`);
+  }
+
+  // R254: WPF consumes the variant. One event pair covers every widget
+  // (GotKeyboardFocus/LostKeyboardFocus), so the Focus call carries both halves:
+  // the element's own merged model as the base and the :focus model as the
+  // focused repaint.
+  {
+    const wRoot = join(scratch, 'focuswpf');
+    mkdirSync(join(wRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(wRoot, 'src/pages/h.rose'), `<script>
+  let name = $state('');
+</script>
+<style>
+  .field { border: 1px solid #ccc; background: #fff; padding: 8px; }
+  .field:focus { border-color: #e91e63; background: #fff7fa; }
+</style>
+<input class="field" bind:value={name} placeholder="your name">
+`);
+    const dir = join(scratch, 'focuswpf-out');
+    const r = await exportProject('dotnet', wRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:focus/.test(w)), 'a WPF :focus rule is no longer linted as skipped');
+    const page = readFileSync(join(dir, 'dotnet', 'Pages/HPage.cs'), 'utf8');
+    assert(/RoseTheme\.Focus\(input\d+, new RoseStyle \{ Background = "#ffffff", Padding = new double\[\] \{ 8, 8, 8, 8 \}, BorderWidth = new double\[\] \{ 1, 1, 1, 1 \}, BorderColor = "#cccccc"/.test(page), 'the base half is the element\u2019s own merged style');
+    assert(/RoseTheme\.Focus\(input\d+, new RoseStyle \{[^\n]*\}, new RoseStyle \{ Background = "#fff7fa", BorderColor = "#e91e63" \}\)/.test(page), 'the focus half repaints the recolored border and background');
+    const theme = readFileSync(join(dir, 'dotnet', 'RoseTheme.cs'), 'utf8');
+    assert(/public static void Focus\(FrameworkElement element, RoseStyle baseStyle, RoseStyle focus\)/.test(theme), 'the kit declares the two-half Focus');
+    assert(/GotKeyboardFocus \+= \(_, _\) => Apply\(element, focus\)/.test(theme) && /LostKeyboardFocus \+= \(_, _\) => Apply\(element, baseStyle\)/.test(theme), 'the event pair applies focus on Got and the base on Lost');
+  }
+
+  // R250: Swing `:hover`. The same shape a sixth time - a second STYLES row
+  // keyed `__hover_<class>__<scope>` plus a MouseAdapter that applies it on
+  // mouseEntered and re-applies the base on mouseExited. The container panel
+  // and the button both return before a shared tail, so each carries the call.
+  {
+    const jRoot = join(scratch, 'hoverswing');
+    mkdirSync(join(jRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(jRoot, 'src/pages/h.rose'), `<style>
+  .btn { background: #eee; padding: 8px; }
+  .btn:hover { background: #e91e63; color: #fff; }
+  .card { background: #fff; padding: 8px; }
+  .card:hover { border-color: #e91e63; }
+</style>
+<button class="btn">press me</button>
+<div class="card"><p>inside</p></div>
+`);
+    const dir = join(scratch, 'hoverswing-out');
+    const r = await exportProject('java', jRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:hover half|:hover has no Swing/.test(w)), 'a Swing :hover rule is no longer linted as dropped');
+    const theme = readFileSync(join(dir, 'java', 'src/main/java/dev/rosezm/app/RoseTheme.java'), 'utf8');
+    assert(/STYLES\.put\("__hover_btn__H", new Style\(14, "#ffffff", "#e91e63"/.test(theme), 'the button hover half compiles to a STYLES row');
+    assert(/STYLES\.put\("__hover_card__H", new Style\(/.test(theme), 'the container hover half compiles to a STYLES row');
+    const page = readFileSync(join(dir, 'java', 'src/main/java/dev/rosezm/app/pages/HPage.java'), 'utf8');
+    assert(/RoseTheme\.hover\(panel\d+, "H", "card__H", "__hover_card__H"\)/.test(page), 'the container panel gets the hover adapter');
+    assert(/RoseTheme\.hover\(__b\d+, "H"/.test(page), 'the button gets the hover adapter');
+    // The generated page must stay structurally sound: braces balance, and the
+    // adapter's base row is the same key the static style used.
+    const open = (page.match(/\{/g) ?? []).length;
+    const close = (page.match(/\}/g) ?? []).length;
+    assert(open === close, `the generated Swing page stays balanced (${open}/${close})`);
+  }
+
+  // R255: Swing `:focus` - a third target consumes the variant. FocusListener
+  // repaints the focus row on focusGained and the base row on focusLost; the
+  // focus row adopts the base border WIDTH when the half only recolors, so the
+  // rose border actually paints.
+  {
+    const sRoot = join(scratch, 'focusswing');
+    mkdirSync(join(sRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(sRoot, 'src/pages/h.rose'), `<script>
+  let name = $state('');
+</script>
+<style>
+  .field { border: 1px solid #ccc; background: #fff; padding: 8px; }
+  .field:focus { border-color: #e91e63; background: #fff7fa; }
+</style>
+<input class="field" bind:value={name} placeholder="your name">
+<textarea class="field"></textarea>
+`);
+    const dir = join(scratch, 'focusswing-out');
+    const r = await exportProject('java', sRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:focus/.test(w)), 'a Swing :focus rule is no longer linted as skipped');
+    const theme = readFileSync(join(dir, 'java', 'src/main/java/dev/rosezm/app/RoseTheme.java'), 'utf8');
+    assert(/STYLES\.put\("__focus_field__H", new Style\(14, "#222222", "#fff7fa", 0, false, "left", "SansSerif", "#e91e63", 1\)\)/.test(theme), 'the focus row carries the recolor AND the adopted border width');
+    assert(/public static void focus\(JComponent widget, String scope, String baseKey, String focusKey\)/.test(theme), 'the kit declares the focus listener');
+    assert(/focusGained\(java\.awt\.event\.FocusEvent e\) => apply\(widget, over\)|focusGained\(java\.awt\.event\.FocusEvent e\) \{ apply\(widget, over\); \}/.test(theme), 'focusGained applies the focus row');
+    assert(/focusLost\(java\.awt\.event\.FocusEvent e\) \{ apply\(widget, base\); \}/.test(theme), 'focusLost repaints the base row');
+    const page = readFileSync(join(dir, 'java', 'src/main/java/dev/rosezm/app/pages/HPage.java'), 'utf8');
+    assert(/RoseTheme\.focus\(RoseTheme\.textField\([^)]*\), "H", "field__H", "__focus_field__H"\)/.test(page), 'the bound input wraps its field helper with focus');
+    assert(/RoseTheme\.focus\(RoseTheme\.textArea\(/.test(page), 'the textarea carries the focus listener too');
+    const open = (page.match(/\{/g) ?? []).length;
+    const close = (page.match(/\}/g) ?? []).length;
+    assert(open === close, `the Swing focus page stays balanced (${open}/${close})`);
+  }
+
+  // R251: Qt `:hover` - the last target. The same shape a seventh time: a
+  // second rose_styles entry keyed `__hover_<class>__<scope>` plus an event
+  // filter that applies it on QEvent::Enter and re-applies the base on
+  // QEvent::Leave, gated by Qt::WA_Hover.
+  {
+    const qRoot = join(scratch, 'hoverqt');
+    mkdirSync(join(qRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(qRoot, 'src/pages/h.rose'), `<style>
+  .btn { background: #eee; padding: 8px; }
+  .btn:hover { background: #e91e63; color: #fff; }
+  .card { background: #fff; padding: 8px; }
+  .card:hover { border-color: #e91e63; }
+</style>
+<button class="btn">press me</button>
+<div class="card"><p>inside</p></div>
+`);
+    const dir = join(scratch, 'hoverqt-out');
+    const r = await exportProject('cpp', qRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:hover half|:hover has no Qt/.test(w)), 'a Qt :hover rule is no longer linted as dropped');
+    const header = readFileSync(join(dir, 'cpp', 'src/rose.h'), 'utf8');
+    assert(/\{"__hover_btn__H", \{14, "#ffffff", "#e91e63"/.test(header), 'the button hover half compiles to a rose_styles entry');
+    assert(/\{"__hover_card__H", \{/.test(header), 'the container hover half compiles to a rose_styles entry');
+    assert(/void rose_hover\(QWidget\* widget, const RoseStyle& base, const RoseStyle& over\);/.test(header), 'the kit declares rose_hover');
+    const kit = readFileSync(join(dir, 'cpp', 'src/rose.cpp'), 'utf8');
+    assert(/class RoseHoverFilter : public QObject/.test(kit) && /QEvent::Enter\) rose_apply_box\(target_, over_\)/.test(kit) && /QEvent::Leave\) rose_apply_box\(target_, base_\)/.test(kit), 'the event filter applies the hover half on Enter and the base on Leave');
+    const page = readFileSync(join(dir, 'cpp', 'src/pages/HPage.cpp'), 'utf8');
+    assert(/rose_hover\(__b\d+, RoseStyle\{/.test(page), 'the button gets the hover filter');
+    assert(/rose_hover\(panel\d+, RoseStyle\{/.test(page), 'the container gets the hover filter');
+  }
+
+  // R256: Qt `:focus` - a fourth target consumes the variant. The same filter
+  // shape as Qt's own hover: FocusIn applies the entry, FocusOut repaints the
+  // base; the entry registers in a SECOND pass so a recolor-only half adopts
+  // the base border width whatever order the stylesheet listed.
+  {
+    const qRoot = join(scratch, 'focusqt');
+    mkdirSync(join(qRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(qRoot, 'src/pages/h.rose'), `<script>
+  let name = $state('');
+</script>
+<style>
+  .field { border: 1px solid #ccc; background: #fff; padding: 8px; }
+  .field:focus { border-color: #e91e63; background: #fff7fa; }
+</style>
+<input class="field" bind:value={name} placeholder="your name">
+<div class="field"><p>inside</p></div>
+`);
+    const dir = join(scratch, 'focusqt-out');
+    const r = await exportProject('cpp', qRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:focus/.test(w)), 'a Qt :focus rule is no longer linted as skipped');
+    const header = readFileSync(join(dir, 'cpp', 'src/rose.h'), 'utf8');
+    const focusRow = /\{"__focus_field__H", \{[^}]*\}/.exec(header)?.[0] ?? '';
+    assert(focusRow.includes('"#fff7fa"'), 'the focus entry carries the recolored background');
+    assert(focusRow.includes('"#e91e63"') && focusRow.includes(', 1,'), 'the recolor-only half adopted the base border width');
+    assert(/void rose_focus\(QWidget\* widget, const RoseStyle& base, const RoseStyle& over\);/.test(header), 'the kit declares rose_focus');
+    const kit = readFileSync(join(dir, 'cpp', 'src/rose.cpp'), 'utf8');
+    assert(/class RoseFocusFilter : public QObject/.test(kit), 'the focus filter class exists');
+    assert(/QEvent::FocusIn\) rose_apply_box\(target_, over_\)/.test(kit) && /QEvent::FocusOut\) rose_apply_box\(target_, base_\)/.test(kit), 'the filter applies focus on FocusIn and the base on FocusOut');
+    const page = readFileSync(join(dir, 'cpp', 'src/pages/HPage.cpp'), 'utf8');
+    assert(/rose_focus\(rose_input\(/.test(page), 'the bound input wraps its field helper with focus');
+    assert(/rose_focus\(panel\d+, RoseStyle\{/.test(page), 'the container gets the focus filter');
+  }
+
+  // R257: Flutter `:focus` - the hover shape adapted: a synthetic style class
+  // keyed `__focus_<class>__<scope>` plus a Focus widget whose onFocusChange
+  // flips the page-level flag gating the class in roseResolve's list. The input
+  // branch returns before the generic tail, so it wraps there - where the caret
+  // actually lands.
+  {
+    const fRoot = join(scratch, 'focusflutter');
+    mkdirSync(join(fRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(fRoot, 'src/pages/h.rose'), `<script>
+  let name = $state('');
+</script>
+<style>
+  .field { border: 1px solid #ccc; background: #fff; padding: 8px; }
+  .field:focus { border-color: #e91e63; background: #fff7fa; }
+</style>
+<input class="field" bind:value={name} placeholder="your name">
+<div class="field"><p>inside</p></div>
+`);
+    const dir = join(scratch, 'focusflutter-out');
+    const r = await exportProject('flutter', fRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:focus/.test(w)), 'a Flutter :focus rule is no longer linted as skipped');
+    const styles = readFileSync(join(dir, 'flutter', 'lib/styles.dart'), 'utf8');
+    assert(/'__focus_field__h': RoseStyle\(background: Color\(0xFFFFF7FA\), border: Border\.all\(color: Color\(0xFFE91E63\), width: 1\)\)/.test(styles), 'the focus entry carries the recolor AND the adopted border width');
+    const page = readFileSync(join(dir, 'flutter', 'lib/pages/h.dart'), 'utf8');
+    assert(/void __setFocus\(String key, bool on\)/.test(page), 'the page declares the focus flag setter');
+    assert(/if \(__focus\.contains\('__focus_field__h'\)\) '__focus_field__h'/.test(page), 'the synthetic class joins the resolve list while focused');
+    assert(/Focus\(onFocusChange: \(v\) => __setFocus\('__focus_field__h', v\), child: roseInputField\(/.test(page), 'the input wraps its field widget with Focus');
+    assert(!page.includes("const <String>['field']"), 'the pure-const class list dropped its keyword once a focus part exists');
+  }
+
+  // R263: Tk consumes `:active` first. <ButtonPress-1> applies the active model
+  // (mouse/touch down), <ButtonRelease-1> re-applies the base - the pressed
+  // state the web's .btn:active carries, through the same inline-dict
+  // rose_apply shape the focus round established.
+  {
+    const aRoot = join(scratch, 'activetk');
+    mkdirSync(join(aRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(aRoot, 'src/pages/h.rose'), `<style>
+  .btn { background: #eee; padding: 8px; }
+  .btn:active { background: #e91e63; color: #fff; }
+</style>
+<button class="btn">press me</button>
+`);
+    const dir = join(scratch, 'activetk-out');
+    const r = await exportProject('python', aRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:active/.test(w)), 'a Tk :active rule is no longer linted as skipped');
+    const page = readFileSync(join(dir, 'python', 'pages/h.py'), 'utf8');
+    assert(/__b\d+\.bind\('<ButtonPress-1>', lambda e: rose_apply\(__b\d+, \{"bg": '#e91e63', "fg": '#ffffff'\}\)\)/.test(page), 'the button binds <ButtonPress-1> to the active model');
+    assert(/__b\d+\.bind\('<ButtonRelease-1>', lambda e: rose_apply\(__b\d+, \{"bg": '#eeeeee'/.test(page), 'the button binds <ButtonRelease-1> back to the base model');
+    assert(page.includes('rose_apply'), 'the page imports rose_apply for the active apply');
+    const py = spawnSync('python', ['-c', `import ast; ast.parse(open(${JSON.stringify(join(dir, 'python', 'pages/h.py'))}, encoding='utf-8').read())`], { encoding: 'utf8' });
+    assert(py.status === 0, `the generated Tk active page parses (${py.stderr.trim().slice(0, 80)})`);
+  }
+
+  // R264: WPF consumes `:active` second. The Focus shape applies again: one
+  // mouse button pair covers every widget - Down paints the active model, Up
+  // repaints the base. The same two-half signature the focus round established.
+  {
+    const wRoot = join(scratch, 'activewpf');
+    mkdirSync(join(wRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(wRoot, 'src/pages/h.rose'), `<style>
+  .btn { background: #eee; padding: 8px; }
+  .btn:active { background: #e91e63; color: #fff; }
+</style>
+<button class="btn">press me</button>
+<div class="btn"><p>inside</p></div>
+`);
+    const dir = join(scratch, 'activewpf-out');
+    const r = await exportProject('dotnet', wRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:active/.test(w)), 'a WPF :active rule is no longer linted as skipped');
+    const theme = readFileSync(join(dir, 'dotnet', 'RoseTheme.cs'), 'utf8');
+    assert(/public static void Active\(FrameworkElement element, RoseStyle baseStyle, RoseStyle active\)/.test(theme), 'the kit declares the two-half Active');
+    assert(/MouseLeftButtonDown \+= \(_, _\) => Apply\(element, active\)/.test(theme) && /MouseLeftButtonUp \+= \(_, _\) => Apply\(element, baseStyle\)/.test(theme), 'the event pair applies active on Down and the base on Up');
+    const page = readFileSync(join(dir, 'dotnet', 'Pages/HPage.cs'), 'utf8');
+    assert(/RoseTheme\.Active\(btn\d+, new RoseStyle \{[^\n]*\}, new RoseStyle \{ Color = "#ffffff", Background = "#e91e63" \}\)/.test(page), 'the button carries both halves');
+    assert(/RoseTheme\.Active\(panel\d+, new RoseStyle \{[^\n]*\}, new RoseStyle \{ Color = "#ffffff", Background = "#e91e63" \}\)/.test(page), 'the container carries both halves too');
+  }
+
+  // R265: Swing consumes `:active` third. The hover MouseAdapter shape applies:
+  // mousePressed repaints the active row, mouseReleased repaints the base. The
+  // recolor-only half adopts the base border width, same as the focus rows.
+  {
+    const sRoot = join(scratch, 'activeswing');
+    mkdirSync(join(sRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(sRoot, 'src/pages/h.rose'), `<style>
+  .btn { background: #eee; padding: 8px; }
+  .btn:active { background: #e91e63; color: #fff; }
+</style>
+<button class="btn">press me</button>
+<div class="btn"><p>inside</p></div>
+`);
+    const dir = join(scratch, 'activeswing-out');
+    const r = await exportProject('java', sRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:active/.test(w)), 'a Swing :active rule is no longer linted as skipped');
+    const theme = readFileSync(join(dir, 'java', 'src/main/java/dev/rosezm/app/RoseTheme.java'), 'utf8');
+    assert(/STYLES\.put\("__active_btn__H", new Style\(14, "#ffffff", "#e91e63"/.test(theme), 'the active row reaches the STYLES table');
+    assert(/public static void active\(JComponent widget, String scope, String baseKey, String activeKey\)/.test(theme), 'the kit declares the active listener');
+    assert(/mousePressed\(java\.awt\.event\.MouseEvent e\) \{ apply\(widget, over\); \}/.test(theme) && /mouseReleased\(java\.awt\.event\.MouseEvent e\) \{ apply\(widget, base\); \}/.test(theme), 'the pair applies active on press and the base on release');
+    const page = readFileSync(join(dir, 'java', 'src/main/java/dev/rosezm/app/pages/HPage.java'), 'utf8');
+    assert(/RoseTheme\.active\(__b\d+, "H", "btn__H", "__active_btn__H"\)/.test(page), 'the button carries the active listener');
+    assert(/RoseTheme\.active\(panel\d+, "H", "btn__H", "__active_btn__H"\)/.test(page), 'the container carries the active listener too');
+    const open = (page.match(/\{/g) ?? []).length;
+    const close = (page.match(/\}/g) ?? []).length;
+    assert(open === close, `the Swing active page stays balanced (${open}/${close})`);
+  }
+
+  // R266: Qt consumes `:active` fourth. The R256 RoseFocusFilter shape applies:
+  // a MouseButtonPress/Release filter applies the active entry on press and the
+  // base on release; the entry registers in the same second pass, adopting the
+  // base border width for a recolor-only half.
+  {
+    const qRoot = join(scratch, 'activeqt');
+    mkdirSync(join(qRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(qRoot, 'src/pages/h.rose'), `<style>
+  .btn { background: #eee; padding: 8px; }
+  .btn:active { background: #e91e63; color: #fff; }
+</style>
+<button class="btn">press me</button>
+<div class="btn"><p>inside</p></div>
+`);
+    const dir = join(scratch, 'activeqt-out');
+    const r = await exportProject('cpp', qRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:active/.test(w)), 'a Qt :active rule is no longer linted as skipped');
+    const header = readFileSync(join(dir, 'cpp', 'src/rose.h'), 'utf8');
+    assert(/\{"__active_btn__H", \{14, "#ffffff", "#e91e63"/.test(header), 'the active entry reaches the rose_styles table');
+    assert(/void rose_active\(QWidget\* widget, const RoseStyle& base, const RoseStyle& over\);/.test(header), 'the kit declares rose_active');
+    const kit = readFileSync(join(dir, 'cpp', 'src/rose.cpp'), 'utf8');
+    assert(/class RoseActiveFilter : public QObject/.test(kit), 'the active filter class exists');
+    assert(/QEvent::MouseButtonPress\) rose_apply_box\(target_, over_\)/.test(kit) && /QEvent::MouseButtonRelease\) rose_apply_box\(target_, base_\)/.test(kit), 'the filter applies active on press and the base on release');
+    const page = readFileSync(join(dir, 'cpp', 'src/pages/HPage.cpp'), 'utf8');
+    assert(/rose_active\(__b\d+, RoseStyle\{/.test(page), 'the button carries the active filter');
+    assert(/rose_active\(panel\d+, RoseStyle\{/.test(page), 'the container carries the active filter too');
+  }
+
+  // R267: Flutter consumes `:active`. The focus shape adapts: a synthetic
+  // class gated by a page-level __active Set, flipped by a Listener's
+  // pointerDown/Up/Cancel trio. Listener (raw pointer) rather than
+  // GestureDetector - a recognizer would win the arena and swallow the field's
+  // own tap, so the caret could never land.
+  {
+    const fRoot = join(scratch, 'activeflutter');
+    mkdirSync(join(fRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(fRoot, 'src/pages/h.rose'), `<style>
+  .btn { background: #eee; padding: 8px; }
+  .btn:active { background: #e91e63; color: #fff; }
+  .field { border: 1px solid #ccc; background: #fff; }
+  .field:active { border-color: #e91e63; }
+</style>
+<button class="btn">press me</button>
+<input class="field" placeholder="name">
+`);
+    const dir = join(scratch, 'activeflutter-out');
+    const r = await exportProject('flutter', fRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:active/.test(w)), 'a Flutter :active rule is no longer linted as skipped');
+    const styles = readFileSync(join(dir, 'flutter', 'lib/styles.dart'), 'utf8');
+    assert(/'__active_btn__h': RoseStyle\((?:[^()]|\([^)]*\))*background: Color\(0xFFE91E63\)/.test(styles), 'the active entry reaches the runtime style table');
+    const page = readFileSync(join(dir, 'flutter', 'lib/pages/h.dart'), 'utf8');
+    assert(page.includes('void __setActive(String key, bool on)'), 'the page declares the active flag setter');
+    assert(page.includes("if (__active.contains('__active_btn__h')) '__active_btn__h'"), 'the synthetic class gates the resolve list');
+    assert(/Listener\(onPointerDown: \(e\) => __setActive\('__active_btn__h', true\), onPointerUp: \(e\) => __setActive\('__active_btn__h', false\)/.test(page), 'the button wraps a Listener that flips the flag on press');
+    assert(/Listener\(onPointerDown: \(e\) => __setActive\('__active_field__h', true\)/.test(page), 'the input wraps a Listener too (raw pointer, no arena stolen)');
+    assert(!page.includes("const <String>['btn']"), 'the pure-const class list dropped its keyword once an active part exists');
+  }
+
+  // R268: Compose consumes `:active`. The hover shape applies one more time:
+  // a MutableInteractionSource + collectIsPressedAsState - the pressed mirror
+  // of collectIsHoveredAsState - with clickable(null indication) watching the
+  // press without drawing a ripple of its own.
+  {
+    const cRoot = join(scratch, 'activecompose');
+    mkdirSync(join(cRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(cRoot, 'src/pages/h.rose'), `<style>
+  .btn { background: #eee; padding: 8px; }
+  .btn:active { background: #e91e63; color: #fff; }
+</style>
+<button class="btn">press me</button>
+<div class="btn"><p>inside</p></div>
+`);
+    const dir = join(scratch, 'activecompose-out');
+    const r = await exportProject('android', cRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:active/.test(w)), 'a Compose :active rule is no longer linted as skipped');
+    const theme = readFileSync(join(dir, 'android', 'app/src/main/java/dev/rosezm/app/kit/RoseTheme.kt'), 'utf8');
+    assert(/"__active_btn__H" to RoseStyle\((?:[^()]|\([^)]*\))*background = Color\(0xFFE91E63\)/.test(theme.replace(/\n/g, ' ')), 'the active entry reaches the style table');
+    const page = readFileSync(join(dir, 'android', 'app/src/main/java/dev/rosezm/app/pages/HPage.kt'), 'utf8');
+    assert(page.includes('import androidx.compose.foundation.interaction.collectIsPressedAsState'), 'the page imports the pressed collector');
+    assert(/val __pressed__active_btn__HSource = remember \{ MutableInteractionSource\(\) \}/.test(page), 'the page carries the pressed interaction source');
+    assert(/val __pressed__active_btn__H by __pressed__active_btn__HSource\.collectIsPressedAsState\(\)/.test(page), 'the pressed flag is a collected state');
+    assert(/if \(__pressed__active_btn__H\) "__active_btn__H" else ""/.test(page), 'the synthetic class joins the resolve list while pressed');
+    assert(/\.clickable\(interactionSource = __pressed__active_btn__HSource, indication = null\)/.test(page), 'a clickable with null indication watches the press');
+    assert(/Button\(onClick = \{\}, colors = ButtonDefaults\.buttonColors\(containerColor = Color\.Transparent\), modifier = Modifier\.clickable\(interactionSource = __pressed__active_btn__HSource/.test(page), 'the button carries the press watcher');
+  }
+
+  // R269: SwiftUI consumes `:active`. The pressing callback of a long-press
+  // gesture with an infinite minimum duration is SwiftUI's own pressed-state
+  // signal on any view (ButtonStyle would only reach Buttons); a page-level
+  // @State flag gates the synthetic class in roseResolve's list.
+  {
+    const sRoot = join(scratch, 'activeswift');
+    mkdirSync(join(sRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(sRoot, 'src/pages/h.rose'), `<style>
+  .btn { background: #eee; padding: 8px; }
+  .btn:active { background: #e91e63; color: #fff; }
+</style>
+<button class="btn">press me</button>
+<div class="btn"><p>inside</p></div>
+`);
+    const dir = join(scratch, 'activeswift-out');
+    const r = await exportProject('xcode', sRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:active/.test(w)), 'a SwiftUI :active rule is no longer linted as skipped');
+    const theme = readFileSync(join(dir, 'xcode', 'rosezmApp/Kit/RoseTheme.swift'), 'utf8');
+    const activeRow = /"__active_btn__HView": RoseStyle\(([^)]*)\)/.exec(theme)?.[1] ?? '';
+    assert(activeRow.includes('"#e91e63"') && activeRow.includes('"#ffffff"'), 'the active entry carries the pressed model');
+    const page = readFileSync(join(dir, 'xcode', 'rosezmApp/Pages/HView.swift'), 'utf8');
+    const decl = /@State private var (__pressed_\w+): Bool = false/.exec(page)?.[1];
+    assert(!!decl, 'the page declares the pressed flag as @State');
+    assert(decl === '__pressed__active_btn__HView', 'the declared flag matches the name the resolve reads');
+    assert(page.includes(`__pressed__active_btn__HView ? "__active_btn__HView" : ""`), 'the synthetic class joins the resolve list while pressed');
+    assert(page.includes(`.onLongPressGesture(minimumDuration: .infinity, pressing: { pressing in __pressed__active_btn__HView = pressing }, perform: {})`), 'the pressing gesture flips the flag');
+    const open = (page.match(/\{/g) ?? []).length;
+    const close = (page.match(/\}/g) ?? []).length;
+    assert(open === close, `the SwiftUI active page stays balanced (${open}/${close})`);
+  }
+
+  // R270: ArkTS consumes `:active`. The focus shape applies once more: a
+  // synthetic `__active___a_<class>` row in RoseStyles.ets, a page-level @State
+  // flag, and the onTouch Down/Up/Cancel pair - ArkUI delivers touch events on
+  // every press, mouse or finger, so the flag mirrors the web's :active.
+  {
+    const kRoot = join(scratch, 'activearkts');
+    mkdirSync(join(kRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(kRoot, 'src/pages/h.rose'), `<style>
+  .btn { background: #eee; padding: 8px; }
+  .btn:active { background: #e91e63; color: #fff; }
+</style>
+<button class="btn">press me</button>
+`);
+    const dir = join(scratch, 'activearkts-out');
+    const r = await exportProject('arkts', kRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[]; outDir: string };
+    assert(!(r.warnings ?? []).some((w) => /:active/.test(w)), 'an ArkTS :active rule is no longer linted as skipped');
+    const styles = readFileSync(join(r.outDir, 'entry/src/main/ets/kit/RoseStyles.ets'), 'utf8');
+    assert(/'__active___a_btn': \(it: RoseModifier\) => \{\.backgroundColor\('#e91e63'\)\.fontColor\('#ffffff'\)\}/.test(styles), 'the active row reaches the RoseStyles table');
+    const page = readFileSync(join(r.outDir, 'entry/src/main/ets/pages/HPage.ets'), 'utf8');
+    assert(/@State __a_btn: boolean = false;/.test(page), 'the page declares the pressed flag as @State');
+    assert(page.includes("this.__a_btn ? '__active___a_btn' : ''"), 'the synthetic class gates the attributeModifier');
+    assert(/\.onTouch\(\(event: TouchEvent\) => \{ if \(event\.type === TouchType\.Down\) \{ this\.__a_btn = true; \} else if \(event\.type === TouchType\.Up \|\| event\.type === TouchType\.Cancel\) \{ this\.__a_btn = false; \} \}\)/.test(page), 'the touch pair flips the flag on Down and clears it on Up/Cancel');
+    assert(/Button\("press me"\)[\s\S]*?__active___a_btn[\s\S]*?onTouch/.test(page), 'the button chain carries the modifier and the touch pair');
+  }
+
+  // R258: Compose `:focus` - the hover shape adapted to the focus system: a
+  // synthetic class + a page-level mutableStateOf flag flipped by onFocusChanged,
+  // gated into roseResolve's list. A recolor-only half adopts the base border
+  // width in the second registration pass (single-loop sheets, like Qt/Flutter).
+  {
+    const cRoot = join(scratch, 'focuscompose');
+    mkdirSync(join(cRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(cRoot, 'src/pages/h.rose'), `<script>
+  let name = $state('');
+</script>
+<style>
+  .field { border: 1px solid #ccc; background: #fff; padding: 8px; }
+  .field:focus { border-color: #e91e63; background: #fff7fa; }
+</style>
+<input class="field" bind:value={name} placeholder="your name">
+<div class="field"><p>inside</p></div>
+`);
+    const dir = join(scratch, 'focuscompose-out');
+    const r = await exportProject('android', cRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:focus/.test(w)), 'a Compose :focus rule is no longer linted as skipped');
+    const page = readFileSync(join(dir, 'android', 'app/src/main/java/dev/rosezm/app/pages/HPage.kt'), 'utf8');
+    assert(page.includes('import androidx.compose.ui.focus.onFocusChanged'), 'the page imports the focus modifier');
+    assert(page.includes('var __focused__focus_field__H by remember { mutableStateOf(false) }'), 'the page declares the focus flag as mutable state');
+    assert(/roseResolve\("input", listOf\("field", if \(__focused__focus_field__H\) "__focus_field__H" else ""\)/.test(page), 'the synthetic class gates the input resolve list');
+    assert(/TextField\([^)]*if \(__focused__focus_field__H\)/.test(page) || page.includes('roseResolve("input", listOf("field", if (__focused__focus_field__H)'), 'the input resolve carries the gate');
+    assert(/\.onFocusChanged \{ __focused__focus_field__H = it\.isFocused \}/.test(page), 'an onFocusChanged modifier flips the flag');
+    assert(/roseResolve\("div", listOf\("field", if \(__focused__focus_field__H\) "__focus_field__H" else ""\)/.test(page), 'the container resolve carries the gate too');
+    const styles = readFileSync(join(dir, 'android', 'app/src/main/java/dev/rosezm/app/kit/RoseTheme.kt'), 'utf8').replace(/\n/g, ' ');
+    assert(/"__focus_field__H"[^}]*#fff7fa/i.test(styles) || styles.includes('__focus_field__H'), 'the focus entry exists in the style table');
+  }
+
+  // R259: SwiftUI `:focus` - the hover shape adapted: a synthetic class plus a
+  // @FocusState flag bound by .focused($flag). The declaration and the resolve
+  // read must spell the SAME name (the hover round's pinning lesson applies).
+  {
+    const sRoot = join(scratch, 'focusswift');
+    mkdirSync(join(sRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(sRoot, 'src/pages/h.rose'), `<script>
+  let name = $state('');
+</script>
+<style>
+  .field { border: 1px solid #ccc; background: #fff; padding: 8px; }
+  .field:focus { border-color: #e91e63; background: #fff7fa; }
+</style>
+<input class="field" bind:value={name} placeholder="your name">
+<div class="field"><p>inside</p></div>
+`);
+    const dir = join(scratch, 'focusswift-out');
+    const r = await exportProject('xcode', sRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:focus/.test(w)), 'a SwiftUI :focus rule is no longer linted as skipped');
+    const theme = readFileSync(join(dir, 'xcode', 'rosezmApp/Kit/RoseTheme.swift'), 'utf8');
+    const focusRow = /"__focus_field__HView": RoseStyle\(([^)]*)\)/.exec(theme)?.[1] ?? '';
+    assert(focusRow.includes('"#fff7fa"'), 'the focus entry carries the recolored background');
+    assert(focusRow.includes('borderWidth: 1') && focusRow.includes('"#e91e63"'), 'the recolor-only half adopted the base border width');
+    const page = readFileSync(join(dir, 'xcode', 'rosezmApp/Pages/HView.swift'), 'utf8');
+    const decl = /@FocusState private var (__focused_\w+): Bool/.exec(page)?.[1];
+    assert(!!decl, 'the page declares the focus flag as @FocusState');
+    assert(decl === '__focused__focus_field__HView', 'the declared flag matches the name the resolve reads');
+    assert(page.includes(`__focused__focus_field__HView ? "__focus_field__HView" : ""`), 'the synthetic class joins the resolve list while focused');
+    assert(/TextField\(/.test(page) && page.includes(`.focused($__focused__focus_field__HView)`), 'the field chain binds .focused to the flag');
+    assert(page.includes(`.focused($__focused__focus_field__HView)`), 'the .focused modifier is emitted');
+    const open = (page.match(/\{/g) ?? []).length;
+    const close = (page.match(/\}/g) ?? []).length;
+    assert(open === close, `the SwiftUI focus page stays balanced (${open}/${close})`);
+  }
+
+  // R219: the user-agent baseline. On the web an h2 is 1.5em and bold without
+  // the author saying so; a native target has no browser, so the style engine
+  // carries the type scale itself - and the author's own rule still wins.
+  {
+    const hProj = join(scratch, 'uabaseline');
+    mkdirSync(join(hProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(hProj, 'src/pages/index.rose'), `<style>
+h2 { font-size: 40px; }
+.loud { font-size: 12px; }
+</style>
+<main>
+  <h2>Plain</h2>
+  <h2 class="loud">Loud</h2>
+  <h3>Sub</h3>
+</main>
+`);
+    const hOut = await exportProject('android', hProj, { outRoot: join(scratch, 'uabaselineout') });
+    const hKt = readFileSync(join(hOut.outDir, 'app/src/main/java/dev/rosezm/app/pages/IndexPage.kt'), 'utf8');
+    assert(hKt.includes('Text("Plain", fontSize = 40.sp, fontWeight = FontWeight.Bold)'), 'a tag rule (h2 { font-size: 40px }) reaches Android');
+    assert(hKt.includes('Text("Loud", fontSize = 12.sp'), 'the author\'s own class still wins over the tag rule');
+    assert(hKt.includes('Text("Sub", fontSize = 19.sp, fontWeight = FontWeight.Bold)'), 'an h3 with no rule carries the browser type scale on Android');
+    const hXc = await exportProject('xcode', hProj, { outRoot: join(scratch, 'uabaselineoutx') });
+    const hSwift = readFileSync(join(hXc.outDir, 'rosezmApp/Pages/IndexView.swift'), 'utf8');
+    assert(hSwift.includes('Text("Plain").font(.system(size: 40)).fontWeight(.bold)'), 'a tag rule reaches SwiftUI');
+    assert(hSwift.includes('Text("Sub").font(.system(size: 19)).fontWeight(.bold)'), 'an h3 with no rule carries the browser type scale on SwiftUI');
+    const hEt = await exportProject('arkts', hProj, { outRoot: join(scratch, 'uabaselineoute') });
+    const hArk = readFileSync(join(hEt.outDir, 'entry/src/main/ets/pages/IndexPage.ets'), 'utf8');
+    assert(hArk.includes('Text("Plain").fontSize(40).fontWeight(FontWeight.Bold)'), 'a tag rule reaches ArkTS');
+    assert(hArk.includes('Text("Sub").fontSize(19).fontWeight(FontWeight.Bold)'), 'an h3 with no rule carries the browser type scale on ArkTS');
+    const hDot = await exportProject('dotnet', hProj, { outRoot: join(scratch, 'uabaselineoutn') });
+    const hCs = readFileSync(join(hDot.outDir, 'Pages/IndexPage.cs'), 'utf8');
+    assert(hCs.includes('FontSize = 40'), 'a tag rule (h2 { font-size: 40px }) reaches WPF');
+    assert(hCs.includes('FontSize = 19') && hCs.includes('FontWeight = 700'), 'an h3 with no rule carries the browser type scale on WPF');
+    const hJa = await exportProject('java', hProj, { outRoot: join(scratch, 'uabaselineoutj') });
+    const hJava = readFileSync(join(hJa.outDir, 'src/main/java/dev/rosezm/app/pages/IndexPage.java'), 'utf8');
+    assert(hJava.includes('new RoseTheme.Style(40,') && hJava.includes('Plain'), 'a tag rule (h2 { font-size: 40px }) reaches Swing');
+    const hFl = await exportProject('flutter', hProj, { outRoot: join(scratch, 'uabaselineoutf') });
+    const hDart = readFileSync(join(hFl.outDir, 'lib/pages/index.dart'), 'utf8');
+    assert(hDart.includes('fontSize: 24'), 'a plain h2 carries the browser type scale on Flutter');
+  }
+
+  // R231: the cross-target consistency gate. One styled page, every target in the
+  // registry, and the same question for each: did the author's own numbers
+  // survive? This is the promise "one source tree, every platform" made testable.
+  // It was a throwaway probe until now (run once, deleted), which meant every
+  // new property could silently fall behind on one target and nothing would say so.
+  {
+    const cProj = join(scratch, 'consistencyproj');
+    mkdirSync(join(cProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(cProj, 'src/pages/index.rose'), `<style>
+  .card { background: #123456; padding: 16px 24px; border-radius: 8px; margin: 12px 0; border: 2px solid #000000; }
+  .title { color: #ffffff; font-size: 24px; font-weight: 700; letter-spacing: 1px; }
+  .row { display: flex; flex-direction: row; gap: 12px; align-items: center; justify-content: space-between; }
+  .muted { opacity: 0.5; }
+  .wide { width: 320px; height: 48px; }
+</style>
+<div class="card"><span class="title">Hi</span></div>
+<div class="row"><span class="muted">a</span><span class="wide">b</span></div>
+`);
+    // Each probe: the CSS property, and the shapes it takes across toolkits.
+    const probes: Array<[string, RegExp]> = [
+      ['background', /#123456|0xFF123456|123456/i],
+      ['padding', /16|24/],
+      ['border', /#000000|0xFF000000|000000|LineBorder|strokeBorder/],
+      ['color', /#ffffff|0xFFFFFFFF|FFFFFF|white/i],
+      ['font-size', /24/],
+      ['font-weight', /700|Bold|bold|Font\.BOLD/],
+      ['flex-direction', /row|Row|HBox|horizontal|Horizontal/],
+      ['gap', /12/],
+      ['opacity', /0\.5|0\.5f|alpha|setAlpha/],
+      ['width', /320/],
+      ['height', /48/],
+    ];
+    // A target that genuinely cannot paint a property must SAY so. Silence is
+    // the failure: the author believes the rule applied.
+    // R257: Java paints a radius now (roundedBorder in the kit), so it is no
+    // longer on the cannot list; the Qt widgets stay rectangular and must name it.
+    const cannot: Record<string, string[]> = {};
+    for (const target of ['weapp', 'qq', 'alipay', 'baidu', 'toutiao', 'flutter', 'android', 'arkts', 'xcode', 'electron', 'python', 'dotnet', 'java', 'cpp'] as const) {
+      const c = await exportProject(target, cProj, { apiBase: 'x', outRoot: join(scratch, `consist-${target}`) });
+      const body = walk(c.outDir).map((f) => { try { return readFileSync(f, 'utf8'); } catch { return ''; } }).join('\n');
+      const missing = probes.filter(([, re]) => !re.test(body)).map(([name]) => name);
+      assert(missing.length === 0, `${target}: every authored style value survives the export (missing: ${missing.join(', ') || 'none'})`);
+      const notes = (c.warnings ?? []).join('\n');
+      for (const prop of cannot[target] ?? []) {
+        assert(new RegExp(prop.replace(/[-]/g, '.')).test(notes), `${target}: ${prop} cannot be painted, so it is named rather than dropped in silence`);
+      }
+    }
+  }
+
+  // R232: the behavioural twin of the gate above. Styles are "it looks right";
+  // behaviour is "it runs right" - a click changes state, the state drives a
+  // conditional class, the same state renders in text, and a list the state grows
+  // re-renders its loop. Each toolkit spells these differently, so the probes are
+  // per-target idioms rather than one shared regex.
+  {
+    const bProj = join(scratch, 'behaviourproj');
+    mkdirSync(join(bProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(bProj, 'src/pages/index.rose'), `<script>
+  let on = $state(false);
+  let n = $state(0);
+  let list = $state([]);
+  function toggle() { $setState('on', !on()); }
+  function bump() { $setState('n', n() + 1); }
+  function add() { $setState('list', [...list(), 'x']); }
+</script>
+<style>
+  .box { padding: 8px; }
+  .live { background: #00ff00; }
+</style>
+<div class="box {on() ? 'live' : ''}"><span>state {n()}</span></div>
+<button on:click={toggle}>t</button>
+<button on:click={bump}>b</button>
+<button on:click={add}>a</button>
+{#each list() as it}<span>{it}</span>{/each}
+`);
+    // [the click wiring, the state write, the loop over the state list]
+    const idioms: Record<string, RegExp[]> = {
+      // Each entry is [the click, the state write, the loop]. The loop probe must
+      // name BOTH the loop variable and the state list: a loose /for .* in /
+      // matched a sabotaged `for BROKEN in []` and the gate stayed green.
+      weapp: [/bindtap="[^"]*"/, /setData|__set/, /wx:for="\{\{list\}\}"/],
+      qq: [/bindtap="[^"]*"/, /setData|__set/, /qq:for="\{\{list\}\}"/],
+      // R257: Alipay's AXML events are on*, not bind* (bindtap is an unknown
+      // attribute there - every click was dead).
+      alipay: [/onTap="[^"]*"/, /setData|__set/, /a:for="\{\{list\}\}"/],
+            // R257: Baidu's directives are s-if / s-for (hyphenated) - s:for is not
+      // SWAN syntax and every conditional/list block was dead there.
+      baidu: [/bindtap="[^"]*"/, /setData|__set/, /s-for="\{\{list\}\}"/],
+      toutiao: [/bindtap="[^"]*"/, /setData|__set/, /tt:for="\{\{list\}\}"/],
+      flutter: [/onPressed/, /__set\("n", n \+ 1\)/, /\(list as List\)\.map\(\(dynamic it\)/],
+      android: [/onClick/, /\bn = n \+ 1\b/, /for \(.*in .*list|\.map\b/],
+      arkts: [/\.onClick\(/, /this\.n = /, /ForEach\(.*list/],
+      xcode: [/Button\(action:/, /n = n \+ 1/, /ForEach\(.*list/],
+      // Electron ships the real web client: the handler is wired into the DOM and
+      // the state write is compiled into the bundle, so the observable contract
+      // is the data attribute the client binds to, not an __set call.
+      // The client bundle is minified, so the loop is identified by the state key
+      // and the each marker the runtime walks, not by a source-level spelling.
+      electron: [/data-rosezm-c="index"/, /bump/, /list/],
+      python: [/rose_button\(parent, "t", toggle/, /st\['n'\] = st\.get\('n'\) \+ 1/, /for it in \(__items or \[\]\)/],
+      dotnet: [/RoseTheme\.Button\(pageRoot, "t", \(_, _\) => \{ toggle\(app\)/, /app\.Set\("n"|n = n \+ 1/, /foreach \(var it in .*[Ll]ist/],
+      java: [/addActionListener/, /set\("n"|put\("n"/, /for \(Object it.*: .*list\(/],
+      cpp: [/QPushButton|connect\(/, /set\("n"/, /for \(.*it.*: rose_list\(app\.v\("list"\)\)\)/],
+    };
+    for (const [target, patterns] of Object.entries(idioms)) {
+      const b = await exportProject(target as never, bProj, { apiBase: 'x', outRoot: join(scratch, `behav-${target}`) });
+      const body = walk(b.outDir).map((f) => { try { return readFileSync(f, 'utf8'); } catch { return ''; } }).join('\n');
+      const what = ['the click', 'the state write', 'the loop over the state list'];
+      patterns.forEach((re, i) => {
+        assert(re.test(body), `${target}: ${what[i]} survives the export (${re})`);
+      });
+      // The three handlers the page declares must all exist, or one interaction
+      // is silently missing while the others look fine.
+      for (const fn of ['toggle', 'bump', 'add']) {
+        assert(body.includes(fn), `${target}: the ${fn} handler is emitted`);
+      }
+    }
+  }
+
+  // R234: navigation and {#await} - the two behaviours most likely to fork across
+  // platforms (a mini-program calls navigateTo, the web pushes history, a desktop
+  // app swaps a panel). Navigation is asserted per platform API; {#await} by its
+  // three branches actually being reachable, not by a keyword appearing.
+  {
+    const nProj = join(scratch, 'navproj');
+    mkdirSync(join(nProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(nProj, 'src/pages/index.rose'), `<script>
+  function go() { goto('/about'); }
+  function load() { return Promise.resolve('v'); }
+</script>
+<a href="/about">link</a>
+<button on:click={go}>go</button>
+{#await load()}
+  <span>loading</span>
+{:then v}
+  <span>got {v}</span>
+{:catch e}
+  <span>failed</span>
+{/await}
+`);
+    const nav: Record<string, RegExp> = {
+      weapp: /wx\.navigateTo|navigator url=/,
+      qq: /qq\.navigateTo|navigator url=/,
+      alipay: /my\.navigateTo|navigator url=/,
+      baidu: /swan\.navigateTo|navigator url=/,
+      toutiao: /tt\.navigateTo|navigator url=/,
+      flutter: /Navigator\.pushNamed\(context/,
+      android: /onNavigate\("\/about"\)|goto\("\/about"\)/,
+      arkts: /router\.pushUrl\(/,
+      xcode: /onNavigate\("\/about"\)/,
+      electron: /rosezmNavigate|__rose/,
+      python: /rose_link\(parent, "link", lambda t="\/about": app\.navigate\(t\)/,
+      dotnet: /Navigate\(|roseNavigate/,
+      java: /\.navigate\(|roseNavigate/,
+      cpp: /\.navigate\(|roseNavigate/,
+    };
+    for (const [target, re] of Object.entries(nav)) {
+      const n = await exportProject(target as never, nProj, { apiBase: 'x', outRoot: join(scratch, `nav-${target}`) });
+      const body = walk(n.outDir).map((f) => { try { return readFileSync(f, 'utf8'); } catch { return ''; } }).join('\n');
+      assert(re.test(body), `${target}: navigation to another page is wired the way that platform navigates (${re})`);
+      // {#await}: a target that cannot await a non-literal promise must say so.
+      // The three branches are asserted by the state the await flips, so a target
+      // that named them but never renders them still fails. WPF is the exception
+      // it declares: it resolves the head while the page builds, so its pending
+      // branch can never render and it says that instead of emitting dead code.
+      // Three desktop targets resolve the head while the page builds, so their
+      // pending branch could never render: they say so instead of emitting it.
+      const pendingless = new Set(['dotnet', 'java', 'cpp']);
+      assert(/__await0|await0|await/.test(body), `${target}: the {#await} block has a state it flips`);
+      assert(/got|then|__await0Value/.test(body) && /failed|__await0Err/.test(body), `${target}: both settled await branches are reachable`);
+      if (pendingless.has(target)) {
+        assert(/pending branch is dropped/.test((n.warnings ?? []).join('\n')), `${target}: the unreachable pending branch is named, not emitted as dead code`);
+      } else {
+        assert(/loading/.test(body), `${target}: the pending branch renders while the promise is unsettled`);
+      }
+      // R234: a Promise constructor is JavaScript. It was normalized for {#await}
+      // heads but not inside a handler, and leaked verbatim into Dart/Kotlin/C++.
+      // Scoped to the page's own files: the kit legimately uses Promise on the
+      // platforms that have one.
+      const pageBody = walk(n.outDir)
+        .filter((f) => /pages?[/\\][^/\\]*\.(js|dart|kt|ets|swift|py|cs|java|cpp)$/i.test(f))
+        .map((f) => { try { return readFileSync(f, 'utf8'); } catch { return ''; } }).join('\n');
+      assert(!/Promise\s*\.\s*(resolve|reject)/.test(pageBody), `${target}: no JS Promise constructor leaks into the page source`);
+    }
+    // R238: the electron shell must work even when the build did not prerender.
+    // `rosezm build` writes dist/index.html; a build that only produces the SSR
+    // bundle leaves it out, and the shell used to answer "index.html is missing"
+    // in the window - an export that cannot start. It now renders through the
+    // server.js it already ships.
+    const e = await exportProject('electron', nProj, { apiBase: 'x', outRoot: join(scratch, 'electron-fallback') });
+    const main = readFileSync(join(e.outDir, 'main.cjs'), 'utf8');
+    assert(/function sendIndex\(req, res\) \{\s*fs\.readFile\([\s\S]*?renderViaSsr\(req, res\);\s*\}\);/.test(main), 'electron: sendIndex falls back to the SSR render when index.html is absent');
+    assert(main.includes("require('node:url')") && /let renderPage = null/.test(main), 'electron: the SSR module is loaded lazily, not imported at startup');
+    assert(/out && out\.html/.test(main) && /out\.status/.test(main), 'electron: the fallback reads the render result (html + status), not a bare string');
+    assert(!/res\.end\('dist\/index\.html is missing - run rosezm build and re-export'\)/.test(main), 'electron: the dead-end error page is gone');
+  }
+
+  // R242: a STRUCTURAL pseudo-class names WHICH elements a rule covers. A native
+  // tree cannot test `:first-child`, and stripping it made the rule apply to every
+  // match - `.item:first-child { font-weight: 700 }` bolded every `.item`. That is
+  // worse than a drop: the page is styled wrong. The rule is now skipped and named.
+  {
+    const p = parseStylesheet('.item:first-child { font-weight: 700; }\n.x:nth-child(2n) { color: red; }\n.b:hover { color: blue; }\ninput::placeholder { color: #999; }');
+    assert(p.rules.length === 1 && p.rules[0].hover !== undefined, 'a :hover rule survives while the structural ones are skipped');
+    assert(/\.item:first-child" uses :first-child.*skipped/.test(p.warnings.join('\n')), ':first-child is named, and skipped rather than applied to every match');
+    assert(/:nth-child/.test(p.warnings.join('\n')), ':nth-child is named too');
+    assert(/:first-child|:nth-child/.test(p.warnings.join('\n')) && !/\.item:first-child.*bold/.test(p.warnings.join('\n')), 'the warning explains it would otherwise style every match');
+  }
+  // R242: ArkTS was the only target that neither applied :hover nor said so.
+  {
+    const hProj = join(scratch, 'hoverproj');
+    mkdirSync(join(hProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(hProj, 'src/pages/index.rose'), '<style>.btn:hover { background: #123456; }</style>\n<button class="btn">b</button>');
+    const h = await exportProject('arkts', hProj, { apiBase: 'x', outRoot: join(scratch, 'hover-ark') });
+    const hPage = readFileSync(join(h.outDir, 'entry/src/main/ets/pages/IndexPage.ets'), 'utf8');
+    const hStyles = readFileSync(join(h.outDir, 'entry/src/main/ets/kit/RoseStyles.ets'), 'utf8');
+    // R243: ArkTS no longer just names the hover it cannot do - it does it, with a
+    // pointer flag, .onHover(), and the hover model in the runtime style table.
+    assert(/\.onHover\(\(isHover: boolean\) => \{ this\.__h_/.test(hPage), 'arkts: a hover rule flips a @State flag from onHover');
+    // R260 FIX: the flag is class-only now (the rule's tag disagreed with the
+    // element's real tag for non-div elements, so the table key and the lookup
+    // disagreed); the assertions spell the fixed name.
+    assert(/@State __h_btn: boolean = false;/.test(hPage), 'arkts: the hover flag is a @State field, so setting it re-renders');
+    assert(/attributeModifier\(roseModifier\('button', \[this\.__h_btn \? '__hover_/.test(hPage), 'arkts: the hover class is asked for only while the flag is set');
+    assert(/__hover_/.test(hStyles) && /#123456/.test(hStyles), 'arkts: the hover model reaches the runtime style table');
+    assert(!(h.warnings ?? []).some((w) => /:hover on .* is dropped/.test(w)), 'arkts: hover is applied now, so it is no longer reported as dropped');
+  }
+
+  // R260: ArkTS `:focus` - the R243 hover shape adapted to ArkUI's focus pair:
+  // a synthetic class keyed `__focus_<flag>` plus .onFocus/.onBlur writing the
+  // same derived @State flag the attributeModifier reads. A recolor-only half
+  // borrows the base row's border width.
+  {
+    const fRoot = join(scratch, 'focusark');
+    mkdirSync(join(fRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(fRoot, 'src/pages/h.rose'), `<script>
+  let name = $state('');
+</script>
+<style>
+  .field { border: 1px solid #ccc; background: #fff; padding: 8px; }
+  .field:focus { border-color: #e91e63; background: #fff7fa; }
+</style>
+<input class="field" bind:value={name} placeholder="your name">
+<div class="field"><p>inside</p></div>
+`);
+    const dir = join(scratch, 'focusark-out');
+    const r = await exportProject('arkts', fRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /:focus/.test(w)), 'arkts: a :focus rule is no longer linted as skipped');
+    const page = readFileSync(join(dir, 'arkts', 'entry/src/main/ets/pages/HPage.ets'), 'utf8');
+    assert(/@State __f_field: boolean = false;/.test(page), 'arkts: the focus flag is a @State field derived from the element');
+    assert((page.match(/@State __f_field: boolean = false;/g) ?? []).length === 1, 'arkts: two elements sharing a class share one @State flag (deduped)');
+    assert(/\.onFocus\(\(\) => \{ this\.__f_field = true; \}\)\.onBlur\(\(\) => \{ this\.__f_field = false; \}\)/.test(page), 'arkts: onFocus/onBlur write the flag');
+    assert(/attributeModifier\(roseModifier\('input', \[this\.__f_field \? '__focus___f_field' : ''\]/.test(page), 'arkts: the focus class is asked for only while the flag is set');
+    assert(/attributeModifier\(roseModifier\('div', \[this\.__f_field \? '__focus___f_field' : ''\]/.test(page), 'arkts: the container carries the same gate');
+    const styles = readFileSync(join(dir, 'arkts', 'entry/src/main/ets/kit/RoseStyles.ets'), 'utf8');
+    assert(/'__focus___f_field'/.test(styles) && /#fff7fa/.test(styles), 'arkts: the focus model reaches the runtime style table');
+    const focusRow = (styles.split('\n').find((l: string) => l.includes("'__focus___f_field'")) ?? '');
+    assert(focusRow.includes('#fff7fa') && focusRow.includes('#e91e63') && focusRow.includes('top: 1'), 'arkts: the recolor-only half adopted the base border width');
+  }
+
+  // R261: the mini programs are the one family where `:focus` needed NO new
+  // mechanism - WXSS/QSS/ACSS pass the pseudo-class through to the platform's
+  // own stylesheet engine, which styles the focused input natively. The audit
+  // found all five targets already carried it; the assertions pin the contract
+  // so a future style rewrite cannot silently drop it.
+  {
+    const mRoot = join(scratch, 'focusmp');
+    mkdirSync(join(mRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(mRoot, 'src/pages/h.rose'), `<style>
+  .field { border: 1px solid #ccc; background: #fff; }
+  .field:focus { border-color: #e91e63; background: #fff7fa; }
+</style>
+<input class="field" placeholder="your name">
+`);
+    // Each dialect names its stylesheet differently: wxss (WeChat/QQ share the
+    // format but QQ renames it qss), acss (Alipay), css (Baidu), ttss (Toutiao).
+    const styleExt: Record<string, string[]> = {
+      weapp: ['.wxss'], qq: ['.qss'], alipay: ['.acss'], baidu: ['.css'], toutiao: ['.ttss'],
+    };
+    for (const [target, exts] of Object.entries(styleExt)) {
+      const dir = join(scratch, `focusmp-out-${target}`);
+      const r = await exportProject(target as 'weapp', mRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+      assert(!(r.warnings ?? []).some((w) => /:focus/.test(w)), `${target}: a :focus rule is not linted as skipped`);
+      const walk = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(join(d, e.name)) : [join(d, e.name)]);
+      const styleFiles = walk(dir).filter((f) => exts.some((e) => f.endsWith(e)));
+      assert(styleFiles.length > 0, `${target}: the export carries a stylesheet (${exts.join('/')})`);
+      const carried = styleFiles.some((f) => readFileSync(f, 'utf8').includes(':focus'));
+      assert(carried, `${target}: the :focus rule passes through to the platform stylesheet`);
+    }
+  }
+
+  // R271: the mini programs consume `:active` through the SAME channel hover
+  // uses - the view layer never styles the pseudo-class, and the platform's one
+  // press signal IS hover-class (a finger down is both hover and active on
+  // touch). The rule rewrites onto a synthetic `__a<selector>` class and the
+  // emitter lists it in the element's hover-class attribute; the dead
+  // passthrough rule becomes a live one.
+  {
+    const aRoot = join(scratch, 'activemp');
+    mkdirSync(join(aRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(aRoot, 'src/pages/h.rose'), `<style>
+  .btn { background: #eee; }
+  .btn:active { background: #e91e63; color: #fff; }
+</style>
+<button class="btn">press me</button>
+`);
+    const styleExt: Record<string, string[]> = {
+      weapp: ['.wxss'], qq: ['.qss'], alipay: ['.acss'], baidu: ['.css'], toutiao: ['.ttss'],
+    };
+    const tplExt: Record<string, string[]> = {
+      weapp: ['.wxml'], qq: ['.qml'], alipay: ['.axml'], baidu: ['.swan'], toutiao: ['.ttml'],
+    };
+    for (const [target, exts] of Object.entries(styleExt)) {
+      const dir = join(scratch, `activemp-out-${target}`);
+      const r = await exportProject(target as 'weapp', aRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+      assert(!(r.warnings ?? []).some((w) => /:active/.test(w)), `${target}: an :active rule is not linted as skipped`);
+      const walk = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(join(d, e.name)) : [join(d, e.name)]);
+      const styleFiles = walk(dir).filter((f) => exts.some((e) => f.endsWith(e)));
+      const carried = styleFiles.some((f) => /\.btn\.__a\._?btn|\.btn\.__a_btn/.test(readFileSync(f, 'utf8')));
+      assert(carried, `${target}: the :active rule rewrote onto the synthetic press class`);
+      assert(!styleFiles.some((f) => /:active\b/.test(readFileSync(f, 'utf8'))), `${target}: the dead :active passthrough is gone`);
+      const tplFiles = walk(dir).filter((f) => (tplExt[target] ?? []).some((e) => f.endsWith(e)));
+      const attr = tplFiles.some((f) => /hover-class="[^"]*__a_btn/.test(readFileSync(f, 'utf8')));
+      assert(attr, `${target}: the element's hover-class carries the active class`);
+    }
+  }
+
+  // R283: the mini targets lower the three modern JS shapes before emitting -
+  // the baselib's ES level varies, and a template literal / optional chain /
+  // `??` reaching page JS verbatim dies on older baselib versions with a bare
+  // SyntaxError. WeChat's template shows the full lowering: string concat for
+  // the interpolation, a null guard for the chain, and a != null ternary for
+  // the default.
+  {
+    const mRoot = join(scratch, 'modernjs-mini');
+    mkdirSync(join(mRoot, 'src/pages'), { recursive: true });
+    const bt = '`';
+    writeFileSync(join(mRoot, 'src/pages/h.rose'), `<script>
+  let name = $state('Ada');
+  let user = $state({});
+</script>
+<p>{${bt}Hi \${name}!${bt}}</p>
+<p>{user()?.nick ?? 'anon'}</p>
+`);
+    const dir = join(scratch, 'modernjs-mini-out');
+    const r = await exportProject('weapp', mRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+    assert(!(r.warnings ?? []).some((w) => /template|optional/i.test(w)), 'no warning is raised for the modern shapes');
+    const wxml = walk(dir).find((f) => f.endsWith('.wxml'));
+    assert(!!wxml, 'the export carries the weapp template');
+    const tpl = wxml ? readFileSync(wxml, 'utf8') : '';
+    assert(tpl.includes(`{{("Hi " + (name) + "!")}}`), 'the template literal lowered to string concatenation');
+    assert(tpl.includes('(user == null ? undefined : (user.nick != null ? user.nick'), 'the optional chain + ?? lowered to guarded ternaries');
+    assert(!tpl.includes('?.') && !tpl.includes('??'), 'no raw modern operator survives in the WXML');
+  }
+
+  // R284: ArkTS is the last target whose modern shapes were untranslated - the
+  // probe showed a mangled nested template (`${`...`}`) and a malformed
+  // optional-chain ternary reaching the .ets. ArkTS is a TS dialect, so
+  // templates and `?.` are native; `??` is NOT (the platform has no such
+  // operator) and stays the ternary the nullish round established.
+  {
+    const aRoot = join(scratch, 'modernjs-arkts');
+    mkdirSync(join(aRoot, 'src/pages'), { recursive: true });
+    const bt = '`';
+    writeFileSync(join(aRoot, 'src/pages/h.rose'), `<script>
+  let name = $state('Ada');
+  let user = $state({});
+</script>
+<p>{${bt}Hi \${name}!${bt}}</p>
+<p>{user()?.nick ?? 'anon'}</p>
+`);
+    const dir = join(scratch, 'modernjs-arkts-out');
+    await exportProject('arkts', aRoot, { apiBase: 'http://x', outRoot: dir });
+    const ets = walk(dir).find((f) => f.endsWith('.ets') && f.includes('pages'));
+    assert(!!ets, 'the export carries the ArkTS page');
+    const src = ets ? readFileSync(ets, 'utf8') : '';
+    assert(src.includes('Text(`Hi ${this.name}!`)'), 'the template splices into the ArkTS text natively');
+    assert(!src.includes('${\\`'), 'no nested/escaped template pair survives');
+    assert(src.includes(`(this.user)?.['nick']`), 'the optional chain is native ArkTS bracket access');
+    assert(src.includes('!== null ?') && !src.includes('??'), '?? stays the platform ternary, never a raw ??');
+    const kit = walk(dir).find((f) => f.endsWith('RoseKit.ets'));
+    assert(!!kit && readFileSync(kit, 'utf8').includes('export function roseIndex('), 'the ArkTS kit ships roseIndex');
+  }
+
+  // R285: `setList(list().map(...))` - the AUTO-SETTER a $state field gets -
+  // was the one write with no path: the raw JS arrow reached the target's
+  // refusal and the WHOLE handler was stubbed ("a handler uses .map("), even
+  // though the equivalent `$setState('list', ...)` translated fine. Kotlin,
+  // Java and Python now translate it; Python additionally had to stop turning
+  // a literal `!` into `not ` and stop wrapping a comprehension's `for` clause.
+  {
+    const mRoot = join(scratch, 'autosetter');
+    mkdirSync(join(mRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(mRoot, 'src/pages/h.rose'), `<script>
+  let todos = $state(['a', 'b']);
+  function bang() { setTodos(todos().map((t) => t + '!')); }
+  function drop() { setTodos(todos().filter((t) => t !== 'a')); }
+  function idx() { setTodos(todos().map((t, j) => t + j)); }
+</script>
+<button on:click={bang}>b</button>
+<button on:click={drop}>d</button>
+<button on:click={idx}>i</button>
+`);
+    const spots: Array<[string, string, string[]]> = [
+      ['android', 'app/src/main/java/dev/rosezm/app/pages/HPage.kt', ['todos = todos.map {', 'todos = roseFilter(todos) {']],
+      ['java', 'src/main/java/dev/rosezm/app/pages/HPage.java', ['app.set("todos", RoseTheme.mapList(', 'app.set("todos", RoseTheme.filterList(']],
+      // R256: the comprehension BODY is coerced now (`str(t) + "!"`), the clause
+      // is not - Python raises on `1 + "!"`, and the web build coerces too.
+      ['python', 'pages/h.py', ["[str(t) + \"!\" for t in st.get('todos')]", "[t for t in st.get('todos') if t != \"a\"]", '[t + j for j, t in enumerate(']],
+    ];
+    for (const [target, rel, needles] of spots) {
+      const dir = join(scratch, `autosetter-out-${target}`);
+      const r = await exportProject(target as 'android', mRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+      assert(!(r.warnings ?? []).some((w) => /handler uses/.test(w)), `${target}: the auto-setter write is no longer stubbed`);
+      const src = readFileSync(join(dir, target === 'python' ? 'python' : target, rel), 'utf8');
+      for (const n of needles) assert(src.includes(n), `${target}: the handler spells ${n}`);
+      assert(!src.includes('handler body not translated'), `${target}: no handler is stubbed`);
+    }
+    // Python's `!` must survive inside a string literal, and the whole page
+    // must still parse.
+    const pyDir = join(scratch, 'autosetter-out-python', 'python');
+    const { execFileSync } = await import('node:child_process');
+    let parsed = true;
+    try {
+      execFileSync('python', ['-c', `import ast,sys; ast.parse(open(sys.argv[1], encoding='utf-8').read())`, join(pyDir, 'pages', 'h.py')], { stdio: 'pipe' });
+    } catch { parsed = false; }
+    assert(parsed, 'python: the emitted page parses (no comprehension/no-clause damage)');
+  }
+
+  // R286: the spread-write pass recognized only `$setState('k', [...])` - the
+  // auto-setter form (`setItems([...items(), 'new'])`) is what real handlers
+  // write, and it reached the refusal: android and cpp stubbed BOTH the plain
+  // "add to list" handler shapes. The pass now takes the setter-to-key
+  // mapping, and all five compiled targets spell append/prepend natively.
+  {
+    const sRoot = join(scratch, 'spreadauto');
+    mkdirSync(join(sRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(sRoot, 'src/pages/h.rose'), `<script>
+  let items = $state(['a']);
+  function add() { setItems([...items(), 'new']); }
+  function pre() { setItems(['top', ...items()]); }
+</script>
+<button on:click={add}>a</button>
+<button on:click={pre}>p</button>
+`);
+    const needles: Array<[string, string, string[]]> = [
+      ['android', 'app/src/main/java/dev/rosezm/app/pages/HPage.kt', ['items = (items as List<Any?>) + listOf("new");', 'items = listOf("top") + (items as List<Any?>);']],
+      ['cpp', 'src/pages/HPage.cpp', ['rose_append(app.v("items"), "new")', 'rose_prepend(app.v("items"), "top")']],
+      ['java', 'src/main/java/dev/rosezm/app/pages/HPage.java', ['RoseTheme.append(', 'RoseTheme.prepend(']],
+      ['dotnet', 'Pages/HPage.cs', ['RoseTheme.Append(app.V("items"), "new")', 'RoseTheme.Prepend(app.V("items"), "top")']],
+      ['arkts', 'entry/src/main/ets/pages/HPage.ets', ['(this.items).concat([ "new" ])', '[ "top" ].concat(this.items)']],
+    ];
+    for (const [target, rel, finds] of needles) {
+      const dir = join(scratch, `spreadauto-out-${target}`);
+      const r = await exportProject(target as 'android', sRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+      assert(!(r.warnings ?? []).some((w) => /handler uses/.test(w)), `${target}: the spread append is not stubbed`);
+      const src = readFileSync(join(dir, target === 'arkts' ? 'arkts' : target, rel), 'utf8');
+      for (const n of finds) assert(src.includes(n), `${target}: the handler spells ${n}`);
+      assert(!src.includes('handler body not translated'), `${target}: no handler is stubbed`);
+    }
+  }
+
+  // R287: `xs.find((p) => pred)` / `xs.some((p) => pred)` - the two predicate
+  // reads a search handler writes. They had no path at all: the raw JS arrow
+  // reached each target's refusal and the WHOLE handler was stubbed, even
+  // though map/filter/reduce translate fine. The IR now spells them per
+  // dialect, and C++ / C# take a callable (a C# lambda would trip the target's
+  // own "web-only arrow" refusal, so it is a delegate there).
+  {
+    const fRoot = join(scratch, 'findsome');
+    mkdirSync(join(fRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(fRoot, 'src/pages/h.rose'), `<script>
+  let items = $state(['a', 'b']);
+  let found = $state('');
+  function f() { setFound(items().find((x) => x === 'a')); }
+</script>
+<button on:click={f}>go</button>
+`);
+    const spells: Array<[string, string, string]> = [
+      ['android', 'app/src/main/java/dev/rosezm/app/pages/HPage.kt', 'roseFind(items, { x -> x == "a" })'],
+      ['java', 'src/main/java/dev/rosezm/app/pages/HPage.java', 'RoseTheme.find(app.v("items"), x -> x == "a")'],
+      ['cpp', 'src/pages/HPage.cpp', 'rose_find(app.v("items"), [&](const RoseValue& x) { return x == "a"; })'],
+      ['dotnet', 'Pages/HPage.cs', 'RoseTheme.FindObj(app.V("items"), delegate(object x) { return x == "a"; })'],
+      ['python', 'pages/h.py', 'next((x for x in st.get(\'items\') if x == "a"), None)'],
+      ['arkts', 'entry/src/main/ets/pages/HPage.ets', 'this.items.find((x) => x === "a")'],
+    ];
+    for (const [target, rel, needle] of spells) {
+      const dir = join(scratch, `findsome-out-${target}`);
+      const r = await exportProject(target as 'android', fRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+      assert(!(r.warnings ?? []).some((w) => /handler uses/.test(w)), `${target}: the find() handler is not stubbed`);
+      const src = readFileSync(join(dir, target, rel), 'utf8');
+      assert(src.includes(needle), `${target}: spells ${needle}`);
+      assert(!src.includes('handler body not translated'), `${target}: no handler is stubbed`);
+    }
+    // The kit helpers the C-family spellings call must exist.
+    const javaKit = readFileSync(join(scratch, 'findsome-out-java', 'java', 'src/main/java/dev/rosezm/app/RoseTheme.java'), 'utf8');
+    assert(/public static Object find\(/.test(javaKit) && /public static boolean any\(/.test(javaKit), 'java: the kit ships find/any');
+    const cppKit = readFileSync(join(scratch, 'findsome-out-cpp', 'cpp', 'src/rose.h'), 'utf8');
+    assert(cppKit.includes('RoseValue rose_find(') && cppKit.includes('bool rose_any('), 'cpp: the kit declares rose_find/rose_any');
+    const arkKit = readFileSync(join(scratch, 'findsome-out-arkts', 'arkts', 'entry/src/main/ets/kit/RoseKit.ets'), 'utf8');
+    assert(arkKit.includes('export function roseFind(') && arkKit.includes('export function roseAny('), 'arkts: the kit ships roseFind/roseAny');
+  }
+
+  // R288: the direct array mutations - `items().push(x); setItems(items())`
+  // (and unshift/splice) - had no path on java/cpp (an "array mutation" or
+  // "web-only" refusal stubbed the whole handler). They now lower to the
+  // spread/concat/slice writes every compiled target can spell, and `slice`
+  // itself joined the IR (it survived into targets verbatim before).
+  {
+    const mRoot = join(scratch, 'mutations');
+    mkdirSync(join(mRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(mRoot, 'src/pages/h.rose'), `<script>
+  let items = $state(['a', 'b']);
+  function add() { items().push('x'); setItems(items()); }
+  function top() { items().unshift('x'); setItems(items()); }
+  function cut() { items().splice(0, 1); setItems(items()); }
+</script>
+<button on:click={add}>a</button>
+<button on:click={top}>t</button>
+<button on:click={cut}>c</button>
+`);
+    const spells: Array<[string, string, string[]]> = [
+      ['java', 'src/main/java/dev/rosezm/app/pages/HPage.java', ['RoseTheme.append(RoseTheme.list(app.v("items")), "x")', 'RoseTheme.concat(RoseTheme.slice(app.v("items"), 0, 0)', 'RoseTheme.slice(app.v("items"), (0) + (1))']],
+      ['cpp', 'src/pages/HPage.cpp', ['rose_append(app.v("items"), "x")', 'rose_concat(rose_slice(app.v("items"), 0, 0)', 'rose_slice(app.v("items"), (0) + (1))']],
+      ['android', 'app/src/main/java/dev/rosezm/app/pages/HPage.kt', ['+ listOf("x")', 'roseSlice(']],
+      ['python', 'pages/h.py', ["[*st.get('items')", "st.get('items')["]],
+    ];
+    for (const [target, rel, needles] of spells) {
+      const dir = join(scratch, `mutations-out-${target}`);
+      const r = await exportProject(target as 'java', mRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+      assert(!(r.warnings ?? []).some((w) => /handler uses/.test(w)), `${target}: the mutation handlers are not stubbed`);
+      const src = readFileSync(join(dir, target, rel), 'utf8');
+      for (const n of needles) assert(src.includes(n), `${target}: the handler spells ${n}`);
+      assert(!src.includes('handler body not translated'), `${target}: no handler is stubbed`);
+    }
+    // The slice kit helpers exist where the spellings call them. ArkTS runs in
+    // its own export; a failure there is its own assertion, not a crash.
+    const javaKit = readFileSync(join(scratch, 'mutations-out-java', 'java', 'src/main/java/dev/rosezm/app/RoseTheme.java'), 'utf8');
+    assert(/public static Object slice\(/.test(javaKit), 'java: the kit ships slice');
+    const cppKit = readFileSync(join(scratch, 'mutations-out-cpp', 'cpp', 'src/rose.h'), 'utf8');
+    assert(cppKit.includes('RoseValue rose_slice('), 'cpp: the kit declares rose_slice');
+    try {
+      const arkDir = join(scratch, 'mutations-out-arkts');
+      await exportProject('arkts', mRoot, { apiBase: 'http://x', outRoot: arkDir });
+      const arkKit = readFileSync(join(arkDir, 'arkts', 'entry/src/main/ets/kit/RoseKit.ets'), 'utf8');
+      assert(arkKit.includes('export function roseSlice('), 'arkts: the kit ships roseSlice');
+    } catch (e) {
+      assert(false, `arkts: the mutations export runs (${String((e as { message?: string }).message ?? e).slice(0, 80)})`);
+    }
+  }
+
+  // R289: the WHOLE-PAGE matrix - layout + dynamic route + $persist/$kv +
+  // onMount/onCleanup + event wiring + <head> block - on every compiled
+  // target. Each of these shapes was audited (no handler stubs, no raw
+  // block syntax, no untranslated runes) and this locks the audit in.
+  {
+    const pRoot = join(scratch, 'pagematrix');
+    mkdirSync(join(pRoot, 'src/pages/todos/[id]'), { recursive: true });
+    writeFileSync(join(pRoot, 'src/pages/_layout.rose'), `<style>
+  .wrap { padding: 12px; }
+</style>
+<div class="wrap">
+  <slot />
+</div>
+`);
+    writeFileSync(join(pRoot, 'src/pages/index.rose'), `<script>
+  let items = $state(['a', 'b']);
+  let ticks = $state(0);
+  onMount(() => { setTicks(1); });
+  function add() { items().push('x'); setItems(items()); }
+</script>
+<head>
+  <title>home ({items().length})</title>
+</head>
+<h1>{ticks()} ticks</h1>
+<button on:click={add}>add</button>
+<a href="/todos/3">goto 3</a>
+`);
+    writeFileSync(join(pRoot, 'src/pages/todos/[id].rose'), `<script>
+  export const params = { id: ['1', '2'] };
+  let id = $state('1');
+  let done = $persist(false);
+  let pref = $kv('pref', 'x');
+</script>
+<p>todo {id()} done: {done() ? 'y' : 'n'} pref: {pref()}</p>
+`);
+    const checks: Array<[string, string[], RegExp]> = [
+      ['android', ['app/src/main/java/dev/rosezm/app/pages/IndexPage.kt'], /handler body not translated/],
+      ['java', ['src/main/java/dev/rosezm/app/pages/IndexPage.java'], /handler body not translated/],
+      ['cpp', ['src/pages/IndexPage.cpp'], /handler body not translated/],
+      ['dotnet', ['Pages/IndexPage.cs'], /handler body not translated/],
+      ['python', ['pages/index.py'], /handler body not translated/],
+      ['arkts', ['entry/src/main/ets/pages/IndexPage.ets'], /handler body not translated/],
+    ];
+    for (const [target, rels, forbid] of checks) {
+      const dir = join(scratch, `pagematrix-out-${target}`);
+      await exportProject(target as 'android', pRoot, { apiBase: 'http://x', outRoot: dir });
+      const src = readFileSync(join(dir, target, rels[0]!), 'utf8');
+      assert(!forbid.test(src), `${target}: the whole-page matrix compiles with no stub`);
+      assert(!/\{#each|\{#if|on:click\{|\$persist\(|\$kv\(/.test(src), `${target}: no raw block syntax or untranslated runes`);
+    }
+    // The mini family carries the same page in its template without raw syntax.
+    const dirW = join(scratch, 'pagematrix-out-weapp');
+    await exportProject('weapp', pRoot, { apiBase: 'http://x', outRoot: dirW });
+    const wxml = walk(dirW).find((f) => f.endsWith('index.wxml'));
+    assert(!!wxml, 'weapp: the export carries the index template');
+    const tpl = wxml ? readFileSync(wxml, 'utf8') : '';
+    assert(!/\{#each|\{#if/.test(tpl), 'weapp: the template compiles the blocks away');
+  }
+
+  // R290: the data-flow matrix - a server action (`export async function like`
+  // mutating an exported store), a `$data` field, and a state seeded from that
+  // store. Every compiled target translates the click handler, and the mini
+  // program keeps the action BODY server-side (renamed to __server_*) while the
+  // exported name becomes an HTTP wrapper - so a store mutation is a real
+  // server call, not a local one that never reaches the server.
+  {
+    const dRoot = join(scratch, 'dataflow');
+    mkdirSync(join(dRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(dRoot, 'src/pages/index.rose'), `<script>
+  export const store = { likes: 41 };
+  export async function like() {
+    store.likes += 1;
+    return { likes: store.likes };
+  }
+  let likes = $state(store.likes);
+  let facts = $data(async () => ({ n: 7 }));
+</script>
+<h1>{likes()} likes</h1>
+<button on:click={like}>like</button>
+<p>facts: {facts().n}</p>
+`);
+    const checks: Array<[string, string]> = [
+      ['android', 'app/src/main/java/dev/rosezm/app/pages/IndexPage.kt'],
+      ['java', 'src/main/java/dev/rosezm/app/pages/IndexPage.java'],
+      ['cpp', 'src/pages/IndexPage.cpp'],
+      ['dotnet', 'Pages/IndexPage.cs'],
+      ['python', 'pages/index.py'],
+      ['arkts', 'entry/src/main/ets/pages/IndexPage.ets'],
+    ];
+    for (const [target, rel] of checks) {
+      const dir = join(scratch, `dataflow-out-${target}`);
+      const r = await exportProject(target as 'android', dRoot, { apiBase: 'http://x', outRoot: dir }) as { warnings?: string[] };
+      const src = readFileSync(join(dir, target, rel), 'utf8');
+      assert(!src.includes('handler body not translated'), `${target}: the data-flow page compiles with no stub`);
+      assert(!/\$action\(/.test(src), `${target}: no untranslated $action call`);
+    }
+    // The mini program: the action body is server-side, the name an HTTP call.
+    const dirW = join(scratch, 'dataflow-out-weapp');
+    await exportProject('weapp', dRoot, { apiBase: 'http://x', outRoot: dirW });
+    const js = walk(dirW).find((f) => f.endsWith('index.js') && f.includes('pages'));
+    assert(!!js, 'weapp: the data-flow page carries its script');
+    const body = js ? readFileSync(js, 'utf8') : '';
+    assert(/function __server_like\(/.test(body), 'weapp: the action body is kept server-side (renamed __server_*)');
+    assert(/function like\(e\) \{ return __action\("like", e\)/.test(body), 'weapp: the exported action becomes an HTTP call');
+  }
+
+  // R291: the string + search family - join / split / indexOf / every /
+  // startsWith / endsWith / toUpperCase / toLowerCase. JS has all eight, so a
+  // real app writes them constantly, and every compiled target used to REFUSE
+  // (an honest stub) or - worse - let the JS method survive onto a value the
+  // target cannot call it on.
+  {
+    const sRoot = join(scratch, 'strfam');
+    mkdirSync(join(sRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(sRoot, 'src/pages/index.rose'), `<script>
+  let tags = $state(['a', 'b']);
+  let word = $state('Abc');
+  let nums = $state([1, 2, 3]);
+  function go() {
+    setWord(word().toUpperCase());
+    setNums(nums().filter((n) => n > 1));
+  }
+</script>
+<p>{tags().join(',')}</p>
+<p>{word().split(',')}</p>
+<p>{tags().indexOf('a')}</p>
+<p>{nums().every((n) => n > 1) ? 'all' : 'no'}</p>
+<p>{word().startsWith('A') ? 'y' : 'n'}</p>
+<p>{word().endsWith('c') ? 'y' : 'n'}</p>
+<p>{word().toUpperCase()}</p>
+<p>{word().toLowerCase()}</p>
+<button on:click={go}>go</button>
+`);
+    // A leak = one of the eight hanging off a STATE GETTER or a translated
+    // receiver where the target's language has no such member. Which members
+    // are legitimate natively differs per target: Python's `str.split` and
+    // ArkTS/Dart's whole set are real methods on the value, Java's `Object` /
+    // Kotlin's `Any?` / Swift's `Any?` / C++'s `RoseValue` have none of them.
+    const JS_NAMES = ['join', 'split', 'indexOf', 'every', 'startsWith', 'endsWith', 'toUpperCase', 'toLowerCase'];
+    const NATIVE: Record<string, string[]> = {
+      python: ['split'],
+      flutter: JS_NAMES,
+      arkts: JS_NAMES,
+    };
+    const leakRe = (n: string): RegExp =>
+      new RegExp(`(?:app\\.v\\([^)]*\\)|app\\.V\\([^)]*\\)|st\\.get\\([^)]*\\)|getState\\([^)]*\\)|rose_str\\([^)]*\\)|roseTextOf\\([^)]*\\))\\s*\\.${n}\\s*\\(`);
+    const leaksIn = (src: string, target: string): string[] =>
+      JS_NAMES.filter((n) => !(NATIVE[target] ?? []).includes(n) && leakRe(n).test(src));
+    const checks: Array<[string, string[]]> = [
+      ['java', ['.java']],
+      ['cpp', ['.cpp']],
+      ['android', ['.kt']],
+      ['dotnet', ['.cs']],
+      ['arkts', ['.ets']],
+      ['python', ['.py']],
+      ['xcode', ['.swift']],
+      ['flutter', ['.dart']],
+    ];
+    for (const [target, exts] of checks) {
+      const dir = join(scratch, `strfam-out-${target}`);
+      await exportProject(target as 'java', sRoot, { apiBase: 'http://x', outRoot: dir });
+      const src = walk(dir)
+        .filter((f) => exts.some((e) => f.endsWith(e)))
+        // The hand-written kit/theme/runtime files are the target's own native
+        // string code (`text(value).indexOf(`) - a leak can only live in the
+        // GENERATED page files, so those are what the scan reads.
+        .filter((f) => !/^(?:rose|RoseKit|RoseTheme|rosezm|app|styles|__init__|main|rosezmApp)(?:\.|$)/.test(basename(f)))
+        .map((f) => readFileSync(f, 'utf8'))
+        .join('\n');
+      assert(!src.includes('handler body not translated'), `${target}: the string-family page compiles with no stub`);
+      const leaks = leaksIn(src, target);
+      assert(leaks.length === 0, `${target}: no raw JS string method survives (${leaks.join(', ')})`);
+    }
+  }
+
+  // R272: the shared expression IR accepts CHAINED collection methods and the
+  // modulo operator. `nums.map((n) => n * 2).filter((n) => n > 4)` used to
+  // refuse (the head pattern only allowed zero-arg call segments, so the middle
+  // arrows leaked raw JS), and `n % 2 === 0` - the classic filter predicate -
+  // refused because % was not in the operator family. Both now translate; the
+  // Python target spells the chain as nested comprehensions.
+  {
+    const py: ExprDialect = {
+      get: (o, k) => `GET(${o}, '${k}')`,
+      count: (e) => `LEN(${e})`,
+      bool: (e) => `BOOL(${e})`,
+      merge: (b, p) => `MERGE(${b}, ${p})`,
+      obj: (pairs) => `OBJ(${pairs.map(([k, v]) => `${k}=${v}`).join(', ')})`,
+      map: (l, ps, b) => `MAP(${l}, ${ps.join(',')}, ${b})`,
+      filter: (l, ps, p) => `FILTER(${l}, ${ps.join(',')}, ${p})`,
+      reduce: (l, ps, b, s) => `REDUCE(${l}, ${ps.join(',')}, ${b}${s ? `, ${s}` : ''})`,
+      append: (l, i) => `APPEND(${l}, ${i})`,
+      concat: (a, b) => `CONCAT(${a}, ${b})`,
+      arr: (items) => `ARR(${items.join(', ')})`,
+      not: (e) => `NOT(${e})`,
+      lit: (v) => v,
+      read: (n) => `READ(${n})`,
+    };
+    const one = translateExpr('nums.filter((n) => n % 2 === 0)', py, new Set());
+    assert(one !== null && one.includes('% 2 == 0'), 'a modulo predicate translates (== normalized from ===)');
+    const chain = translateExpr('nums.map((n) => n * 2).filter((n) => n > 4)', py, new Set());
+    assert(chain !== null && /FILTER\(MAP\(READ\(nums\), n, n \* 2\), n, n > 4\)/.test(chain), 'a map-then-filter chain translates through the shared IR');
+    const three = translateExpr('nums.map((n) => n * 2).filter((n) => n > 4).map((n) => n + 1)', py, new Set());
+    assert(three !== null && three.includes('MAP(FILTER(MAP('), 'a three-step chain nests the same way');
+    assert(translateExpr('nums.filter((n) => n.mystery(n))', py, new Set()) === null, 'an unknown method inside the chain still refuses honestly');
+    const cRoot = join(scratch, 'chainpy');
+    mkdirSync(join(cRoot, 'src/pages'), { recursive: true });
+    writeFileSync(join(cRoot, 'src/pages/h.rose'), `<script>
+  let nums = $state([1, 2, 3, 4]);
+</script>
+<ul>
+  {#each nums.map((n) => n * 2).filter((n) => n > 4) as n}
+    <li>{n}</li>
+  {/each}
+</ul>
+`);
+    const cDir = join(scratch, 'chainpy-out');
+    const r = await exportProject('python', cRoot, { apiBase: 'http://x', outRoot: cDir }) as { outDir: string };
+    const pyPage = readFileSync(join(r.outDir, 'pages', 'h.py'), 'utf8');
+    assert(/__items = \[n for n in \[n \* 2 for n in st\.get\('nums'\)\] if n > 4\]/.test(pyPage), 'the Python page spells the chain as nested comprehensions');
+    assert(!/\.(?:map|filter)\(/.test(pyPage), 'no raw JS chain reaches the Python file');
+  }
+
+  // R273: four more constructs in the shared expression subset - template
+  // literals, index reads, the nullish default and optional chaining. Each is
+  // dialect-optional: a target without the spelling refuses honestly.
+  {
+    const py: ExprDialect = {
+      get: (o, k) => `GET(${o}, '${k}')`,
+      count: (e) => `LEN(${e})`,
+      bool: (e) => `BOOL(${e})`,
+      merge: () => `MERGE()`,
+      obj: () => `OBJ()`,
+      map: (l, ps, b) => `MAP(${l}, ${ps.join(',')}, ${b})`,
+      filter: (l, ps, p) => `FILTER(${l}, ${ps.join(',')}, ${p})`,
+      reduce: (l, ps, b) => `REDUCE(${l}, ${ps.join(',')}, ${b})`,
+      append: (l, i) => `APPEND(${l}, ${i})`,
+      concat: (a, b) => `CONCAT(${a}, ${b})`,
+      arr: (items) => `ARR(${items.join(', ')})`,
+      not: (e) => `NOT(${e})`,
+      lit: (v) => v,
+      read: (n) => `READ(${n})`,
+      template: (parts) => `TPL(${parts.map((p) => JSON.stringify(p)).join(', ')})`,
+      index: (l, i) => `IDX(${l}, ${i})`,
+      nullish: (a, b) => `NUL(${a}, ${b})`,
+      optChain: (o, k) => `OPT(${o}, '${k}')`,
+    };
+    const tpl = translateExpr('`Hi ${name}, you have ${n} items`', py, new Set());
+    assert(tpl === `TPL({"text":"Hi "}, {"expr":"READ(name)"}, {"text":", you have "}, {"expr":"READ(n)"}, {"text":" items"})`, 'a template literal splits into tagged literal and expression parts');
+    assert(translateExpr('`a${1 + 2}b`', py, new Set()) === 'TPL({"text":"a"}, {"expr":"1 + 2"}, {"text":"b"})', 'an interpolation body is itself translated');
+    const noTpl: ExprDialect = { ...py };
+    delete (noTpl as { template?: unknown }).template;
+    assert(translateExpr('`Hi ${name}`', noTpl, new Set()) === null, 'a template literal refuses when the dialect has no spelling');
+    assert(translateExpr('list[0]', py, new Set()) === 'IDX(READ(list), 0)', 'an index read translates');
+    assert(translateExpr('xs[i + 1]', py, new Set()) === 'IDX(READ(xs), READ(i) + 1)', 'an index sub-expression translates recursively');
+    assert(translateExpr('a ?? b', py, new Set()) === 'NUL(READ(a), READ(b))', 'the nullish default translates');
+    assert(translateExpr('user()?.name', py, new Set()) === `OPT(READ(user), 'name')`, 'an optional chain translates');
+    assert(translateExpr('user()?.name.length', py, new Set()) === `LEN(OPT(READ(user), 'name'))`, 'a member tail on an optional chain composes');
+    const noOpt: ExprDialect = { ...py };
+    delete (noOpt as { optChain?: unknown }).optChain;
+    assert(translateExpr('user()?.name', noOpt, new Set()) === null, 'an optional chain refuses when the dialect has no spelling');
+    // R274: Python consumes the four constructs. The template literal becomes
+    // an f-string (literal braces escaped, double quotes escaped, interpolation
+    // braces live), the nullish default is `or`, the optional chain is a
+    // `.get(key)`.
+    {
+      const cRoot = join(scratch, 'pydialect');
+      mkdirSync(join(cRoot, 'src/pages'), { recursive: true });
+      writeFileSync(join(cRoot, 'src/pages/h.rose'), `<script>
+  let name = $state('Ada');
+  let n = $state(3);
+  let user = $state({});
+</script>
+<p>{\`Hi \${name}, you have \${n} items\`}</p>
+<p>{user()?.name ?? 'guest'}</p>
+`);
+      const cDir = join(scratch, 'pydialect-out');
+      const r = await exportProject('python', cRoot, { apiBase: 'http://x', outRoot: cDir }) as { outDir: string };
+      const pyPage = readFileSync(join(r.outDir, 'pages', 'h.py'), 'utf8');
+      assert(/f'Hi \{st\.get\('name'\)\}, you have \{st\.get\('n'\)\} items'/.test(pyPage), 'the Python page spells the template literal as a nested f-string');
+      assert(/\(st\.get\('user'\)\.get\('name'\)\) or \('guest'\)/.test(pyPage), 'the optional chain becomes .get() and the nullish default becomes or');
+      assert(!/\$\{|\?\./.test(pyPage), 'no raw JS template or optional-chain syntax reaches the Python file');
+      const parsed = spawnSync('python', ['-c', `import ast; ast.parse(open(r'${join(r.outDir, 'pages', 'h.py')}', encoding='utf-8').read()); print('ok')`]);
+      assert(parsed.status === 0, 'the generated Python file parses (nested f-string quoting is valid)');
+    }
+    // R275: Kotlin and Swift consume the same four constructs with their own
+    // native spellings - `"$name"` / `\(name)` interpolation, `?:` / `??` for
+    // the nullish default, a safe call for the optional chain, and the kit's
+    // roseIndex for the untyped index read.
+    {
+      const kRoot = join(scratch, 'ksdialect');
+      mkdirSync(join(kRoot, 'src/pages'), { recursive: true });
+      writeFileSync(join(kRoot, 'src/pages/h.rose'), `<script>
+  let name = $state('Ada');
+  let n = $state(3);
+  let user = $state({});
+  let items = $state(['a', 'b']);
+</script>
+<p>{\`Hi \${name}, you have \${n} items\`}</p>
+<p>{user()?.name ?? 'guest'}</p>
+<p>{items[0]}</p>
+`);
+      const kDir = join(scratch, 'ksdialect-kt');
+      const kRes = await exportProject('android', kRoot, { apiBase: 'http://x', outRoot: kDir }) as { outDir: string };
+      const ktPage = readFileSync(join(kRes.outDir, 'app/src/main/java/dev/rosezm/app/pages/HPage.kt'), 'utf8');
+      assert(/Hi \$name, you have \$n items/.test(ktPage), 'Kotlin spells the template literal with its own interpolation');
+      assert(/\?\.get\("name"\)\) \?: \("guest"\)/.test(ktPage), 'Kotlin spells nullish as the elvis operator over a safe call');
+      assert(/roseIndex\(items, 0\)/.test(ktPage), 'Kotlin routes the untyped index read through the kit');
+      const sDir = join(scratch, 'ksdialect-swift');
+      const sRes = await exportProject('xcode', kRoot, { apiBase: 'http://x', outRoot: sDir }) as { outDir: string };
+      const swPage = readFileSync(join(sRes.outDir, 'rosezmApp/Pages/HView.swift'), 'utf8');
+      assert(/Hi \\\(name\), you have \\\(n\) items/.test(swPage), 'Swift spells the template literal with its own interpolation');
+      assert(/\?\? \("guest"\)/.test(swPage), 'Swift spells the nullish default as ??');
+      assert(/roseIndex\(items, 0\)/.test(swPage), 'Swift routes the untyped index read through the kit');
+    }
+    // R276: the remaining four targets consume the same constructs, each in
+    // its own spelling - Dart interpolation, Java string concatenation (no
+    // interpolation exists), C# interpolated strings, C++ std::string
+    // concatenation through the kit.
+    {
+      const fRoot = join(scratch, 'fourdialect');
+      mkdirSync(join(fRoot, 'src/pages'), { recursive: true });
+      writeFileSync(join(fRoot, 'src/pages/h.rose'), `<script>
+  let name = $state('Ada');
+  let n = $state(3);
+  let user = $state({});
+  let items = $state(['a', 'b']);
+</script>
+<p>{\`Hi \${name}, you have \${n} items\`}</p>
+<p>{user()?.name ?? 'guest'}</p>
+<p>{items[0]}</p>
+`);
+      const dDir = join(scratch, 'fourdialect-dart');
+      const dRes = await exportProject('flutter', fRoot, { apiBase: 'http://x', outRoot: dDir }) as { outDir: string };
+      const dPage = readFileSync(join(dRes.outDir, 'lib/pages/h.dart'), 'utf8');
+      assert(/Hi \$name, you have \$n items/.test(dPage), 'Dart spells the template literal with its own interpolation');
+      assert(/roseIndex\(items, 0\)/.test(dPage), 'Dart routes the untyped index read through the kit');
+      assert(readFileSync(join(dRes.outDir, 'lib/rosezm.dart'), 'utf8').includes('dynamic roseIndex('), 'the Dart kit defines roseIndex');
+      const jDir = join(scratch, 'fourdialect-java');
+      const jRes = await exportProject('java', fRoot, { apiBase: 'http://x', outRoot: jDir }) as { outDir: string };
+      const jPage = readFileSync(join(jRes.outDir, 'src/main/java/dev/rosezm/app/pages/HPage.java'), 'utf8');
+      assert(/RoseTheme\.str\(app\.v\("name"\)\) \+ ", you have " \+ RoseTheme\.str\(app\.v\("n"\)\) \+ " items"/.test(jPage), 'Java concatenates the template literal through the kit');
+      assert(/RoseTheme\.get\(app\.v\("user"\), "name"\) != null \?/.test(jPage), 'Java spells the nullish default as a null test');
+      assert(/RoseTheme\.index\(app\.v\("items"\), 0\)/.test(jPage), 'Java routes the untyped index read through the kit');
+      const nDir = join(scratch, 'fourdialect-net');
+      const nRes = await exportProject('dotnet', fRoot, { apiBase: 'http://x', outRoot: nDir }) as { outDir: string };
+      const nPage = readFileSync(join(nRes.outDir, 'Pages/HPage.cs'), 'utf8');
+      assert(/RoseTheme\.Str\(\$"Hi \{app\.V\("name"\)\}, you have \{app\.V\("n"\)\} items"\)/.test(nPage), 'C# spells the template literal as an interpolated string');
+      assert(/RoseTheme\.Get\(app\.V\("user"\), "name"\) \?\? "guest"\)/.test(nPage), 'C# spells the nullish default as ??');
+      assert(/RoseTheme\.Index\(app\.V\("items"\), 0\)/.test(nPage), 'C# routes the untyped index read through the kit');
+      const cDir = join(scratch, 'fourdialect-cpp');
+      const cRes = await exportProject('cpp', fRoot, { apiBase: 'http://x', outRoot: cDir }) as { outDir: string };
+      const cPage = readFileSync(join(cRes.outDir, 'src/pages/HPage.cpp'), 'utf8');
+      assert(/std::string\("Hi "\) \+ rose_str\(app\.v\("name"\)\)/.test(cPage), 'C++ concatenates the template literal through the kit');
+      assert(/!rose_is_null\(rose_get\(app\.v\("user"\), "name"\)\) \?/.test(cPage), 'C++ spells the nullish default as a null test');
+      assert(/rose_index\(app\.v\("items"\), 0\)/.test(cPage), 'C++ routes the untyped index read through the kit');
+      assert(readFileSync(join(cRes.outDir, 'src/rose.cpp'), 'utf8').includes('RoseValue rose_index(const RoseValue& value, const RoseValue& at) {'), 'the Qt kit defines rose_index');
+    }
+  }
+
+  // R239: the completeness gate - "can this export actually be opened?". The
+  // other three gates ask whether the right CODE was emitted; this asks whether
+  // the FILES that make a project openable are all there. R238's electron bug
+  // (an app that only showed "index.html is missing") passed every other gate.
+  {
+    const kProj = join(scratch, 'completeproj');
+    mkdirSync(join(kProj, 'src/pages'), { recursive: true });
+    mkdirSync(join(kProj, 'src/components'), { recursive: true });
+    writeFileSync(join(kProj, 'src/components/Badge.rose'), `<script>export let label = 'b';</script>\n<span>{label}</span>`);
+    writeFileSync(join(kProj, 'src/pages/index.rose'), `<script>
+  import Badge from '../components/Badge.rose';
+  let n = $state(0);
+  function inc() { n = n + 1; }
+</script>
+<div><Badge label="hi" /><button on:click={inc}>{n}</button></div>
+`);
+    writeFileSync(join(kProj, 'src/pages/about.rose'), `<div>about</div>`);
+    // What each target MUST ship to be openable at all - the project file its
+    // toolchain reads first, plus every page it declares.
+    const mustShip: Record<string, RegExp[]> = {
+      weapp: [/^app\.json$/, /^app\.wxss$/, /^pages\/index\/index\.(wxml|js|json|wxss)$/, /^pages\/about\/about\.wxml$/],
+      qq: [/^app\.json$/, /^pages\/index\/index\.qml$/],
+      alipay: [/^app\.json$/, /^pages\/index\/index\.axml$/],
+      baidu: [/^app\.json$/, /^pages\/index\/index\.swan$/],
+      toutiao: [/^app\.json$/, /^pages\/index\/index\.ttml$/],
+      flutter: [/^pubspec\.yaml$/, /^lib\/main\.dart$/, /^lib\/pages\/index\.dart$/],
+      android: [/build\.gradle\.kts$/, /AndroidManifest\.xml$/, /MainActivity\.kt$/, /pages\/IndexPage\.kt$/],
+      arkts: [/build-profile\.json5$/, /oh-package\.json5$/, /module\.json5$/, /app\.json5$/, /pages\/IndexPage\.ets$/],
+      xcode: [/project\.pbxproj$/, /\.swift$/, /Info\.plist$/],
+      electron: [/^package\.json$/, /^main\.cjs$/, /^preload\.cjs$/],
+      python: [/^app\.py$/, /^pages\/index\.py$/, /^rosezm\.py$/],
+      dotnet: [/\.csproj$/, /IndexPage\.cs$/],
+      java: [/IndexPage\.java$/, /RoseTheme\.java$/],
+      cpp: [/CMakeLists\.txt$/, /IndexPage\.cpp$/, /rose\.h$/, /rose\.cpp$/],
+    };
+    for (const [target, pats] of Object.entries(mustShip)) {
+      const k = await exportProject(target as never, kProj, { apiBase: 'x', outRoot: join(scratch, `complete-${target}`) });
+      const files = walk(k.outDir).map((f) => relative(k.outDir, f).replace(/\\/g, '/'));
+      const missing = pats.filter((re) => !files.some((f) => re.test(f))).map((re) => re.source);
+      assert(missing.length === 0, `${target}: every file the project needs to open is shipped (missing: ${missing.join(', ') || 'none'})`);
+      // And the manifest must tell the truth about what was exported - R231 found
+      // electron claiming zero pages while the project had two.
+      const manifest = JSON.parse(readFileSync(join(k.outDir, 'rosezm-export.json'), 'utf8'));
+      assert((manifest.pages ?? []).length > 0, `${target}: the export manifest reports the pages it actually emitted`);
+    }
+  }
+
+  // R240: buildProject must accept a RELATIVE root. The scans return paths joined
+  // onto `root` while every import resolves with path.resolve (absolute), so a
+  // relative root produced relative registry keys against absolute lookups: the
+  // build died with "no .rose file at <a file that exists>". The CLI always passed
+  // path.resolve(argv[3]), which is exactly why nothing caught it.
+  {
+    const relProj = join(scratch, 'relrootproj');
+    mkdirSync(join(relProj, 'src/pages'), { recursive: true });
+    mkdirSync(join(relProj, 'src/components'), { recursive: true });
+    writeFileSync(join(relProj, 'src/components/Card.rose'), `<script>export let title = 't';</script>\n<div>{title}</div>`);
+    writeFileSync(join(relProj, 'src/pages/index.rose'), `<script>
+  import Card from '../components/Card.rose';
+</script>
+<Card title="hi" />
+`);
+    const savedCwd = process.cwd();
+    try {
+      process.chdir(scratch);
+      // A relative root AND a relative out dir - the shape that used to fail.
+      // Wrapped so a regression reads as a named failure, not an uncaught throw.
+      let rel: { routes: unknown[] } | null = null;
+      let why = '';
+      try { rel = await buildProject('relrootproj', join(scratch, 'relout'), {}); } catch (e) { why = String((e as Error)?.message ?? e).slice(0, 120); }
+      assert(rel !== null && rel.routes.length === 1, `buildProject accepts a relative project root - the registry keys and the import lookup agree${why ? ` (${why})` : ''}`);
+      assert(existsSync(join(scratch, 'relout', 'server.js')), 'a relative root still writes the full build output');
+    } finally {
+      process.chdir(savedCwd);
+    }
+  }
+
+  // R235: conditional compilation - `{#ifdef target}{:else}{/ifdef}`. The one
+  // thing every cross-platform framework has and rosezm did not: a block that
+  // exists on one platform only. It resolves at parse time, so the losing branch
+  // never reaches any emitter and no target has to implement it.
+  {
+    const iProj = join(scratch, 'ifdefproj');
+    mkdirSync(join(iProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(iProj, 'src/pages/index.rose'), `
+{#ifdef weapp}
+<span>WECHAT ONLY</span>
+{:else}
+<span>everywhere else</span>
+{/ifdef}
+{#ifdef desktop}
+<span>DESKTOP</span>
+{/ifdef}
+{#ifndef mini-program}
+<span>NOT A MINI PROGRAM</span>
+{/ifndef}
+{#ifdef nonsense}
+<span>NEVER</span>
+{/ifdef}
+`);
+    const expect: Record<string, { wechat: boolean; other: boolean; desktop: boolean; notMp: boolean }> = {
+      weapp: { wechat: true, other: false, desktop: false, notMp: false },
+      qq: { wechat: false, other: true, desktop: false, notMp: false },
+      flutter: { wechat: false, other: true, desktop: false, notMp: true },
+      cpp: { wechat: false, other: true, desktop: true, notMp: true },
+      arkts: { wechat: false, other: true, desktop: false, notMp: true },
+    };
+    for (const [target, want] of Object.entries(expect)) {
+      const i = await exportProject(target as never, iProj, { apiBase: 'x', outRoot: join(scratch, `ifdef-${target}`) });
+      const body = walk(i.outDir).map((f) => { try { return readFileSync(f, 'utf8'); } catch { return ''; } }).join('\n');
+      const has = (s: string) => body.includes(s);
+      assert(has('WECHAT ONLY') === want.wechat, `${target}: {#ifdef weapp} keeps its branch only on WeChat`);
+      assert(has('everywhere else') === want.other, `${target}: the {:else} branch is what the rest of the world gets`);
+      assert(has('DESKTOP') === want.desktop, `${target}: {#ifdef desktop} matches the whole desktop family`);
+      assert(has('NOT A MINI PROGRAM') === want.notMp, `${target}: {#ifndef mini-program} excludes the mini-program family`);
+      assert(!has('NEVER'), `${target}: an unknown platform name keeps neither branch`);
+      // A term naming another platform is simply false here, not an error.
+      const notes = (i.warnings ?? []).join('\n');
+      assert(!/\{#ifdef weapp\} names an unknown/.test(notes), `${target}: naming another platform is not an error`);
+      assert(/\{#ifdef nonsense\} names an unknown/.test(notes), `${target}: a genuinely unknown name IS named`);
+    }
+    // R236: the web build must agree with all 13 exports, or the framework's own
+    // renderer is the one place the block means something else. `{#ifdef web}` is
+    // true here and `{#ifdef weapp}` is false; the same source, one answer.
+    await buildProject(iProj, join(scratch, 'ifdef-web-dist'), {});
+    const serverJs = readFileSync(join(scratch, 'ifdef-web-dist', 'server.js'), 'utf8');
+    assert(serverJs.includes('everywhere else'), 'web: {#ifdef weapp} is false, so the {:else} branch is what the web renders');
+    assert(!serverJs.includes('WECHAT ONLY'), 'web: the WeChat-only branch does not reach the web build');
+    assert(!serverJs.includes('DESKTOP'), 'web: {#ifdef desktop} excludes the web');
+    assert(serverJs.includes('NOT A MINI PROGRAM'), 'web: {#ifndef mini-program} includes the web');
+    assert(!serverJs.includes('NEVER'), 'web: an unknown platform name keeps neither branch');
+  }
+
+  // R237: the COMMENT form - `// #ifdef target` ... `// #endif` - for the blocks
+  // a template form cannot reach: `<script>` and `<style>`. This is the spelling
+  // uni-app code already uses, so a project migrating from it keeps its markers.
+  {
+    const cProj = join(scratch, 'commentifdefproj');
+    mkdirSync(join(cProj, 'src/pages'), { recursive: true });
+    writeFileSync(join(cProj, 'src/pages/index.rose'), `<script>
+  let n = $state(0);
+  // #ifdef MP-WEIXIN
+  const PLAT = 'WECHAT_JS';
+  // #endif
+  // #ifndef weapp
+  const PLAT = 'OTHER_JS';
+  // #endif
+  function inc() { n = n + 1; }
+</script>
+<style>
+  /* #ifdef weapp */
+  .box { color: #ff0000; }
+  /* #endif */
+  /* #ifndef weapp */
+  .box { color: #00ff00; }
+  /* #endif */
+</style>
+<div class="box"><button on:click={inc}>{n}</button></div>
+`);
+    for (const target of ['weapp', 'flutter', 'cpp'] as const) {
+      const c = await exportProject(target, cProj, { apiBase: 'x', outRoot: join(scratch, `cmt-${target}`) });
+      const body = walk(c.outDir).map((f) => { try { return readFileSync(f, 'utf8'); } catch { return ''; } }).join('\n');
+      const wechat = target === 'weapp';
+      assert(body.includes('WECHAT_JS') === wechat, `${target}: // #ifdef MP-WEIXIN keeps its script only on WeChat (the uni-app alias resolves)`);
+      assert(body.includes('OTHER_JS') === !wechat, `${target}: // #ifndef weapp is the complement`);
+      assert(/#ff0000|0xFFFF0000/i.test(body) === wechat, `${target}: // #ifdef works inside <style> too`);
+      assert(/#00ff00|0xFF00FF00/i.test(body) === !wechat, `${target}: the style else-branch is the complement`);
+      assert(!/#ifdef|#endif/.test(body), `${target}: no marker comment survives into the emitted source`);
+    }
+  }
+
+  console.log(`\nAll export checks passed - one source tree, ${result.pages.length} pages to WeChat, ${alipay.pages.length} to Alipay, ${flutter.pages.length} to Flutter/Dart, ${python.pages.length} to Python/Tkinter, ${arkts.pages.length} to HarmonyOS ArkTS, ${android.pages.length} to Android/Compose, ${xcode.pages.length} to Xcode/SwiftUI, ${java.pages.length} to Java/Swing, ${dotnet.pages.length} to .NET/WPF, ${cpp.pages.length} to C++/Qt; the Electron shell wraps the built site - ${checks} assertions.\nEvery target in the registry is ready - one .rose tree, every platform.`);
+} finally {
+  rmSync(scratch, { recursive: true, force: true });
+}
+
+/** Balanced braces/parens/brackets, skipping string literals and comments. */
+function balancedJava(src: string): boolean {
+  let braces = 0;
+  let parens = 0;
+  let brackets = 0;
+  let mode = '';
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (mode === 'line') { if (ch === '\n') mode = ''; continue; }
+    if (mode === 'block') { if (ch === '*' && src[i + 1] === '/') { mode = ''; i++; } continue; }
+    if (mode === 'string' || mode === 'char') {
+      if (ch === '\\') { i++; continue; }
+      if ((mode === 'string' && ch === '"') || (mode === 'char' && ch === "'")) mode = '';
+      continue;
+    }
+    if (ch === '/' && src[i + 1] === '/') { mode = 'line'; i++; continue; }
+    if (ch === '/' && src[i + 1] === '*') { mode = 'block'; i++; continue; }
+    if (ch === '"') { mode = 'string'; continue; }
+    if (ch === "'") { mode = 'char'; continue; }
+    if (ch === '{') braces++;
+    else if (ch === '}') braces--;
+    else if (ch === '(') parens++;
+    else if (ch === ')') parens--;
+    else if (ch === '[') brackets++;
+    else if (ch === ']') brackets--;
+    if (braces < 0 || parens < 0 || brackets < 0) return false;
+  }
+  return braces === 0 && parens === 0 && brackets === 0;
+}
+
+/**
+ * The Java shape gate (R198). No JDK runs here, so emitted Swing code cannot be
+ * compiled - but what stops `javac` is mostly visible as *shape*, and shape is
+ * cheap to check across the whole tree at once:
+ *   - a declarator that restates its type after a comma (`String a, int b`) -
+ *     legal in C, a syntax error in Java;
+ *   - `new T(...)` whose argument count matches no constructor T declares;
+ *   - a call `Own.member(...)` where no emitted file declares that member;
+ *   - comma hygiene (`,,`, `(,`, `,)`) and unbalanced delimiters.
+ * A front end over the scrubbed source, not a parser: it knows nothing about
+ * types, scope or the JDK, so it only reports what could not compile.
+ */
+function javaScrub(src: string): string {
+  let out = '';
+  let i = 0;
+  const n = src.length;
+  while (i < n) {
+    const c = src[i];
+    if (c === '/' && src[i + 1] === '/') { while (i < n && src[i] !== '\n') { out += ' '; i++; } continue; }
+    if (c === '/' && src[i + 1] === '*') { let j = i; while (j < n && !(src[j] === '*' && src[j + 1] === '/')) { out += src[j] === '\n' ? '\n' : ' '; j++; } i = Math.min(j + 2, n); out += '  '; continue; }
+    if (c === '"' || c === "'") {
+      const triple = c === '"' && src.startsWith('"""', i);
+      i += triple ? 3 : 1;
+      // one sentinel letter reads as an identifier, so f("a","b") never looks empty
+      out += 'A';
+      while (i < n) {
+        if (src[i] === '\\') { if (src[i + 1] === 'n') out += '\n'; i += 2; continue; }
+        if (triple && src.startsWith('"""', i)) { i += 3; break; }
+        if (!triple && src[i] === c) { i++; break; }
+        if (src[i] === '\n') out += '\n';
+        i++;
+      }
+      continue;
+    }
+    out += c; i++;
+  }
+  return out;
+}
+
+/** Words that can never be a declaration's name. */
+function javaReserved(w: string): boolean {
+  return /(^|:)(if|for|while|switch|catch|synchronized|return|new|do|else|try|finally|class|interface|enum|record|throw|case|super|this|assert|in|instanceof):/.test(':' + w + ':');
+}
+
+/** Region between a name and the boundary that closed whatever came before it.
+ *  `; { } ( ) = ,` end a statement, an argument or an initializer, so what is
+ *  left is exactly a declaration's modifiers and return type - and a plain call
+ *  leaves nothing but `new `. */
+function javaBeforeName(text: string, nameStart: number): string {
+  let i = nameStart - 1;
+  while (i >= 0 && !';{}()=,'.includes(text[i])) i--;
+  return text.slice(i + 1, nameStart);
+}
+
+function javaIsWord(ch: string): boolean { return /[\w$]/.test(ch); }
+
+/** Split an argument list on top-level commas. */
+function javaArgs(text: string): string[] {
+  if (text.trim() === '') return [];
+  const parts: string[] = [];
+  let depth = 0;
+  let cur = '';
+  for (const c of text) {
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+    if (c === ',' && depth === 0) { parts.push(cur.trim()); cur = ''; continue; }
+    cur += c;
+  }
+  parts.push(cur.trim());
+  return parts.filter((p) => p !== '');
+}
+
+function javaCloseParen(text: string, open: number): number {
+  let d = 0;
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === '(') d++;
+    else if (text[i] === ')') { d--; if (d === 0) return i; }
+  }
+  return -1;
+}
+
+function javaLineOf(text: string, index: number): number {
+  let line = 1;
+  for (let i = 0; i < index; i++) if (text[i] === '\n') line++;
+  return line;
+}
+
+/** One pass over a scrubbed file: the classes it declares, with the parameter
+ *  count (-1 = varargs) of every constructor and method. */
+function javaDecls(text: string): { classes: Set<string>; ctors: Map<string, number[]>; methods: Map<string, Map<string, number[]>> } {
+  const classes = new Set<string>();
+  const ctors = new Map<string, number[]>();
+  const methods = new Map<string, Map<string, number[]>>();
+  const stack: Array<{ name: string; open: number }> = [];
+  let depth = 0;
+  let pending: { name: string; at: number } | null = null;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '{') {
+      depth++;
+      if (pending && pending.at === depth - 1) { stack.push({ name: pending.name, open: depth - 1 }); classes.add(pending.name); pending = null; }
+      continue;
+    }
+    if (c === '}') {
+      if (stack.length && stack[stack.length - 1].open === depth - 1) stack.pop();
+      depth--;
+      continue;
+    }
+    if (c === '(') {
+      let k = i - 1;
+      while (k >= 0 && /\s/.test(text[k])) k--;
+      const nameEnd = k;
+      while (k >= 0 && javaIsWord(text[k])) k--;
+      const name = text.slice(k + 1, nameEnd + 1);
+      if (!name || javaReserved(name) || /^\d/.test(name)) continue;
+      let p = k;
+      while (p >= 0 && /\s/.test(text[p])) p--;
+      // a header's name is preceded by its return type, which ends in a word
+      // char, a generic `>` or an array `]`; `.`, `=`, `,`, `(` mean it is a call.
+      const prev = p >= 0 ? text[p] : '';
+      if (!(/[\w$]/.test(prev) || prev === '>' || prev === ']')) continue;
+      const before = javaBeforeName(text, k + 1);
+      const tokens = before.split(/\s+/).filter(Boolean);
+      const typeToken = tokens[tokens.length - 1] ?? '';
+      if (javaReserved(typeToken)) continue;
+      const owner = stack.length ? stack[stack.length - 1].name : '';
+      if (!owner) continue;
+      const isCtor = name === owner && (typeToken === '' || /^(public|private|protected|static|final|abstract|synchronized|default|native)$/.test(typeToken));
+      const isMethod = name !== owner && typeToken !== '';
+      if (!isCtor && !isMethod) continue;
+      const close = javaCloseParen(text, i);
+      if (close < 0) continue;
+      let e = close + 1;
+      while (e < text.length && /\s/.test(text[e])) e++;
+      if (text.startsWith('throws', e)) { while (e < text.length && text[e] !== '{' && text[e] !== ';') e++; while (e < text.length && /\s/.test(text[e])) e++; }
+      // a real declaration body follows; anything else was a call in an expression
+      if (text[e] !== '{') { i = close; continue; }
+      const params = javaArgs(text.slice(i + 1, close));
+      const arity = /\.\.\./.test(params[params.length - 1] ?? '') ? -1 : params.length;
+      if (isCtor) ctors.set(owner, [...(ctors.get(owner) ?? []), arity]);
+      else {
+        const table = methods.get(owner) ?? new Map<string, number[]>();
+        table.set(name, [...(table.get(name) ?? []), arity]);
+        methods.set(owner, table);
+      }
+      i = close;
+      continue;
+    }
+    if (text.startsWith('class ', i) && !javaIsWord(text[i - 1] ?? ' ')) {
+      let j = i + 6;
+      while (j < text.length && /\s/.test(text[j])) j++;
+      let k = j;
+      while (k < text.length && javaIsWord(text[k])) k++;
+      const name = text.slice(j, k);
+      if (name) pending = { name, at: depth };
+      i = k - 1;
+    }
+  }
+  return { classes, ctors, methods };
+}
+
+/** A word that can only be the start of a second declarator's type. */
+function javaPrimitiveType(w: string): boolean {
+  return /^(int|long|double|float|boolean|char|byte|short|var)$/.test(w);
+}
+
+/** Every shape defect across a whole emitted Java tree (basename -> source). */
+function javaShape(files: Map<string, string>): string[] {
+  const defects: string[] = [];
+  const texts = new Map<string, string>();
+  const classes = new Set<string>();
+  const ctors = new Map<string, number[]>();
+  const methods = new Map<string, Map<string, number[]>>();
+  for (const [rel, src] of files) {
+    const text = javaScrub(src);
+    texts.set(rel, text);
+    const decls = javaDecls(text);
+    for (const c of decls.classes) classes.add(c);
+    for (const [c, list] of decls.ctors) ctors.set(c, [...(ctors.get(c) ?? []), ...list]);
+    for (const [c, table] of decls.methods) {
+      const mine = methods.get(c) ?? new Map<string, number[]>();
+      for (const [name, list] of table) mine.set(name, [...(mine.get(name) ?? []), ...list]);
+      methods.set(c, mine);
+    }
+    let braces = 0;
+    let parens = 0;
+    let brackets = 0;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (c === '{') braces++;
+      else if (c === '}') braces--;
+      else if (c === '(') parens++;
+      else if (c === ')') parens--;
+      else if (c === '[') brackets++;
+      else if (c === ']') brackets--;
+      if (braces < 0 || parens < 0 || brackets < 0) break;
+    }
+    if (braces !== 0 || parens !== 0 || brackets !== 0) defects.push(`${rel}: unbalanced delimiters (${braces} braces, ${parens} parens, ${brackets} brackets)`);
+    for (const re of [/,\s*,/, /\(\s*,/, /,\s*\)/]) {
+      const m = re.exec(text);
+      if (m) defects.push(`${rel}: comma hygiene ${JSON.stringify(m[0])} at line ${javaLineOf(text, m.index)}`);
+    }
+    for (const raw of text.split('\n')) {
+      const line = raw.trim();
+      if (!/^(?:public|private|protected)\b/.test(line) || !line.endsWith(';') || /[()<=]/.test(line)) continue;
+      const parts = javaArgs(line.replace(/;$/, '').replace(/^(?:public |private |protected |static |final )+/, ''));
+      if (parts.length < 2) continue;
+      for (const later of parts.slice(1)) {
+        const first = later.split(/[\s[\]]/)[0];
+        if (javaPrimitiveType(first) || /^[A-Z][\w$]*$/.test(first)) defects.push(`${rel}: declarator restates its type (${JSON.stringify(later)}) in ${JSON.stringify(line)}`);
+      }
+    }
+  }
+  const callSites = (text: string, re: RegExp, resolve: (m: RegExpExecArray) => number[] | undefined, report: (m: RegExpExecArray, name: string, arity: number, declared: number[], line: number) => string) => {
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text))) {
+      const declared = resolve(m);
+      if (!declared || !declared.length) continue;
+      const open = m.index + m[0].length - 1;
+      const close = javaCloseParen(text, open);
+      if (close < 0) continue;
+      const args = text.slice(open + 1, close);
+      if (/[<>]/.test(args)) continue;
+      const arity = javaArgs(args).length;
+      if (declared.includes(arity) || declared.includes(-1)) continue;
+      defects.push(report(m, m[1], arity, declared, javaLineOf(text, m.index)));
+    }
+  };
+  for (const [rel, text] of texts) {
+    callSites(text, /\bnew\s+([A-Z][\w$]*)\s*\(/g, (m) => ctors.get(m[1]),
+      (_m, name, arity, declared, line) => `${rel}: new ${name}(${arity} args) at line ${line}, but ${name} declares constructor(s) of ${declared.join('/')} parameters`);
+    callSites(text, /\b([A-Z][\w$]*)\.([a-z_$][\w$]*)\s*\(/g, (m) => methods.get(m[1])?.get(m[2]),
+      (m, _name, arity, declared, line) => `${rel}: ${m[1]}.${m[2]}(${arity} args) at line ${line}, declared arities ${declared.join('/')}`);
+    const missing = /\b([A-Z][\w$]*)\.([a-z_$][\w$]*)\s*\(/g;
+    let m2: RegExpExecArray | null;
+    while ((m2 = missing.exec(text))) {
+      if (!classes.has(m2[1]) || methods.get(m2[1])?.has(m2[2])) continue;
+      defects.push(`${rel}: ${m2[1]}.${m2[2]}(...) at line ${javaLineOf(text, m2.index)} is called but ${m2[1]} never declares it`);
+    }
+  }
+  return [...new Set(defects)];
+}
+
+function balancedBraces(src: string): boolean {
+  let braces = 0;
+  let parens = 0;
+  let brackets = 0;
+  for (const ch of src) {
+    if (ch === '{') braces++;
+    else if (ch === '}') braces--;
+    else if (ch === '(') parens++;
+    else if (ch === ')') parens--;
+    else if (ch === '[') brackets++;
+    else if (ch === ']') brackets--;
+    if (braces < 0 || parens < 0 || brackets < 0) return false;
+  }
+  return braces === 0 && parens === 0 && brackets === 0;
+}
+
+function balancedCode(src: string): boolean {
+  const stack: string[] = [];
+  const pairs: Record<string, string> = { '}': '{', ')': '(', ']': '[' };
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '/' && src[i + 1] === '/') {
+      const nl = src.indexOf('\n', i);
+      if (nl < 0) break;
+      i = nl;
+      continue;
+    }
+    if (ch === '/' && src[i + 1] === '*') {
+      const end = src.indexOf('*/', i + 2);
+      if (end < 0) return false;
+      i = end + 1;
+      continue;
+    }
+    if (ch === '`') {
+      for (i++; i < src.length && src[i] !== '`'; i++) if (src[i] === '\\') i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const triple = src.slice(i, i + 3);
+      const quote = triple === "'''" || triple === '"""' ? triple : ch;
+      let j = i + quote.length;
+      for (; j < src.length; j++) {
+        if (src[j] === '\\') { j++; continue; }
+        if (src.startsWith(quote, j)) break;
+      }
+      i = j + quote.length - 1;
+      continue;
+    }
+    if (ch === '{' || ch === '(' || ch === '[') stack.push(ch);
+    else if (ch === '}' || ch === ')' || ch === ']') {
+      if (stack.pop() !== pairs[ch]) return false;
+    }
+  }
+  return stack.length === 0;
+}
