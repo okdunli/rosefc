@@ -1964,14 +1964,25 @@ function copyTemplate(dir: string, name: string, display: string): void {
   }
   fs.cpSync(src, dir, {
     recursive: true,
-    filter: (s) => !/(^|[\\/])(node_modules|dist|\.git)([\\/]|$)/.test(s),
+    // The filter must judge the path RELATIVE to the template root. An
+    // installed package lives under node_modules/, so a test on the absolute
+    // path rejects the template root itself and copies nothing - `rosezm new
+    // --template` then died with ENOENT on the first written file.
+    filter: (s) => {
+      const rel = path.relative(src, s);
+      return rel === '' || !/(^|[\\/])(node_modules|dist|\.git)([\\/]|$)/.test(rel);
+    },
   });
   const pkgFile = path.join(dir, 'package.json');
   if (fs.existsSync(pkgFile)) {
     const pkg = JSON.parse(fs.readFileSync(pkgFile, 'utf8'));
     pkg.name = path.basename(dir);
     if (pkg.dependencies?.rosezm) pkg.dependencies.rosezm = `^${version()}`;
-    pkg.devDependencies = { ...pkg.devDependencies, typescript: '^5.6.0' };
+    // `check` plus the node types are what makes a template type-check: the
+    // api routes import node:sqlite and read process.env, and a project
+    // without @types/node fails its own `rosezm check` on the first route.
+    pkg.scripts = { ...pkg.scripts, check: 'rosezm check' };
+    pkg.devDependencies = { ...pkg.devDependencies, '@types/node': '^22.0.0', typescript: '^5.6.0' };
     fs.writeFileSync(pkgFile, JSON.stringify(pkg, null, 2) + '\n');
   }
   writeTypeScriptReady(dir);
@@ -2044,7 +2055,7 @@ async function scaffold(): Promise<void> {
   function increment() { $setState('count', count() + 1); }
   function toggleList() { $setState('showList', !showList()); }
   
-  let first: Item = $data((): Item => ({ label: items()[0] ?? 'nothing yet' }));
+  let first = $data((): Item => ({ label: items()[0] ?? 'nothing yet' }));
 </script>
 
 <h1>🌹 rosezm</h1>
@@ -2164,6 +2175,13 @@ async function check(): Promise<void> {
       const abs = path.resolve(flatDir, spec);
       const cand = [abs, `${abs}.ts`, `${abs}.js`, `${abs}.mjs`, path.join(abs, 'index.ts'), path.join(abs, 'index.js')]
         .find((p) => fs.existsSync(p));
+      // The framework owns './runtime.js': the compiler writes that module
+      // into every build dir, so a script may import the runtime helpers from
+      // it. The checker resolves it to the runtime SOURCE, so the import is
+      // checked against the real signatures instead of a copy that can drift.
+      if (!cand && runtimeSource && /(?:^|\/)runtime\.js$/.test(spec)) {
+        return pre + norm(runtimeSource) + post;
+      }
       if (!cand) return mm; // unknown target: leave it, TS reports the honest error
       return pre + cand.replace(/\\/g, '/') + post;
     });
