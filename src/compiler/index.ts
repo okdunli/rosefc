@@ -13,16 +13,27 @@ import * as esbuild from 'esbuild';
 // the cache so the context never holds the service open and hangs process exit.
 const __esbuildCache = new Map<string, esbuild.BuildContext>();
 function runEsbuild(key: string, opts: esbuild.BuildOptions, incremental: boolean): Promise<esbuild.BuildResult> {
+  // Every bundle this build emits - the client's, the block server's, the
+  // split/sliced variants - gets the same public-env define table, so one
+  // `import.meta.env.rosezm_PUBLIC_*` literal means the same value on both
+  // halves (and Node, which has no import.meta.env, resolves it too).
+  // A dev context is keyed WITH the env fingerprint: vite-style, a changed
+  // value must rebuild, not replay the context built before the edit.
+  const env = publicEnvStamp();
+  const withEnv: esbuild.BuildOptions = { ...opts, define: { ...publicEnvDefine(), ...(opts.define ?? {}) } };
+  key += `|env:${env}`;
   // esbuild.context() cannot be used with code splitting (outdir+splitting); fall back to a plain one-shot build there.
-  if (!incremental || opts.splitting) return esbuild.build(opts);
+  if (!incremental || opts.splitting) return esbuild.build(withEnv);
   const ex = __esbuildCache.get(key);
   if (ex) return ex.rebuild().catch((e) => { __esbuildCache.delete(key); throw e; });
-  return esbuild.context(opts).then((c) => { __esbuildCache.set(key, c); return c.rebuild(); });
+  return esbuild.context(withEnv).then((c) => { __esbuildCache.set(key, c); return c.rebuild(); });
 }
 // The error contract every compiler failure speaks: a stable code, the file, the line when known.
 import { RoseError, lineOf, lineAt } from './errors.js';
+import { rewriteStateWrites, derivedWrite } from './state-writes.js';
 import { rmTreeParallel, sweepStaleBuildDirs } from './rm-fast.js';
 import { fnv1a32 } from '../hash.js';
+import { resolveBraceBlocks, resolveCommentBlocks } from '../platform-blocks.js';
 export { RoseError, lineOf, lineAt, errorInfo, codeFrame } from './errors.js';
 export type { RoseErrorInfo } from './errors.js';
 import type { PwaOptions } from '../pwa.js';
@@ -33,7 +44,14 @@ const TEMPLATE_RE = /<template>([\s\S]*?)<\/template>/;
 const HEAD_RE = /<head>([\s\S]*?)<\/head>/;
 // <style> block: component CSS, scoped by a build-time attribute on the component's top-level elements and inlined into the document (zero stylesheet).
 const STYLE_RE = /<style>([\s\S]*?)<\/style>/;
-const DECL_RE = /(?:let|const|var)\s+(\w+)[^=]*=\s*\$(state|data|kv|persist|derived)\b/g;
+// R256 (BUG.md AZ): the bridge was `[^=]*`, which crosses `}`, `;` and
+// newlines - `function f() { let t }` (ASI) made the NEXT top-level decl match
+// from `t` and misreport it as nested ("must be a top-level declaration"), and
+// `var label; // …` swallowed the decl on the next line, renaming it `label`
+// and deleting the original statement (the template then died on the old
+// name). Anchor at a statement boundary and keep the bridge inside one
+// statement: no `;`, `{`, `}`, `=` or newline between the name and `=`.
+const DECL_RE = /(?<=^|[;}{\n])[ \t]*(?:let|const|var)\s+(\w+)[^\n;{}=]*=\s*\$(state|data|kv|persist|derived)\b/g;
 const DECL_CAST_RE = /^\s+as\s+[^;\n]+/;
 const SETSTATE_RE = /\$setState\(([^,]+),\s*([^)]+)\)/g;
 const EVENT_RE = /on:(\w+)=\{([^}]+)\}/g;
@@ -51,6 +69,67 @@ function encodeSlotCall(attrs: string): string {
 const BOUNDARY_FALLBACK = '<p>This section failed to render.</p>';
 const HTTP_METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']);
 const TS_LOADER = { loader: { '.js': 'ts' as const } };
+
+// === Client-visible environment: the rosezm_PUBLIC_* convention ===
+// One prefix, one promise: a variable whose name STARTS with rosezm_PUBLIC_
+// is readable from a .rose <script> and from the template as
+// `import.meta.env.rosezm_PUBLIC_<SUFFIX>` - on the server and in the client
+// bundle alike. Everything else (DATABASE_URL, OPENAI_API_KEY, any name
+// without the prefix) is never exposed: the table below is built from the
+// prefixed names alone, and there is no wholesale process.env injection -
+// that omission IS the secret-leak guard.
+//
+// The values are inlined by esbuild's `define`, applied to every bundle this
+// build produces (the client's, the server's, the sliced and split variants),
+// so one literal works on both halves: `import.meta.env` does not exist on
+// Node, and an inlined client value must not be fetched at runtime.
+//
+// `define` is textual, so it needs no import, no polyfill and no config; a
+// computed read (`import.meta.env['rosezm_PUBLIC_FOO']`) still works because
+// the whole object is defined too - carrying the public names and nothing
+// else. The `.env` file itself is loaded by the CLI (src/cli/index.ts,
+// loadDotEnv) before a build runs; the compiler reads process.env, which is
+// also what a library caller or a test sets directly.
+const PUBLIC_ENV_PREFIX = 'rosezm_PUBLIC_';
+// A var name must be a valid JS identifier to be written as `import.meta.env.X`
+// in source; an OS env var may legally contain anything (`FOO-BAR`), so a
+// non-identifier name is exposed ONLY through the `import.meta.env['...']`
+// object form instead of producing a define key esbuild rejects.
+const PUBLIC_ENV_NAME_RE = /^[A-Za-z_$][\w$]*$/;
+const publicEnvEntries = (): Array<[string, string]> =>
+  Object.entries(process.env)
+    .filter((entry): entry is [string, string] => entry[0].startsWith(PUBLIC_ENV_PREFIX) && typeof entry[1] === 'string')
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+/** Fingerprint of the public env: part of an esbuild cache key, so a changed value rebuilds instead of reusing a dev context built with the old one. */
+const publicEnvStamp = (): string => __fnv1a(JSON.stringify(publicEnvEntries()));
+
+/**
+ * The esbuild `define` table: one entry per public var plus the object itself.
+ * Values are JSON with `<` escaped as the JSON escape `\u003c` - esbuild keeps
+ * the escape in its output, so a value containing `</script>` can never close
+ * the script tag that inlines this bundle into a document.
+ */
+function publicEnvDefine(): Record<string, string> {
+  const env = Object.fromEntries(publicEnvEntries());
+  const define: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (!PUBLIC_ENV_NAME_RE.test(k)) continue;
+    define[`import.meta.env.${k}`] = JSON.stringify(v).replace(/</g, '\\u003c');
+  }
+  define['import.meta.env'] = JSON.stringify(env).replace(/</g, '\\u003c');
+  return define;
+}
+
+/**
+ * The `import.meta.env.<name>` reads in generated code - used to warn about
+ * names the convention does not expose. A read of a non-public name is
+ * undefined on BOTH sides (the define table carries the public names only),
+ * which is the leak guard working: the build says which name, instead of
+ * shipping a page that works in dev and renders an empty string in production.
+ */
+function envReadsOf(code: string): string[] {
+  return [...code.matchAll(/\bimport\.meta\.env\.([A-Za-z_$][\w$]*)/g)].map((m) => m[1]);
+}
 
 export interface CompileResult {
   ssr: string;
@@ -163,6 +242,135 @@ interface Decl {
 }
 
 /**
+ * BUG.md BT: a name bound by a function parameter or by a local declaration
+ * SHADOWS the state of the same name. The rewrite below is a flat scan, so it
+ * callified the binding too: `function showLoading(title) { return title; }`
+ * became `function showLoading(title()) { return title(); }` and esbuild
+ * rejected the whole build.
+ *
+ * These ranges say where a shadow is in force: the [start, end) span of the
+ * source, and the names it binds. The scan consults them before it callifies.
+ * A shadow is scoped - the same name read OUTSIDE the function is still the
+ * signal.
+ */
+interface ShadowRange {
+  start: number;
+  end: number;
+  names: Set<string>;
+}
+
+/** The index of the bracket that closes the one at `open` (masked text). */
+function matchBracketMasked(masked: string, open: number): number {
+  const close = { '(': ')', '[': ']', '{': '}' }[masked[open]] ?? '';
+  if (!close) return -1;
+  let depth = 0;
+  for (let i = open; i < masked.length; i++) {
+    if (masked[i] === masked[open]) depth++;
+    else if (masked[i] === close) {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/** The index of the bracket that opens the one at `close` (masked text). */
+function matchBracketBackMasked(masked: string, close: number): number {
+  const open = { ')': '(', ']': '[', '}': '{' }[masked[close]] ?? '';
+  if (!open) return -1;
+  let depth = 0;
+  for (let i = close; i >= 0; i--) {
+    if (masked[i] === masked[close]) depth++;
+    else if (masked[i] === open) {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * The end of the expression that starts at `i` (masked text): the first
+ * depth-0 `,`/`;`, or the bracket that ends the enclosing group.
+ */
+function exprEndMasked(masked: string, i: number): number {
+  let depth = 0;
+  for (let j = i; j < masked.length; j++) {
+    const ch = masked[j];
+    if (ch === '(' || ch === '[' || ch === '{') { depth++; continue; }
+    if (ch === ')' || ch === ']' || ch === '}') {
+      if (depth === 0) return j;
+      depth--;
+      continue;
+    }
+    if (depth === 0 && (ch === ',' || ch === ';')) return j;
+  }
+  return masked.length;
+}
+
+/**
+ * Every scope in the script where a name is bound by something other than the
+ * module: a function parameter, a local declaration, an arrow parameter.
+ *
+ * The scan runs on the masked copy of the source (strings and comments
+ * blanked, same length), so an index here is an index in the original.
+ */
+function shadowRanges(script: string): ShadowRange[] {
+  const masked = maskCommentsAndStrings(script);
+  const out: ShadowRange[] = [];
+  const localsOf = (from: number, to: number): string[] => {
+    const names: string[] = [];
+    for (const d of masked.slice(from, to).matchAll(/\b(?:const|let|var|function|class)\s+([A-Za-z_$][\w$]*)/g)) names.push(d[1]);
+    return names;
+  };
+  // A function declaration/expression: `function name(params) { body }`.
+  for (const m of masked.matchAll(/\bfunction\b/g)) {
+    let i = m.index + m[0].length;
+    while (i < masked.length && /\s/.test(masked[i])) i++;
+    if (masked[i] === '*') i++;
+    while (i < masked.length && /[A-Za-z_$]/.test(masked[i])) i++;
+    while (i < masked.length && /\s/.test(masked[i])) i++;
+    if (masked[i] !== '(') continue;
+    const close = matchBracketMasked(masked, i);
+    if (close < 0) continue;
+    let j = close + 1;
+    while (j < masked.length && /\s/.test(masked[j])) j++;
+    if (masked[j] !== '{') continue;
+    const bodyEnd = matchBracketMasked(masked, j);
+    if (bodyEnd < 0) continue;
+    const names = new Set(bindingNames(script.slice(i + 1, close)));
+    for (const n of localsOf(j, bodyEnd)) names.add(n);
+    out.push({ start: i, end: bodyEnd + 1, names });
+  }
+  // An arrow function: `(a, b) => body` or `a => body`.
+  for (const m of masked.matchAll(/=>/g)) {
+    const arrow = m.index;
+    let p = arrow - 1;
+    while (p >= 0 && /\s/.test(masked[p])) p--;
+    let params = '';
+    let start = arrow;
+    if (masked[p] === ')') {
+      const open = matchBracketBackMasked(masked, p);
+      if (open < 0) continue;
+      params = script.slice(open + 1, p);
+      start = open;
+    } else if (/[A-Za-z_$]/.test(masked[p] ?? '')) {
+      let q = p;
+      while (q >= 0 && /[\w$]/.test(masked[q])) q--;
+      params = script.slice(q + 1, p + 1);
+      start = q + 1;
+    } else continue;
+    let j = arrow + 2;
+    while (j < masked.length && /\s/.test(masked[j])) j++;
+    const end = masked[j] === '{' ? matchBracketMasked(masked, j) + 1 : exprEndMasked(masked, j);
+    if (end <= 0) continue;
+    const names = new Set(bindingNames(params));
+    out.push({ start, end, names });
+  }
+  return out.sort((a, b) => a.start - b.start);
+}
+
+/**
  *
  * A regex cannot do this safely - it would rewrite state names inside string
  * This scanner copies those verbatim and only rewrites identifier positions,
@@ -180,7 +388,20 @@ interface Decl {
  */
 function callifyStateReads(script: string, names: string[], rename?: Record<string, string>): string {
   if (names.length === 0 && !rename) return script;
-  const scan = (src: string): string => {
+  // BUG.md BT: the scopes where a name is bound by a parameter or a local
+  // declaration shadow the state of the same name. The scan is flat, so
+  // without this the PARAMETER itself was callified and the build died in
+  // esbuild. `off` keeps the absolute position while the scanner recurses
+  // into a template literal's `${...}`.
+  const shadows = shadowRanges(script);
+  const shadowedAt = (abs: number, word: string): boolean => {
+    for (const r of shadows) {
+      if (r.start > abs) break;
+      if (abs < r.end && r.names.has(word)) return true;
+    }
+    return false;
+  };
+  const scan = (src: string, off = 0): string => {
     let out = '';
     let i = 0;
     while (i < src.length) {
@@ -213,7 +434,7 @@ function callifyStateReads(script: string, names: string[], rename?: Record<stri
               if (depth === 0) break;
               j++;
             }
-            out += '${' + scan(src.slice(i + 2, j)) + '}';
+            out += '${' + scan(src.slice(i + 2, j), off + i + 2) + '}';
             i = j + 1;
             continue;
           }
@@ -246,8 +467,14 @@ function callifyStateReads(script: string, names: string[], rename?: Record<stri
         const word = src.slice(i, j);
         const prev = out.length ? out[out.length - 1] : '';
         const next = src[j] ?? '';
+        // A `@` before the word marks a template directive (`{@html x}`,
+        // `{@debug x}`, `{@const x = 閳ヮ洠`), not a state read: the word after it is
+        // the directive's own argument and must be left alone. Without this,
+        // `{@html html()}` became `(@html() html())` - invalid JavaScript - and
+        // the raw-HTML path never ran at all.
+        const directive = prev === '@';
         const bare = !/[\w$.]/.test(prev) && !/[\w$:(]/.test(next);
-        const rewrite = bare && names.includes(word);
+        const rewrite = bare && !directive && names.includes(word) && !shadowedAt(off + i, word);
         const renamed = bare && rename != null && Object.prototype.hasOwnProperty.call(rename, word);
         out += rewrite ? `${word}()` : renamed ? `${rename[word]}()` : word;
         i = j;
@@ -280,7 +507,7 @@ function callifyStateReads(script: string, names: string[], rename?: Record<stri
  * makes {@const total = total() * 2} shadow instead of self-recurse.
  *
  * Block syntax is NOT skipped: the expanders that run after the state pass
- * (expandIfElse, expandAwaitBlocks, …) parse conditions straight out of this
+ * (expandIfElse, expandAwaitBlocks, 閳? parse conditions straight out of this
  * text, so a `{:else}` whose condition still reads `show` would compile to
  * `{#if !(show)}` - a dead branch, because autoCall only calls a BARE name.
  * Block spans therefore go through the same rewrite as any other span; the
@@ -509,7 +736,7 @@ function callifyTemplateExprs(
     const [en, er] = eff();
     if (constDecl) {
       // The declaration name is copied verbatim. Rewriting it is what used
-      // to shatter {@const total = total() * 2} into {@const total() = …},
+      // to shatter {@const total = total() * 2} into {@const total() = 閳ヮ洠,
       // which the const matcher then rejected - and the same hazard applies
       // to a rename pass walking a nested same-name declaration.
       const init = constDecl[2];
@@ -586,6 +813,17 @@ function scanExprEnd(src: string, open: number): number {
     if (ch === '`') {
       i = skipTemplate(src, i);
       continue;
+    }
+    // A regex literal inside the expression can contain quote chars:
+    // `x.replace(/[\\/:*?"<>|]/g, '-')` would open a phantom "string" here and
+    // swallow the rest of the file - maskCommentsAndStrings then blanks every
+    // $state declaration after it (render fails with "$state is not defined").
+    if (ch === '/') {
+      const lit = skipLiteral(src, i);
+      if (lit !== null) {
+        i = lit;
+        continue;
+      }
     }
     if (ch === '{') depth++;
     else if (ch === '}' && --depth === 0) return i;
@@ -888,7 +1126,11 @@ export interface StoreBridge {
 
 export interface Plugin {
   name: string;
-  transform?(code: string, filePath: string): string | Promise<string>;
+  /** Return `{ code, deps }` to declare the files this transform reads (a
+   *  compile-time `fs.readFileSync` of injected CSS, for instance): the memo
+   *  key folds each dep's mtime, so editing a dep recompiles the .rose that
+   *  pulled it in - BUG.md BB. A bare string return keeps the old contract. */
+  transform?(code: string, filePath: string): string | Promise<string> | { code: string; deps?: string[] } | Promise<{ code: string; deps?: string[] }>;
   /** Before routing and middleware. Return a Response to short-circuit (auth wall, rate limit, maintenance page). */
   onRequest?(ctx: RequestHookContext): Response | void | Promise<Response | void>;
   /** After the response exists, before it is sent. Return a Response to replace it. */
@@ -904,11 +1146,24 @@ export interface I18nConfig {
   preload?: string[];
 }
 
+export interface CspConfig {
+  /** Extra connect-src sources appended after 'self' (e.g. 'https:' or a host list) */
+  connectSrc?: string;
+  /** Extra img-src sources appended after the defaults (e.g. 'https://www.gravatar.com https:') */
+  imgSrc?: string;
+}
+
 export interface rosezmConfig {
   plugins: Plugin[];
   i18n: I18nConfig;
   pwa?: PwaOptions;
   brotli?: BrotliConfig;
+  csp?: CspConfig;
+  /** Files a plugin reads at compile time (injected CSS, font maps...). Their
+   *  mtimes join the compile memo key, so editing one recompiles the .rose
+   *  files whose compiled output depends on it - BUG.md BB. Glob-less: list
+   *  exact paths (a plugin can compute them). */
+  watch?: string[];
 }
 
 /**
@@ -932,6 +1187,8 @@ export async function loadConfig(root: string): Promise<rosezmConfig> {
     i18n: (mod.i18n as I18nConfig | undefined) ?? {},
     pwa: (mod.pwa as PwaOptions | undefined) ?? undefined,
     brotli: (mod.brotli as BrotliConfig | undefined) ?? undefined,
+    csp: (mod.csp as CspConfig | undefined) ?? undefined,
+    watch: (mod.watch as string[] | undefined) ?? undefined,
   };
 }
 
@@ -1025,6 +1282,56 @@ function nodeOnlyImports(importStmts: string): string[] {
 }
 
 /**
+ * R259 (BUG.md BE suggestion 1): one `{#each}` body's text range plus the
+ * names it binds - the pair the inline-handler decision needs. A handler may
+ * be inlined only when the INNERMOST {#each} containing it declares the
+ * iteration variable it reads: that is exactly where compileTemplate's item
+ * rename (`it` -> `__s`) rewrites the read, and where `__s` still means that
+ * block's item. Same scanners the compile loop uses (findBlockFrom +
+ * blockOpenerEnd), so the decision and the emitted code cannot disagree.
+ */
+interface EachBody {
+  names: Set<string>;
+  contentStart: number;
+  contentEnd: number;
+}
+
+function eachBodiesOf(src: string): EachBody[] {
+  const out: EachBody[] = [];
+  for (let from = 0; ; ) {
+    const m = findBlockFrom(src, 'each', from);
+    if (!m) break;
+    from = m.index + 1;
+    const openEnd = blockOpenerEnd(src, m.index);
+    const content = m[5];
+    if (openEnd < 0 || content == null) continue;
+    out.push({
+      names: new Set<string>([...bindingNames(m[2] ?? ''), ...(m[3] ? [m[3]] : [])]),
+      contentStart: openEnd,
+      contentEnd: openEnd + content.length,
+    });
+  }
+  return out;
+}
+
+/**
+ * R259: whether a scope-breaking block sits between the each body's start and
+ * the handler. {#snippet} re-binds `__s` to its own parameter, and {#key} and
+ * {#await} expand into a NESTED {#each} - under any of them the read would
+ * capture a different `__s` than the item the handler names, so the handler
+ * cannot be inlined there and keeps the loud refusal. {#if}/{#boundary}/
+ * {#island}/{#defer} pass the enclosing scope through and stay transparent.
+ */
+function insideScopeBreak(src: string, from: number, to: number): boolean {
+  let net = 0;
+  for (const m of src.slice(from, to).matchAll(/\{#(?:snippet|key|await)\b|\{\/(?:snippet|key|await)\s*\}/g)) {
+    net += m[0][1] === '/' ? -1 : 1;
+    if (net > 0) return true;
+  }
+  return false;
+}
+
+/**
  * the client module needs. One pass, two outputs, so the attribute and the
  * registry can never disagree.
  *
@@ -1034,13 +1341,19 @@ function nodeOnlyImports(importStmts: string): string[] {
  * and never reaches the client registry (the body is server-only). An inline
  * the rest of the page uses.
  */
-function wireEventBindings(template: string, actionNames: Set<string>, filePath = '<template>'): {
+function wireEventBindings(template: string, actionNames: Set<string>, filePath = '<template>', moduleId = ''): {
   template: string;
   bindings: Array<{ event: string; fn: string }>;
+  /** R259: handlers inlined into their {#each} render closure instead of the module registry */
+  inlineCount: number;
 } {
   const bindings: Array<{ event: string; fn: string }> = [];
+  let inlineCount = 0;
+  // R259: the template's {#each} body ranges, scanned at most once per template.
+  let bodies: EachBody[] | null = null;
   let out = '';
   let rest = template;
+  let consumed = 0;
   const TARGET_MODS: Record<string, string> = { window: 'w', document: 'd' };
   const MOD_PRE: Record<string, (p: string) => string> = {
     preventDefault: () => 'e.preventDefault()',
@@ -1057,6 +1370,8 @@ function wireEventBindings(template: string, actionNames: Set<string>, filePath 
       out += rest;
       break;
     }
+    // R259: whether THIS handler inlines into its {#each} render closure.
+    let inlineEach = false;
     const mods = m[2] ? m[2].slice(1).split('|') : [];
     const targets = mods.filter((mod) => TARGET_MODS[mod]);
     if (targets.length > 1) {
@@ -1097,6 +1412,50 @@ function wireEventBindings(template: string, actionNames: Set<string>, filePath 
       i++;
     }
     const expr = rest.slice(m.index + m[0].length, i).trim();
+    // BUG.md BE: an inline handler is hoisted to the page module, where the
+    // {#each} iteration variables do not exist - `on:click={() =>
+    // pickTab(t.key)}` inside a block compiled to a module-scope arrow over a
+    // dead `t`, and the click threw a swallowed ReferenceError (a button that
+    // silently does nothing). A named handler exists at module scope, and a
+    // body reading no block variable is safe to hoist.
+    //
+    // R259 (BE suggestion 1): the arrow that reads an iteration variable is
+    // NOT hoisted. It stays in the template as an attribute expression, so
+    // compileTemplate emits it inside the {#each} render closure, where the
+    // item rename already rewrote `it` to `__s` and the closure captures the
+    // row's item - the closure is created per row, at render time, by
+    // `__rhreg`. This is only done when the position analysis can PROVE the
+    // handler sits in that closure (innermost {#each} declares the variable,
+    // no scope-breaking block between); anything else keeps the loud refusal
+    // below - a silently dead handler is the failure this guard exists to stop.
+    const eachVars = new Set<string>();
+    for (const mEach of template.matchAll(/\{#each\s+[\s\S]+?\s+as\s+([A-Za-z_$][\w$]*)\s*(?:,\s*([A-Za-z_$][\w$]*))?/g)) {
+      eachVars.add(mEach[1]);
+      if (mEach[2]) eachVars.add(mEach[2]);
+    }
+    if (/=>/.test(expr) && !/^\w+$/.test(expr)) {
+      const readVars = [...eachVars].filter((v) => new RegExp(`\\b${v}\\b`).test(expr));
+      if (readVars.length > 0) {
+        const pos = consumed + m.index;
+        const inner = (bodies ??= eachBodiesOf(template))
+          .filter((b) => pos >= b.contentStart && pos < b.contentEnd)
+          .sort((a, b) => a.contentStart - b.contentStart)
+          .pop() ?? null;
+        const safe = inner != null
+          && !insideScopeBreak(template, inner.contentStart, pos)
+          && readVars.every((v) => inner.names.has(v));
+        if (safe) {
+          inlineEach = true;
+        } else {
+          const badVar = readVars.find((v) => !inner || !inner.names.has(v)) ?? readVars[0];
+          throw new RoseError(
+            'E-TEMPLATE',
+            `${filePath}: this inline handler reads the {#each} variable "${badVar}" but is hoisted to the page module, where it does not exist`,
+            { file: filePath, line: lineOf(template, consumed + m.index), hint: `name the handler in the script block (function onX(e) { ... }) and write on:${m[1]}={onX} - the named form closes over nothing and works for every item` },
+          );
+        }
+      }
+    }
     const wrap = (body: string): string => {
       if (!mods.length) return body;
       const pre = mods.filter((mod) => MOD_PRE[mod]).map((mod) => MOD_PRE[mod](prefix));
@@ -1110,8 +1469,21 @@ function wireEventBindings(template: string, actionNames: Set<string>, filePath 
         { hint: '$action already preventDefaults - drop the modifiers, or bind a local handler that calls $action' },
       );
     }
-    if (mods.length) {
-      const name = `__h${bindings.length}`;
+    if (inlineEach) {
+      // R259 (BUG.md BE suggestion 1): the handler stays an attribute
+      // EXPRESSION, so compileTemplate emits it inside the {#each} render
+      // closure - `it` is already `__s` there and `__rhreg` stores the
+      // row-scoped closure under a fresh key, returning it as the attribute
+      // value the click dispatch looks up. Nothing joins the module registry.
+      const keyPrefix = moduleId ? `__rh_${moduleId}_` : '__rh_';
+      out += `data-${prefix}-${m[1]}={__rhreg(${JSON.stringify(keyPrefix)}, ${mods.length ? wrap(expr) : expr})}`;
+      inlineCount++;
+    } else if (mods.length) {
+      // BUG.md BE (second half): `__h0/__h1/...` were module-locally unique but
+      // globally colliding - two pages both declaring an inline handler
+      // registered the same key, and the page imported LAST won for both. The
+      // page path (module id) namespaces the key.
+      const name = moduleId ? `__h_${moduleId}_${bindings.length}` : `__h${bindings.length}`;
       out += `data-${prefix}-${m[1]}="${name}"`;
       bindings.push({ event: m[1], fn: `${name}: ${wrap(expr)}` });
     } else if (actionNames.has(expr)) {
@@ -1120,13 +1492,15 @@ function wireEventBindings(template: string, actionNames: Set<string>, filePath 
       out += `data-on-${m[1]}="${expr}"`;
       bindings.push({ event: m[1], fn: expr });
     } else {
-      const name = `__h${bindings.length}`;
+      // Same namespacing as the modifier branch above.
+      const name = moduleId ? `__h_${moduleId}_${bindings.length}` : `__h${bindings.length}`;
       out += `data-on-${m[1]}="${name}"`;
       bindings.push({ event: m[1], fn: `${name}: ${expr}` });
     }
+    consumed += i + 1;
     rest = rest.slice(i + 1);
   }
-  return { template: out, bindings };
+  return { template: out, bindings, inlineCount };
 }
 
 /**
@@ -1198,6 +1572,15 @@ function hoistImports(script: string): { imports: string; rest: string } {
 }
 
 const __compileMemo = new Map<string, CompileResult>();
+// BUG.md BB: per-.rose deps a plugin's transform declared, and the app-level
+// watch list from rosezm.config.js - both fold into the memo key.
+const __pluginDeps = new Map<string, Set<string>>();
+function __pluginDepsFor(filePath: string): Set<string> {
+  let s = __pluginDeps.get(filePath);
+  if (!s) { s = new Set<string>(); __pluginDeps.set(filePath, s); }
+  return s;
+}
+let __watchList: string[] = [];
 const __memoCap = 2000;
 const __regKeyCache = new WeakMap<RoseRegistry, string>();
 const __pluginFpCache = new WeakMap<Plugin[], string>();
@@ -1239,7 +1622,20 @@ function compileMemoKey(
 ): string | null {
   let st: fs.Stats;
   try { st = fs.statSync(filePath); } catch { return null; }
-  return [filePath, String(st.mtimeMs), String(st.size), scopeKey, isApi ? '1' : '0', registryKey(registry), pluginFingerprint(plugins)].join('\u0000');
+  const parts = [filePath, String(st.mtimeMs), String(st.size), scopeKey, isApi ? '1' : '0', registryKey(registry), pluginFingerprint(plugins)];
+  // BUG.md BB: files a plugin injected at compile time are part of the
+  // compiled result - fold each dep's mtime into the key so editing a dep
+  // (a font URL inside an injected CSS file) recompiles the .rose that pulled
+  // it in, instead of serving stale CSS until the source is touched.
+  const deps = __pluginDepsFor(filePath);
+  for (const dep of deps) {
+    try { parts.push(`${dep}\u0001${String(fs.statSync(dep).mtimeMs)}`); } catch { parts.push(`${dep}\u0001gone`); }
+  }
+  // The config's watch list participates the same way (the declarative path).
+  for (const w of __watchList) {
+    try { parts.push(`watch:${w}\u0001${String(fs.statSync(w).mtimeMs)}`); } catch { /* no such watch file */ }
+  }
+  return parts.join('\u0000');
 }
 const __compilerStamp = (() => {
   try { return String(fs.statSync(fileURLToPath(import.meta.url)).mtimeMs); } catch { return 'noid'; }
@@ -1370,7 +1766,12 @@ export async function compileComponent(filePath: string, publicDir: string, scop
   for (const p of plugins) {
     if (!p.transform) continue;
     try {
-      source = await p.transform(source, filePath);
+      const out = await p.transform(source, filePath);
+      if (typeof out === 'string') source = out;
+      else {
+        source = out.code;
+        for (const dep of out.deps ?? []) __pluginDepsFor(filePath).add(dep);
+      }
     } catch (err) {
       throw new RoseError(
         'E-PLUGIN',
@@ -1380,14 +1781,37 @@ export async function compileComponent(filePath: string, publicDir: string, scop
     }
   }
 
+  // R237: the comment form (`// #ifdef target` ... `// #endif`) reaches the parts
+  // a template block cannot: `<script>` and `<style>`. Applied to the whole file
+  // before any block is split, so the plugin transform above still sees it whole.
+  source = resolveCommentBlocks(source, 'web');
+
   if (isApi) {
     const scriptMatch = source.match(COMPONENT_RE);
     const rawScript = scriptMatch?.[1] ?? '';
-    const apiMethods = [...rawScript.matchAll(/(?:^|\n)\s*export\s+(?:async\s+)?function\s+(\w+)\s*\(/g)]
-      .map((m) => m[1])
-      .filter((name) => HTTP_METHODS.has(name));
-    const usesContext = /getContext\s*\(/.test(rawScript);
+    // Both handler shapes: a declaration (`export function GET(`) and the
+    // equally idiomatic const binding of a function expression
+    // (`export const GET = async (req) => ...`). Only the first used to be
+    // detected, so the second compiled to handlers: {} - a route whose every
+    // method answered 405 with an empty Allow header, and no build-time word
+    // about it. The const form is matched only when the initializer IS a
+    // function (arrow or `function`), never for an arbitrary exported const.
+    const apiMethods = [...new Set([
+      ...[...rawScript.matchAll(/(?:^|\n)\s*export\s+(?:async\s+)?function\s+(\w+)\s*\(/g)].map((m) => m[1]),
+      ...[...rawScript.matchAll(/(?:^|\n)\s*export\s+(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?(?:function\b|(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>)/g)].map((m) => m[1]),
+    ])].filter((name) => HTTP_METHODS.has(name));
+    // What makes an api route un-bakeable is the same rule pages use: reading
+    // request state. It used to test getContext() alone, so an api route that
+    // read $query() (or wrote $store()) and carried `prerender = true` was
+    // baked at build time - the file answered the BUILD's query and a frozen
+    // store snapshot to every visitor, and the Go binary (which serves only
+    // the baked bytes) had no way to be right.
+    const usesContext = /getContext\s*\(/.test(rawScript) || /\$store\s*\(/.test(rawScript) || /\$query\s*\(/.test(rawScript);
     const usesStore = /\$store\s*\(/.test(rawScript);
+    // The auth helpers live in the server entry: an API route that references
+    // globalThis.__rosezmAuth must raise the same flag a page does, or the
+    // helpers are never emitted and every auth call dies on undefined.
+    const usesrosezmAuth = rawScript.includes('__rosezmAuth');
     const hasPrerender = !usesContext && /(?:^|\n)\s*export\s+(?:const|let|var)\s+prerender\s*=\s*true\b/.test(rawScript);
     const hoisted = hoistImports(resolveRoseImports(rawScript, filePath, registry).script);
     const ownRuntimeImports = new Set(
@@ -1409,6 +1833,7 @@ export async function compileComponent(filePath: string, publicDir: string, scop
       hasPrerender,
       usesContext,
       usesStore,
+      usesrosezmAuth,
       hotVary: parseHotVary(rawScript, filePath),
     };
   }
@@ -1417,7 +1842,14 @@ export async function compileComponent(filePath: string, publicDir: string, scop
   const sourceNoScript = source.replace(COMPONENT_RE, '');
   const sourceNoHead = sourceNoScript.replace(HEAD_RE, '');
   const styleMatch = sourceNoHead.match(STYLE_RE);
-  const scopedStyle = styleMatch?.[1] ? scopeCss(styleMatch[1], scopeKey) : '';
+  // R294 (BUG.md BW): a LAYOUT's <style> is the app's global design system -
+  // CSS variables, the icon mask classes, the base component classes. It must
+  // stay UNsсoped: a layout template is typically just `<slot />` (no top-level
+  // element to carry data-rosezm-c), so every scoped rule would match nothing
+  // and the whole stylesheet would die silently. Pages and components keep
+  // their scoping exactly as before.
+  const isLayoutScope = scopeKey === '_layout' || scopeKey.endsWith('/_layout');
+  const scopedStyle = styleMatch?.[1] ? (isLayoutScope ? rpxToPx(styleMatch[1]) : scopeCss(styleMatch[1], scopeKey)) : '';
   const sourceNoBlocks = sourceNoHead.replace(STYLE_RE, '');
 
   const scriptMatch = source.match(COMPONENT_RE);
@@ -1622,6 +2054,68 @@ export async function compileComponent(filePath: string, publicDir: string, scop
 
   const setterNames = new Map<string, string>();
   stateDecls.forEach((s) => setterNames.set(s.name, `set${capitalize(s.name)}`));
+  // BUG.md AT: the automatic setter's name is the user's namespace - a page
+  // with `let sort = $state('default')` and `function setSort(e)` compiled
+  // both `const [sort, setSort] = state(...)` and the function, and esbuild
+  // refused the generated file with "already been declared" pointing at the
+  // intermediate artifact, never at the .rose line. The build now names the
+  // collision and the escape hatch ($setState always works).
+  {
+    const maskedScript = maskCommentsAndStrings(rawScript);
+    const userNames = new Set<string>();
+    for (const m2 of maskedScript.matchAll(/(?:^|\n)\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/g)) userNames.add(m2[1]);
+    for (const m2 of maskedScript.matchAll(/(?:^|\n)\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)/g)) userNames.add(m2[1]);
+    for (const s of stateDecls) {
+      const setter = setterNames.get(s.name)!;
+      if (userNames.has(setter)) {
+        throw new RoseError(
+          'E-SCRIPT',
+          `${filePath}: the automatic setter "${setter}" for $state("${s.name}") collides with a same-named declaration in the script`,
+          { file: filePath, hint: `rename your function, or drop the auto setter and write $setState("${s.name}", v) - the explicit form never collides` },
+        );
+      }
+    }
+  }
+
+  // Emission order for the state/derived declarations: a declaration whose
+  // initializer reads another declared name must follow it, or the read happens
+  // before the `const` exists (a temporal-dead-zone ReferenceError). Only names
+  // that are themselves declarations count as edges - a call to a real function
+  // (`Math.max`, a helper) is not an ordering constraint.
+  //
+  // `orderedDecls` is the declaration indices in dependency order; the
+  // placeholders appear in source order, so the k-th placeholder takes the k-th
+  // entry of this list.
+  const orderedDecls = (() => {
+    // `d` is re-widened to Decl here (the map produces a fresh object), so the
+    // kind check is written against the full union rather than whatever the
+    // earlier stateDecls filter narrowed it to.
+    const ALL: ReadonlyArray<string> = ['state', 'derived', 'kv', 'persist'];
+    const stateLike = decls
+      .map((d, i) => ({ d, i }))
+      .filter(({ d }) => ALL.includes(d.kind as string)) as Array<{ d: (typeof decls)[number]; i: number }>;
+    const names = new Set(stateLike.map(({ d }) => d.name));
+    const ordered: number[] = [];
+    const emitted = new Set<string>();
+    // Repeat until stable: each pass appends every declaration whose
+    // dependencies are already emitted. O(n^2) in the worst case, but n is the
+    // number of state fields in one component, and a cyclic or unreadable
+    // dependency keeps its source position instead of failing the build.
+    for (let guard = 0; guard <= stateLike.length; guard++) {
+      let moved = false;
+      for (const { d, i } of stateLike) {
+        if (emitted.has(d.name)) continue;
+        const deps = [...new Set([...d.expr.matchAll(/\b([A-Za-z_$][\w$]*)\b/g)].map((m) => m[1]))].filter((n) => names.has(n) && n !== d.name);
+        if (deps.every((n) => emitted.has(n))) {
+          ordered.push(i);
+          emitted.add(d.name);
+          moved = true;
+        }
+      }
+      if (!moved) break;
+    }
+    return ordered;
+  })();
 
   const declCode = (d: (typeof decls)[number]): string => {
     const key = isComponent ? `${scopeKey}:${d.name}` : d.name;
@@ -1667,7 +2161,25 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
   });
   spliced += script.slice(pos);
 
-  let cleanScript = spliced.replace(SETSTATE_RE, (_, key, val) => {
+  // R200: mutation sugar. A `$state` reads like a value, so users write it like
+  // one - `count++`, `n += 2`, `show = !show` - and until now only the long form
+  // `$setState('count', ...)` was understood: the sugar became `count()++` here
+  // (a TypeError on click) and an assignment to an undeclared name in a native
+  // export. Normalizing to the canonical write at this single point means every
+  // target that reads `$setState` keeps working unchanged.
+  const writableNames = new Set(stateDecls.map((d) => d.name));
+  const isWritable = (name: string): boolean => writableNames.has(name);
+  const wroteDerived = derivedWrite(script);
+  if (wroteDerived) {
+    throw new RoseError(
+      'E-STATE',
+      `${filePath}: ${wroteDerived} is a $derived value and is written here - a $derived is read-only`,
+      { hint: `make ${wroteDerived} a $state, or derive a different name from it` },
+    );
+  }
+  const sugared = rewriteStateWrites(spliced, isWritable);
+
+  let cleanScript = sugared.replace(SETSTATE_RE, (_, key, val) => {
     const trimmedKey = key.trim().replace(/^['"`]|['"`]$/g, '');
     if (derivedNames.includes(trimmedKey)) {
       throw new Error(
@@ -1678,33 +2190,93 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
     return `${setter}(${val})`;
   });
   cleanScript = callifyStateReads(cleanScript, callifyNames);
-  cleanScript = cleanScript.replace(/'__rvdecl(\d+)__';/g, (_m, i) => declCode(decls[Number(i)]));
+  // The k-th placeholder in source order takes the k-th entry of orderedDecls,
+  // so a declaration whose initializer reads another state is emitted after it.
+  // The reorder only applies when the placeholder count matches the ordered set
+  // exactly: a $data declaration also produces a placeholder, and guessing a
+  // mapping would emit one declaration twice (a duplicate `const`).
+  {
+    const marks = [...cleanScript.matchAll(/'__rvdecl(\d+)__';/g)];
+    if (marks.length === orderedDecls.length) {
+      let slot = 0;
+      cleanScript = cleanScript.replace(/'__rvdecl(\d+)__';/g, (_m, i) => declCode(decls[orderedDecls[slot++] ?? Number(i)]));
+    } else {
+      cleanScript = cleanScript.replace(/'__rvdecl(\d+)__';/g, (_m, i) => declCode(decls[Number(i)]));
+    }
+  }
 
   const stateDeclsCode = nestedDecls.filter((d) => d.kind === 'state').map(declCode).join('\n');
   const dataDeclsCode = nestedDecls.filter((d) => d.kind === 'data').map(declCode).join('\n');
 
-  const templateCalled = callifyTemplateExprs(template, callifyNames);
+  // The same sugar inside the template: an inline handler is source text here
+  // (`on:click={() => count++}`), and it is callified below, so it has to be
+  // normalized first - otherwise the fold never sees it and the read becomes
+  // `count()++`, which is a runtime error rather than a write.
+  const templateCalled = callifyTemplateExprs(rewriteStateWrites(template, isWritable), callifyNames);
   const imgDefaulted = templateCalled
     .replace(/<img\b(?![^>]*?\sloading=)/gi, '<img loading="lazy"')
     .replace(/<img\b(?![^>]*?\sdecoding=)/gi, '<img decoding="async"')
-  const wired = wireEventBindings(imgDefaulted, actionNames, filePath);
+  // BUG.md BE: the page path namespaces the handler key, so two pages'
+  // inline handlers can no longer overwrite each other in the global
+  // registry (the last page imported used to win for both).
+  const moduleId = filePath.replace(/[^\w]/g, '_').replace(/^_+|_+$/g, '').slice(-40);
+  const wired = wireEventBindings(imgDefaulted, actionNames, filePath, moduleId);
+  // R259: a handler inlined into its {#each} render closure needs `__rhreg`
+  // (and $setState, for a state-write body) in the render scope of BOTH halves.
+  const inlineEachCount = wired.inlineCount;
 
   const stateKeys = decls.filter((d) => d.kind !== 'derived').map((d) => d.name);
 
   const bindBindings: Array<{ event: string; fn: string }> = [];
   let bindCounter = 0;
+  const compNames = new Set(roseImports.map((r) => r.name));
+  const propKeys = new Set(props.map((p) => p.name));
   const bindExpanded = wired.template.replace(
     /\sbind:(value|checked|this|open)\s*=\s*\{([\w$]+)(?:\(\))?\}/g,
     (whole, kind: string, name: string, offset: number, str: string) => {
-      if (!stateKeys.includes(name)) {
+      const tagStart = str.lastIndexOf('<', offset);
+      const tagText = tagStart >= 0 ? str.slice(tagStart, offset) : '';
+      const tagName = /^<([a-zA-Z][^\s/>]*)/.exec(tagText)?.[1] ?? '';
+      if (!stateKeys.includes(name) && !propKeys.has(name)) {
         throw new Error(
           `${filePath}: bind:${kind}={${name}} must name a $state declaration` +
             (stateKeys.length ? ` (state keys here: ${stateKeys.join(', ')})` : ' (this file declares no $state)'),
         );
       }
       if (kind === 'this') return ` data-bind-this="${name}"`;
-      const tagStart = str.lastIndexOf('<', offset);
-      const tagText = tagStart >= 0 ? str.slice(tagStart, offset) : '';
+      // A component's OWN prop (this file is the component): the edit reports
+      // out through the same on<Prop>Change callback the export targets use.
+      if (!stateKeys.includes(name)) {
+        const cb = 'on' + capitalize(kind) + 'Change';
+        const hnameC = `__rvbind_${scopeKey.replace(/\W/g, '_')}_${bindCounter++}`;
+        if (/^<select[\s>]/i.test(tagText) && /\smultiple\b/i.test(tagText)) {
+          bindBindings.push({ event: 'change', fn: `${hnameC}: (e) => __p.${cb}?.(Array.from(e.target.selectedOptions, (o) => o.value))` });
+          return ` data-selmulti={(__rvlive('value', ${name}) || []).join(',')} data-on-change="${hnameC}"`;
+        }
+        if (kind === 'checked') {
+          bindBindings.push({ event: 'change', fn: `${hnameC}: (e) => __p.${cb}?.(e.target.checked)` });
+          return ` checked={__rvlive('checked', ${name})} data-on-change="${hnameC}"`;
+        }
+        if (kind === 'open') {
+          bindBindings.push({ event: 'toggle', fn: `${hnameC}: (e) => __p.${cb}?.(e.target.open)` });
+          return ` open={__rvlive('open', ${name})} data-on-toggle="${hnameC}"`;
+        }
+        bindBindings.push({ event: 'input', fn: `${hnameC}: (e) => { const t = e.target; const raw = t.type === 'number' || t.type === 'range' ? t.valueAsNumber : t.value; __p.${cb}?.(typeof raw === 'number' && Number.isNaN(raw) ? null : raw); }` });
+        return ` value={__rvlive('value', ${name})} data-on-input="${hnameC}" data-on-change="${hnameC}"`;
+      }
+      // A component CALL SITE: the value rides in as the prop, the edit rides
+      // out through the callback - one inline closure per call site, so two
+      // instances never share a handler.
+      if (tagName && compNames.has(tagName)) {
+        const setterC = setterNames.get(name)!;
+        const cbC = 'on' + capitalize(kind) + 'Change';
+        // The setter IS the callback (arity matches) - and a bare identifier
+        // keeps the attr free of `>` so the tag scanner still sees the rest
+        // of the tag (an arrow's `>` would end the tag early). The __live-
+        // twin passes the state GETTER itself so the child's markers re-run
+        // on parent state changes (the plain prop is a mount-time snapshot).
+        return ` ${kind}={${name}()} __live-${kind}={${name}} ${cbC}={${setterC}}`;
+      }
       if (kind === 'value' && /^<select[\s>]/i.test(tagText) && /\smultiple\b/i.test(tagText)) {
         const setterM = setterNames.get(name)!;
         const hnameM = `__rvbind_${scopeKey.replace(/\W/g, '_')}_${bindCounter++}`;
@@ -1744,24 +2316,62 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
   }));
   const groupBindings: Array<{ event: string; fn: string }> = [];
   let groupCounter = 0;
-  const TAG_SCAN_RE = /<([a-zA-Z][^\s>/]*)((?:[^>"']|"[^"]*"|'[^']*')*?)(\/?)>/g;
+  // A component's input rendering a PLAIN `value={prop}` is two-way too - the
+  // same contract the export targets infer with inputBoundProps (the canonical
+  // `<input value={value}>` component). Skips inputs the bind: expansion or a
+  // manual on:input already wired: one owner per input, never two.
+  // R256 (BUG.md BZ): both passes below match tags with the brace-aware
+  // scanRoseTag - a quote-aware-only regex cut attrs at a `>` inside
+  // `value={cond ? a : b}` / any `{...}` expression on the tag.
+  const compValueExpanded = (() => {
+    if (!propKeys.size || !/<(input|textarea|select)[\s>]/i.test(bindExpanded)) return bindExpanded;
+    return mapTemplateTags(bindExpanded, (t) => {
+      const { tag, attrs } = t;
+      if (!/^(input|textarea|select)$/i.test(tag)) return null;
+      if (/\sdata-on-input=|\sdata-selmulti=/.test(attrs)) return null;
+      const vm = /\svalue\s*=\s*\{([\w$]+)\}/.exec(attrs);
+      if (!vm || !propKeys.has(vm[1])) return null;
+      const prop = vm[1];
+      const hnameV = `__rvbind_${scopeKey.replace(/\W/g, '_')}_${bindCounter++}`;
+      bindBindings.push({
+        event: 'input',
+        fn: `${hnameV}: (e) => { const t = e.target; const raw = t.type === 'number' || t.type === 'range' ? t.valueAsNumber : t.value; __p.onValueChange?.(typeof raw === 'number' && Number.isNaN(raw) ? null : raw); }`,
+      });
+      const multi = /^select$/i.test(tag) && /\smultiple\b/i.test(attrs);
+      // Read through __rvlive so a __live-value twin prop (from a bind:
+      // call site) keeps the input in sync after mount; a plain prop falls
+      // back to the snapshot exactly as before.
+      const liveAttrs = attrs.replace(vm[0], ` value={__rvlive('value', ${prop})}`);
+      const extra = multi
+        ? ` data-selmulti={(__rvlive('value', ${prop}) || []).join(',')} data-on-change="${hnameV}"`
+        : ` data-on-input="${hnameV}" data-on-change="${hnameV}"`;
+      return liveAttrs + extra;
+    });
+  })();
   const groupExpanded = (() => {
-    if (!bindExpanded.includes('bind:group')) return bindExpanded;
-    let out = '';
-    let pos = 0;
-    let m: RegExpExecArray | null;
-    TAG_SCAN_RE.lastIndex = 0;
-    while ((m = TAG_SCAN_RE.exec(bindExpanded))) {
-      const [whole, tag, attrs, selfClose] = m;
+    if (!compValueExpanded.includes('bind:group')) return compValueExpanded;
+    return mapTemplateTags(compValueExpanded, (t) => {
+      const { tag, attrs } = t;
       const gm = /\sbind:group\s*=\s*\{([\w$]+)(?:\(\))?\}/.exec(attrs);
-      if (!gm) continue;
+      if (!gm) return null;
       const name = gm[1];
-      if (!stateKeys.includes(name)) {
+      const isPropG = !stateKeys.includes(name);
+      if (isPropG && !propKeys.has(name)) {
         throw new RoseError(
           'E-TEMPLATE',
           `${filePath}: bind:group={${name}} must name a $state declaration`,
           { hint: 'the group state holds the selected value (radio) or an ARRAY of checked values (checkbox) - declare it: let ' + name + ' = $state("")' },
         );
+      }
+      // A component call site: the group VALUE rides in as the `group` prop,
+      // the selection reports out through onGroupChange.
+      if (!isPropG && compNames.has(tag)) {
+        const setterG = setterNames.get(name)!;
+        // Bare setter reference: arity matches the callback, and no `>` for
+        // the tag scanner to mistake for the end of the tag. The __live-
+        // twin passes the state GETTER so the child's checked expressions
+        // re-run when the parent's group state changes.
+        return attrs.replace(gm[0], ` group={${name}()} __live-group={${name}} onGroupChange={${setterG}}`);
       }
       if (!/\stype\s*=\s*["'](radio|checkbox)["']/.test(attrs)) {
         throw new RoseError(
@@ -1786,23 +2396,24 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
           { hint: 'the group state alone decides which inputs are checked' },
         );
       }
-      const setter = setterNames.get(name)!;
+      const setter = isPropG ? '' : setterNames.get(name)!;
       const hname = `__rvbg_${scopeKey.replace(/\W/g, '_')}_${groupCounter++}`;
       const groupValue = JSON.stringify(vm[1] ?? vm[2]);
+      // A prop-sourced group reads through __rvlive: a __live-group twin
+      // (from a bind: call site) keeps checked markers and the handler's
+      // array merge on the CURRENT value, not the mount-time snapshot.
+      const gRead = isPropG ? `__rvlive('group', ${name})` : `${name}()`;
       const checkedExpr = isArrayGroup
-        ? `${name}().includes(${groupValue})`
-        : `${name}() === ${groupValue}`;
+        ? `${gRead}.includes(${groupValue})`
+        : `${gRead} === ${groupValue}`;
       const handlerBody = isArrayGroup
-        ? `${setter}(e.target.checked ? [...${name}(), ${groupValue}] : ${name}().filter((x) => x !== ${groupValue}))`
-        : `${setter}(e.target.value)`;
+        ? (isPropG
+            ? `__p.onGroupChange?.(e.target.checked ? [...${gRead}, ${groupValue}] : ${gRead}.filter((x) => x !== ${groupValue}))`
+            : `${setter}(e.target.checked ? [...${name}(), ${groupValue}] : ${name}().filter((x) => x !== ${groupValue}))`)
+        : (isPropG ? `__p.onGroupChange?.(e.target.value)` : `${setter}(e.target.value)`);
       groupBindings.push({ event: 'change', fn: `${hname}: (e) => { ${handlerBody}; }` });
-      const newAttrs = attrs.replace(gm[0], ` checked={${checkedExpr}} data-on-change="${hname}"`);
-      out += bindExpanded.slice(pos, m.index) + `<${tag}${newAttrs}${selfClose}>`;
-      pos = m.index + whole.length;
-    }
-    if (pos === 0) return bindExpanded;
-    out += bindExpanded.slice(pos);
-    return out;
+      return attrs.replace(gm[0], ` checked={${checkedExpr}} data-on-change="${hname}"`);
+    });
   })();
   const eventBindings = wired.bindings.concat(bindBindings, groupBindings);
   const useExpanded = groupExpanded.replace(
@@ -1812,7 +2423,14 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
         ? ` data-use="${name}" data-use-param={JSON.stringify(${expr})}`
         : ` data-use="${name}"`,
   );
-  const classExpanded = expandClassDirectives(useExpanded, filePath);
+  // R236: conditional compilation FIRST, before `expandIfElse` rewrites every
+  // `{:else}` into a nested `{#if}` (which would shred an `{#ifdef}` block and
+  // drop both its branches). Resolved as text, so the web build agrees with all
+  // 13 export targets and the losing branch never reaches the parser.
+  // R237: both forms - the comment form reaches `<script>`/`<style>` (already
+  // applied to the whole file earlier), the brace form the template.
+  const platformExpanded = resolveBraceBlocks(useExpanded, 'web');
+  const classExpanded = expandClassDirectives(platformExpanded, filePath);
   const classMerged = mergeStaticClass(classExpanded);
   const styleExpanded = expandStyleDirectives(classMerged, filePath);
   const transExpanded = expandTransitionDirectives(styleExpanded, filePath);
@@ -1841,15 +2459,47 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
       fallback && fallback.trim()
         ? `{__slotDefault(${JSON.stringify(fallback)})}`
         : '{__slot__}'), comps);
-  assertKnownDirectives(ssrTemplate, filePath);
+  const platformTemplate = ssrTemplate;
+  assertKnownDirectives(platformTemplate, filePath);
   // One file, one naming sequence: the internal {@const} thunk names restart
   // here so they are stable and reviewable in the emitted output.
+  // BUG.md AU: every top-level const/let/var whose declaration is NOT a
+  // $state rune is a plain value - the template may read it bare, and
+  // autoCall must wrap it as a value getter instead of calling it.
+  const plainConstDecls = new Set<string>();
+  {
+    const maskedDecls = maskCommentsAndStrings(rawScript);
+    const stateLike = new Set(stateDecls.map((s) => s.name));
+    // R254: a const holding a FUNCTION is not a plain value - a bare `docs` in
+    // {#each docs as d} means "call it", which is what autoCall already does
+    // for an unlisted name. Registering it as a value wrapped the function
+    // itself and eachMark() then did `fn.map(...)`: the page died with
+    // "list.map is not a function" in the browser, the SSR server and every
+    // export target. A same-file getter (`const docs = () => ...`) is the
+    // documented way to make a derived list, so it must stay callable.
+    const isFnDecl = (rhs: string) => /^(?:async\s*)?(?:function\b|\([^)]*\)\s*=>)/.test(rhs)
+      || /^(?:async\s*)?\(/.test(rhs) && rhs.includes('=>')
+      || /^(?:async\s+)?[A-Za-z_$][\w$]*\s*=>/.test(rhs);
+    for (const m2 of maskedDecls.matchAll(/(?:^|\n)\s*(?:export\s+)?(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;]{0,200})/g)) {
+      if (stateLike.has(m2[1]) || /^\s*\$state\b/.test(m2[2])) continue;
+      if (isFnDecl(m2[2].trim())) continue;
+      plainConstDecls.add(m2[1]);
+    }
+  }
+  // R250: these five resets must sit in the SAME synchronous window as
+  // compileTemplate below - buildProject compiles every file in one
+  // Promise.all, so an `await` between here and the clears below would let a
+  // sibling file reset (or wipe) this file's naming state mid-compile: thunk
+  // numbers bleed across files and hoisted const code disappears. Guarded by
+  // tests/test-compile-concurrency.ts.
   constUid = 0;
   sourceFilePath = filePath;
   hoistedConstNames = new Set();
   hoistTopLevelConsts = true;
-  const compiledTemplate = compileTemplate(ssrTemplate, 'h', '__c', null, 0, true, comps);
+  plainConstNames = new Set(plainConstDecls);
+  const compiledTemplate = compileTemplate(platformTemplate, 'h', '__c', null, 0, true, comps);
   hoistTopLevelConsts = false;
+  plainConstNames = new Set();
   // Capture and clear the module-level hoist state BEFORE any throw below:
   // state left behind by a failed compile leaks into the NEXT one (a dev
   // rebuild after an error, or a `check` run over many files) and shows up as
@@ -1903,8 +2553,8 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
     + (awaitExpanded.blocks.length ? '\n' + awaitBootCode(awaitExpanded.blocks) : '');
   const ssr = isMiddleware
     ? `${RUNTIME_IMPORTS}\n\n${importStmts}\n\n${ssrExports}\n${ssrGuard}\n\n${cleanScript}\n`
-    : generateSSR(cleanScript + bootCode, compiledTemplate, stateDeclsCode, ssrExports, compiledHead, props, hasNamedSlots, importStmts, isComponent, ssrGuard, actions.length > 0, dataDeclsCode, hoistedConsts);
-  const client = generateClient(cleanScript + bootCode, compiledTemplate, stateDeclsCode, eventBindings, exportStmts, compiledHead, props, hasNamedSlots, importStmts, isComponent, dataDeclsCode, hoistedConsts);
+    : generateSSR(cleanScript + bootCode, compiledTemplate, stateDeclsCode, ssrExports, compiledHead, props, hasNamedSlots, importStmts, isComponent, ssrGuard, actions.length > 0, dataDeclsCode, hoistedConsts, inlineEachCount > 0);
+  const client = generateClient(cleanScript + bootCode, compiledTemplate, stateDeclsCode, eventBindings, exportStmts, compiledHead, props, hasNamedSlots, importStmts, isComponent, dataDeclsCode, hoistedConsts, inlineEachCount > 0);
 
   return {
     ssr: rewriteRoseImports(ssr, 'ssr'),
@@ -1946,6 +2596,17 @@ if (!__seeded_${d.name}) { const __v_${d.name} = await $data(${fn}); set${capita
  * whitespace-sensitive, and quoted strings (content: "a  b") are left
  * untouched by the alternation.
  */
+/** rpx -> px for the WEB build: a browser drops a declaration carrying an
+ *  unknown unit, so every size in this design system (icon width/height, radii,
+ *  spacing) silently vanished and pages rendered un-styled. 750rpx is one
+ *  design-canvas width = 375 CSS px on a standard phone, so 1rpx = 0.5px. */
+function rpxToPx(css: string): string {
+  return css.replace(/(-?\d*\.?\d+)rpx/g, (_m, n: string) => {
+    const px = Number(n) / 2;
+    return px === 0 ? '0' : `${Math.round(px * 100) / 100}px`;
+  });
+}
+
 function minifyDecls(block: string): string {
   return block
     .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^"']+/g, (m) =>
@@ -1960,17 +2621,31 @@ function minifyDecls(block: string): string {
  * Trade-off: no full CSS parser - comma lists only, and @keyframes blocks
  * pass through unscoped (their from/to/to selectors are not selectors).
  * Global element rules (:root/html/body) belong in the shell's STYLES.
+ *
+ * R277 (BUG.md BD): the scope attribute is stamped on the component's
+ * top-level elements, so a rule for the component's OWN ROOT element
+ * (`.admin-shell` on the root div) never matched - `[data-rosezm-c=x]
+ * .admin-shell` is a descendant combinator and an element is not its own
+ * descendant. Every scoped selector therefore emits TWO alternatives: the
+ * subtree match and the self match. CSS cost is a few bytes per rule; the
+ * alternative was a silently dead layout rule on exactly the elements most
+ * likely to carry layout (flex/grid/position:fixed shells).
+ *
+ * `:global(...)` finally means what it says: a selector that is entirely
+ * global is emitted bare (no scope prefix, so `:global(body)` styles the
+ * document), and a mixed one keeps the prefix only for its scoped part.
  */
 export function scopeCss(css: string, key: string): string {
   const attr = `[data-rosezm-c="${key}"]`;
   const scopeOneSelector = (s: string): string => {
     const t = s.trim();
-    if (!t.includes(':global')) return `${attr} ${t}`;
+    if (!t.includes(':global')) return `${attr} ${t}, ${attr}${t}`;
     const stripped = t.replace(/:global\([^()]*\)/g, (m) => m.slice(8, -1)).trim();
     const outside = t.replace(/:global\([^()]*\)/g, '').trim();
-    return outside ? `${attr} ${stripped}` : stripped;
+    if (!outside) return stripped;
+    return `${attr} ${stripped}, ${attr}${stripped}`;
   };
-  const clean = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  const clean = rpxToPx(css.replace(/\/\*[\s\S]*?\*\//g, ''));
   let out = '';
   let prelude = '';
   let i = 0;
@@ -2022,12 +2697,22 @@ function injectScopeAttr(template: string, key: string): string {
     out += template.slice(i, lt);
     let j = lt + 1;
     let quote = '';
+    // R256 (BUG.md AY): quote awareness alone let `on:click={() => x({ top: 0 })}`
+    // end the tag at the `>` of `=>` (the file's <style> is what turns this pass
+    // on), mangling the client bundle into `() = data-rosezm-c="..."> ...`. A `>`
+    // inside parens/braces is expression text, never the tag end.
+    let paren = 0;
+    let brace = 0;
     while (j < template.length) {
       const c = template[j];
       if (quote) {
         if (c === quote) quote = '';
       } else if (c === '"' || c === "'") quote = c;
-      else if (c === '>') break;
+      else if (c === '(') paren++;
+      else if (c === ')') paren = Math.max(0, paren - 1);
+      else if (c === '{') brace++;
+      else if (c === '}') brace = Math.max(0, brace - 1);
+      else if (c === '>' && paren === 0 && brace === 0) break;
       j++;
     }
     const tagText = template.slice(lt, j + 1);
@@ -2365,13 +3050,19 @@ function maskCommentsAndStrings(src: string): string {
  * JS literals that are valid standalone expressions in a condition. A bare
  * name in a block condition is read as a SIGNAL and called - but these are
  * not signals, and calling one is a runtime TypeError ({#if true} used to
- * compile to ifMark(…, () => (true())…)). Kept beside autoCall because the
+ * compile to ifMark(閳? () => (true())閳?). Kept beside autoCall because the
  * exclusion belongs to the one place that decides.
  */
 const JS_LITERAL_NAMES = new Set(['true', 'false', 'null', 'undefined', 'NaN', 'Infinity']);
 
 function autoCall(expr: string): string {
   const e = expr.trim();
+  // BUG.md AU: a plain top-level const (const FAQS = [...] - NOT a $state
+  // signal) reached the each/if source bare and got callified into `FAQS()`,
+  // a runtime "FAQS is not a function". The page's plain-const names ride the
+  // module-level set the sync template walk reads (set/cleared around it);
+  // such a name becomes a VALUE wrapper instead: () => (FAQS).
+  if (/^[A-Za-z_$][\w$]*$/.test(e) && plainConstNames.has(e)) return e;
   // __s is the each item parameter - a value, never a getter. A nested block
   // whose source is the enclosing item ({#each docs as doc} inside an each
   // that bound docs) has that name rewritten to __s before this runs, and
@@ -2630,6 +3321,73 @@ function mergeStaticClass(template: string): string {
 }
 
 /**
+ * One tag found by the directive passes. Attributes are captured with a
+ * brace-aware scan: a `{` opens an expression whose `>` (arrow, comparison)
+ * is NOT the tag end - `class:on={n > 1}` ends the attr segment there under a
+ * quote-aware-only regex and the inner brace scan then runs off the tag's end,
+ * throwing "class:on={...} is missing its closing brace" on a legal file.
+ */
+interface RoseTag {
+  start: number;
+  end: number;
+  tag: string;
+  attrs: string;
+  selfClose: string;
+}
+
+function scanRoseTag(src: string, start: number): RoseTag | null {
+  const nm = /^<([a-zA-Z][^\s>/]*)/.exec(src.slice(start));
+  if (!nm) return null;
+  let j = start + nm[0].length;
+  let quote = '';
+  let brace = 0;
+  while (j < src.length) {
+    const c = src[j];
+    if (quote) {
+      if (c === quote) quote = '';
+    } else if (c === '"' || c === "'") quote = c;
+    else if (c === '{') brace++;
+    else if (c === '}') brace = Math.max(0, brace - 1);
+    else if (c === '>' && brace === 0) {
+      const raw = src.slice(start, j + 1);
+      const selfClose = raw.endsWith('/>') ? '/' : '';
+      const attrsEnd = selfClose ? j - 1 : j;
+      return {
+        start,
+        end: j + 1,
+        tag: nm[1],
+        attrs: src.slice(start + nm[0].length, attrsEnd),
+        selfClose,
+      };
+    }
+    j++;
+  }
+  return null;
+}
+
+/**
+ * Iterate every tag of a template with scanRoseTag. The callback edits the
+ * tag's attrs; returning null leaves the tag untouched.
+ */
+function mapTemplateTags(template: string, fn: (t: RoseTag) => string | null): string {
+  let out = '';
+  let pos = 0;
+  let i = 0;
+  while (i < template.length) {
+    const lt = template.indexOf('<', i);
+    if (lt < 0) break;
+    const t = scanRoseTag(template, lt);
+    if (!t) { i = lt + 1; continue; }
+    const attrs = fn(t);
+    out += template.slice(pos, t.start) + (attrs === null ? template.slice(t.start, t.end) : `<${t.tag}${attrs}${t.selfClose}>`);
+    pos = t.end;
+    i = t.end;
+  }
+  out += template.slice(pos);
+  return out;
+}
+
+/**
  * class into ONE reactive class attribute whose closure concatenates the
  * static value plus each conditional segment - one attrMark, one data-b
  * marker, all conditions re-evaluated together on every toggle. This runs
@@ -2640,14 +3398,12 @@ function mergeStaticClass(template: string): string {
  */
 function expandClassDirectives(template: string, filePath: string): string {
   if (!template.includes('class:')) return template;
-  const TAG_RE = /<([a-zA-Z][^\s>/]*)((?:[^>"']|"[^"]*"|'[^']*')*?)(\/?)>/g;
-  let out = '';
-  let pos = 0;
-  let m: RegExpExecArray | null;
-  TAG_RE.lastIndex = 0;
-  while ((m = TAG_RE.exec(template))) {
-    const [whole, tag, attrs, selfClose] = m;
-    if (!attrs.includes('class:')) continue;
+  // R256 (BUG.md BZ): tags are matched with the brace-aware scanRoseTag - a
+  // quote-aware-only regex cut the attrs at the `>` inside `class:on={n > 1}`
+  // and the inner brace scan then threw "missing its closing brace".
+  return mapTemplateTags(template, (t) => {
+    const attrs = t.attrs;
+    if (!attrs.includes('class:')) return null;
     const pairs: Array<{ name: string; expr: string; start: number; end: number }> = [];
     const NAME_RE = /\sclass:([\w-]+)\s*=\s*\{/g;
     let nm: RegExpExecArray | null;
@@ -2669,7 +3425,7 @@ function expandClassDirectives(template: string, filePath: string): string {
     const clsRe = /(\sclass\s*=\s*)("([^"]*)"|'([^']*)'|\{[^}]*\})/;
     const clsM = clsRe.exec(attrs);
     if (clsM && clsM[2].startsWith('{')) {
-      throw new RoseError('E-TEMPLATE', `${filePath}: <${tag}> has both class={...} and class: directives`, { file: filePath, hint: 'merge them: move the dynamic part into a class:NAME={expr} and keep the rest in class="..."' });
+      throw new RoseError('E-TEMPLATE', `${filePath}: <${t.tag}> has both class={...} and class: directives`, { file: filePath, hint: 'merge them: move the dynamic part into a class:NAME={expr} and keep the rest in class="..."' });
     }
     const staticCls = clsM ? (clsM[3] ?? clsM[4] ?? '') : '';
     let closure = `(${JSON.stringify(staticCls)}`;
@@ -2686,12 +3442,8 @@ function expandClassDirectives(template: string, filePath: string): string {
     } else {
       newAttrs = ` class={${closure}}` + newAttrs;
     }
-    out += template.slice(pos, m.index) + `<${tag}${newAttrs}${selfClose}>`;
-    pos = m.index + whole.length;
-  }
-  if (pos === 0) return template;
-  out += template.slice(pos);
-  return out;
+    return newAttrs;
+  });
 }
 
 /**
@@ -2710,14 +3462,10 @@ function expandClassDirectives(template: string, filePath: string): string {
  */
 function expandTransitionDirectives(template: string, filePath: string): string {
   if (!/\s(?:transition|in|out):/.test(template)) return template;
-  const TAG_RE = /<([a-zA-Z][^\s>/]*)((?:[^>"']|"[^"]*"|'[^']*')*?)(\/?)>/g;
-  let out = '';
-  let pos = 0;
-  let m: RegExpExecArray | null;
-  TAG_RE.lastIndex = 0;
-  while ((m = TAG_RE.exec(template))) {
-    const [whole, tag, attrs, selfClose] = m;
-    if (!attrs.includes('transition:') && !/\s(?:in|out):/.test(attrs)) continue;
+  // R256 (BUG.md BZ): brace-aware tag scan - `{...}` expressions may hold `>`.
+  return mapTemplateTags(template, (t) => {
+    const attrs = t.attrs;
+    if (!attrs.includes('transition:') && !/\s(?:in|out):/.test(attrs)) return null;
     const pairs: Array<{ dir: string; name: string; params: string; start: number; end: number }> = [];
     const NAME_RE = /\s(transition|in|out):([\w-]+)(?:\s*=\s*\{)?/g;
     let nm: RegExpExecArray | null;
@@ -2743,7 +3491,7 @@ function expandTransitionDirectives(template: string, filePath: string): string 
       }
       pairs.push({ dir: nm[1] === 'transition' ? '' : nm[1], name: nm[2], params, start, end });
     }
-    if (pairs.length === 0) continue;
+    if (pairs.length === 0) return null;
     let transitionValue = '';
     for (const p of pairs) {
       if (transitionValue) transitionValue += '|';
@@ -2761,11 +3509,8 @@ function expandTransitionDirectives(template: string, filePath: string): string 
     } else {
       newAttrs = ` data-transition="${transitionValue}"` + newAttrs;
     }
-    out += template.slice(pos, m.index) + `<${tag}${newAttrs}${selfClose}>`;
-    pos = m.index + whole.length;
-  }
-  out += template.slice(pos);
-  return out;
+    return newAttrs;
+  });
 }
 
 /**
@@ -2777,14 +3522,10 @@ function expandTransitionDirectives(template: string, filePath: string): string 
  */
 function expandAnimateDirectives(template: string, filePath: string): string {
   if (!template.includes('animate:')) return template;
-  const TAG_RE = /<([a-zA-Z][^\s>/]*)((?:[^>"']|"[^"]*"|'[^']*')*?)(\/?)>/g;
-  let out = '';
-  let pos = 0;
-  let m: RegExpExecArray | null;
-  TAG_RE.lastIndex = 0;
-  while ((m = TAG_RE.exec(template))) {
-    const [whole, tag, attrs, selfClose] = m;
-    if (!attrs.includes('animate:')) continue;
+  // R256 (BUG.md BZ): brace-aware tag scan - `{...}` expressions may hold `>`.
+  return mapTemplateTags(template, (t) => {
+    const attrs = t.attrs;
+    if (!attrs.includes('animate:')) return null;
     const pairs: Array<{ name: string; params: string; start: number; end: number }> = [];
     const NAME_RE = /\sanimate:([\w-]+)(?:\s*=\s*\{)?/g;
     let nm: RegExpExecArray | null;
@@ -2827,23 +3568,17 @@ function expandAnimateDirectives(template: string, filePath: string): string {
     } else {
       newAttrs = ` data-animate="${animateValue}"` + newAttrs;
     }
-    out += template.slice(pos, m.index) + `<${tag}${newAttrs}${selfClose}>`;
-    pos = m.index + whole.length;
-  }
-  out += template.slice(pos);
-  return out;
+    return newAttrs;
+  });
 }
 
 function expandStyleDirectives(template: string, filePath: string): string {
   if (!template.includes('style:')) return template;
-  const TAG_RE = /<([a-zA-Z][^\s>/]*)((?:[^>"']|"[^"]*"|'[^']*')*?)(\/?)>/g;
-  let out = '';
-  let pos = 0;
-  let m: RegExpExecArray | null;
-  TAG_RE.lastIndex = 0;
-  while ((m = TAG_RE.exec(template))) {
-    const [whole, tag, attrs, selfClose] = m;
-    if (!attrs.includes('style:')) continue;
+  // R256 (BUG.md BZ): brace-aware tag scan - `style:opacity={n >= 1 ? 1 : 0}`
+  // used to cut the attrs at `>=` and throw "missing its closing brace".
+  return mapTemplateTags(template, (t) => {
+    const attrs = t.attrs;
+    if (!attrs.includes('style:')) return null;
     const pairs: Array<{ prop: string; expr: string; start: number; end: number }> = [];
     const NAME_RE = /\sstyle:([\w-]+)\s*=\s*\{/g;
     let nm: RegExpExecArray | null;
@@ -2865,7 +3600,7 @@ function expandStyleDirectives(template: string, filePath: string): string {
     const styleRe = /(\sstyle\s*=\s*)("([^"]*)"|'([^']*)'|\{[^}]*\})/;
     const stM = styleRe.exec(attrs);
     if (stM && stM[2].startsWith('{')) {
-      throw new RoseError('E-TEMPLATE', `${filePath}: <${tag}> has both style={...} and style: directives`, { file: filePath, hint: 'keep the static declarations in style="..." and move the dynamic ones to style:PROP={expr}' });
+      throw new RoseError('E-TEMPLATE', `${filePath}: <${t.tag}> has both style={...} and style: directives`, { file: filePath, hint: 'keep the static declarations in style="..." and move the dynamic ones to style:PROP={expr}' });
     }
     const staticStyle = stM ? (stM[3] ?? stM[4] ?? '') : '';
     let closure = `${JSON.stringify(staticStyle.endsWith(';') || staticStyle === '' ? staticStyle : staticStyle + ';')}`;
@@ -2881,12 +3616,8 @@ function expandStyleDirectives(template: string, filePath: string): string {
     } else {
       newAttrs = ` style={${closure}}` + newAttrs;
     }
-    out += template.slice(pos, m.index) + `<${tag}${newAttrs}${selfClose}>`;
-    pos = m.index + whole.length;
-  }
-  if (pos === 0) return template;
-  out += template.slice(pos);
-  return out;
+    return newAttrs;
+  });
 }
 
 /**
@@ -3066,13 +3797,13 @@ function expandAwaitBlocks(template: string, filePath: string): { template: stri
     // syntax - rosezm spells it with a {:then users} line inside the block.
     // Left alone the opener leaks into the output as literal text, so refuse
     // it here. A trailing word after then/catch is the tell: a promise method
-    // call (`p.then(r => …)`, `p.catch(e => …)`) is followed by `(`, never a
+    // call (`p.then(r => 閳?`, `p.catch(e => 閳?`) is followed by `(`, never a
     // bare name at the end.
     const inlineBranch = /\b(then|catch)\s+[A-Za-z_$][\w$]*\s*$/.exec(expr);
     if (inlineBranch) {
       throw new RoseError('E-TEMPLATE', `${filePath}: {#await ${expr}} puts the ${inlineBranch[1]} branch in the opener`, {
         file: filePath,
-        hint: `write the branch on its own line inside the block:\n{#await ${expr.replace(/\s+(then|catch)\s+[A-Za-z_$][\w$]*\s*$/, '')}}\n  …pending…\n{:${inlineBranch[1]} ${inlineBranch[0].trim().split(/\s+/)[1]}}\n  …${inlineBranch[1] === 'then' ? 'fulfilled' : 'rejected'}…\n{/await}`,
+        hint: `write the branch on its own line inside the block:\n{#await ${expr.replace(/\s+(then|catch)\s+[A-Za-z_$][\w$]*\s*$/, '')}}\n  閳ヮ洊ending閳ヮ泜n{:${inlineBranch[1]} ${inlineBranch[0].trim().split(/\s+/)[1]}}\n  閳?{inlineBranch[1] === 'then' ? 'fulfilled' : 'rejected'}閳ヮ泜n{/await}`,
       });
     }
     const blockOpenRe = /\{\#(if|each|boundary|island|await)\b/g;
@@ -3269,7 +4000,9 @@ function compileHead(head: string): string {
       const end = gt < 0 ? head.length : gt + 1;
       flush();
       out += emitOpenTag(open[0], '__hd', '__hc', null);
-      out += emitChunk(head.slice(i + open[0].length, end), '__hd', '__hc', null);
+      // R256 (BUG.md BY): raw interiors still evaluate `{@html expr}` (the
+      // literal marker shipped verbatim and the CSS was lost); see emitRawChunk.
+      out += emitRawChunk(head.slice(i + open[0].length, end), '__hd', '__hc', null);
       i = end;
       continue;
     }
@@ -3282,7 +4015,7 @@ function compileHead(head: string): string {
 /**
  * - "errors an agent can fix" - closed on a real
  * failure from the field. A template directive rosezm does not implement
- * used to reach esbuild as generated code and die THERE: the Eoboext port
+ * used to reach esbuild as generated code and die THERE: the Oboext port
  * never wrote, a construct never named, a fix never suggested. An unknown
  * directive is now a build error at the .rose file, with the line, the
  * construct and the rosezm shape that replaces it.
@@ -3444,11 +4177,19 @@ function assertKnownDirectives(template: string, filePath: string): void {
  * have, and the old path was no better.
  */
 function rewriteQuotedExprAttrs(template: string, comps: Map<string, unknown>): string {
-  const TAG_RE = /<([a-zA-Z][\w-]*)((?:\s+[\w:-]+(?:=(?:"[^"]*"|'[^']*'|[^\s"'>]+))?)*)\s*(\/?)>/g;
+  const TAG_RE = /<([a-zA-Z][\w-]*)((?:\s+[\w:-]+(?:=(?:"[^"]*"|'[^']*'|`[^`]*`|[^\s"'>]+))?)*)\s*(\/?)>/g;
   return template.replace(TAG_RE, (tag: string, name: string, attrs: string, selfClose: string) => {
     if (comps.has(name) || !/\{/.test(attrs)) return tag;
-    const rewritten = attrs.replace(/([\w:-]+)="([^"]*)"/g, (whole: string, attr: string, value: string) => {
-      if (!/\{/.test(value) || value.includes('`')) return whole;
+    // All three quote styles are rewritten. Only `="..."` was handled first, so
+    // a single-quoted value fell through to the TEXT path: it emitted a text
+    // marker INSIDE the attribute, which the client can never patch and which
+    // leaves the value holding comment markers instead of its content. A
+    // backtick value has the same flaw, plus one of its own: a value holding a
+    // space (`title=`a {x} b``) is not even matched by TAG_RE's unquoted branch
+    // (it stops at whitespace), so the whole tag skipped this pre-pass.
+    const rewritten = attrs.replace(/([\w:-]+)=("([^"]*)"|'([^']*)'|`([^`]*)`)/g, (whole: string, attr: string, _quoted: string, dq: string | undefined, sq: string | undefined, bt: string | undefined) => {
+      const value = dq ?? sq ?? bt ?? '';
+      if (!/\{/.test(value) || (bt === undefined && value.includes('`'))) return whole;
       const spans = templateExprSpans(value);
       if (spans.length === 0) return whole;
       let expr = '';
@@ -3476,7 +4217,7 @@ let constUid = 0;
  * A TOP-LEVEL {@const} thunk is hoisted out of __root into the render()
  * scope. Handlers are lifted into the handlers registry in that same scope,
  * so a handler expression can only see a const whose thunk sits there - and
- * the hoist is what makes {@const} usable inside on:click={…}. Block-level
+ * the hoist is what makes {@const} usable inside on:click={閳ヮ洠. Block-level
  * consts stay where they are compiled (they may read block bindings, which
  * the render scope does not have). compileComponent flips the flag around
  * the one depth-0 compileTemplate call, so compileHead's segments keep
@@ -3494,6 +4235,9 @@ let hoistedConstRenames: Record<string, string> = {};
 // than approximate positions, redeclaration is a build error - the same
 // answer plain JS gives for `const x` twice in one scope.
 let hoistedConstNames = new Set<string>();
+// BUG.md AU: the page's plain (non-signal) top-level const names, set around the
+// synchronous template walk and read by autoCall.
+let plainConstNames = new Set<string>();
 let hoistedConstDup: string | null = null;
 // The file being compiled. compileTemplate has no filePath parameter, but one
 // of its error paths (a keyed {#each} over a destructuring pattern) names the
@@ -3858,7 +4602,7 @@ function compileTemplate(
         const decl = `const ${internal} = () => (${constMatch[2].trim()});\n`;
         if (hoistTopLevelConsts && depth === 0) {
           // Hoisted to the render() scope: the handlers registry lives there,
-          // so an on:click={…} expression can call this thunk. Uses inside
+          // so an on:click={閳ヮ洠 expression can call this thunk. Uses inside
           // __root still resolve it through the closure.
           if (hoistedConstNames.has(constName)) {
             hoistedConstDup = constName;
@@ -3933,7 +4677,14 @@ function compileTemplate(
         cursor = earliest.index + earliest.match[0].length;
         continue;
       }
-      const attrMatch = before.match(/([\w-]+)=\s*$/);
+      // `<input value={x}>` - the expression is an ATTRIBUTE value, so the text
+      // before it ends with `name=`. The test has to be "are we inside an open
+      // tag", not merely "does the text end with name=": plain text like
+      // `total={n()}` or `x= {n()}` also ends that way, and treating it as an
+      // attribute silently DROPS the visible text and emits a stray attribute
+      // instead. `inOpenTag` is tracked across spans, because the second
+      // attribute on a tag has no `<a` in its own preceding text.
+      const attrMatch = openTagAt(src, earliest.index) ? (/([\w-]+)=\s*$/.exec(before) ?? null) : null;
       if (attrMatch) {
         const lit = before.slice(0, before.length - attrMatch[0].length);
         if (lit) result += emitChunk(lit, acc, closes, scope);
@@ -3941,13 +4692,33 @@ function compileTemplate(
       } else {
         if (before) result += emitChunk(before, acc, closes, scope);
         const after = src.slice(earliest.index + earliest.match[0].length);
-        const pair = after.length > 0 && !/^<[a-zA-Z/!]/.test(after) && !after.startsWith('{');
-        result += emitText(trimmed, acc, closes, scope, effMarkers, pair);
+        // An interpolation INSIDE a quoted attribute value (`style="... {x} ..."`)
+        // is not a text node: emitting it as one wraps the value in text
+        // markers, which both corrupts the attribute AND breaks every later
+        // attribute of the same tag (the marker contains '>', so the open-tag
+        // scan fails from there on). Emit the escaped value plainly instead.
+        const insideQuotedAttr = /=[\"'][^\"']*$/.test(before);
+        if (insideQuotedAttr) {
+          result += `${acc} += esc(${trimmed});
+`;
+        } else {
+          const pair = after.length > 0 && !/^<[a-zA-Z/!]/.test(after) && !after.startsWith('{');
+          result += emitText(trimmed, acc, closes, scope, effMarkers, pair);
+        }
       }
       cursor = earliest.index + earliest.match[0].length;
     }
   }
 
+  // An attribute written as `attr="..."` around an interpolation compiles to
+  // `acc += " attr=";` followed by a textMark() call - the marker then lands
+  // INSIDE the attribute value (and the marker contains '>', so the open-tag
+  // scan for every LATER attribute of the same tag fails too). Rewrite that
+  // shape into a proper attrMark() call.
+  result = result.replace(
+    /\+= "\s*([a-zA-Z][\w-]*)=";\r?\n\s*\w+\s*\+=\s*textMark\((\w+), (.+?), 1, ([^;]+?)\);/g,
+    (_m, name, closes, fn, arg) => `+= attrMark(${closes}, ${fn}, '${name}', ${arg});`,
+  );
   return result;
 }
 
@@ -4194,10 +4965,83 @@ function splitSlots(src: string): { def: string; named: Array<[string, string]> 
   return { def, named: [...named.entries()] };
 }
 
+/**
+ * Is the position `at` inside an OPEN TAG's interior (so a `{expr}` there is an
+ * attribute value)?
+ *
+ * The test that matters is not "does the text before it end with `name=`" -
+ * plain body text like `total={n()}` and `x= {n()}` ends that way too, and
+ * reading those as attributes drops the visible text and emits a stray
+ * attribute in its place. It also cannot look only at the text since the last
+ * span, because `<a href={x} title={y}>` has a second span whose preceding text
+ * is just ` title=` with no `<a` in it. So: scan backwards from `at` for the
+ * last `<` that starts a tag, and check that no `>` follows it.
+ */
+function openTagAt(src: string, at: number): boolean {
+  const before = src.slice(0, at);
+  const lt = before.lastIndexOf('<');
+  if (lt < 0) return false;
+  // `<` must begin a tag name (not `</`, `<!--`, or a stray less-than).
+  if (!/^<[a-zA-Z]/.test(src.slice(lt))) return false;
+  // A `>` that belongs to a template expression (an arrow `=>`, a comparison,
+  // a `>` inside a quoted attr value) does NOT close the tag. Scanning for a
+  // bare `>` misread `<div class={list.filter((c) => c.ok)} tabindex={i}>` as
+  // body text at tabindex: the expr fell to the text path and emitted a
+  // textMark INSIDE the attribute value, which no wire pass can repair (the
+  // repair rewrite at the end of compileTemplate only matches a literal whose
+  // sole content is `name=`, so any static attribute ahead of it - draggable,
+  // role, ... - left the marker in place). Walk forward quote- and
+  // brace-aware, exactly like scanTagEnd, and only a `>` at depth 0 closes.
+  let j = lt + 1;
+  let quote = '';
+  let brace = 0;
+  while (j < at) {
+    const c = src[j];
+    if (quote) {
+      if (c === quote) quote = '';
+    } else if (c === '"' || c === "'") quote = c;
+    else if (c === '{') brace++;
+    else if (c === '}') brace = Math.max(0, brace - 1);
+    else if (c === '>' && brace === 0) return false;
+    j++;
+  }
+  return true;
+}
+
 /** Emit a static chunk (attributes are handled by the expr branch). */
 function emitChunk(text: string, acc: string, closes: string, scope: string | null): string {
   if (!text) return '';
   return `${acc} += ${JSON.stringify(text)};\n`;
+}
+
+/**
+ * The interior of a head raw element (<style>/<script>/<noscript>) with one
+ * exception: R256 (BUG.md BY) - `{@html expr}` evaluates and splices its value
+ * as RAW text (the literal marker used to ship verbatim and the whole
+ * stylesheet was silently dropped). Every other brace - CSS rule bodies
+ * included - stays literal text; only spans starting `{@html` are scanned.
+ */
+function emitRawChunk(text: string, acc: string, closes: string, scope: string | null): string {
+  if (!text.includes('{@html')) return emitChunk(text, acc, closes, scope);
+  let code = '';
+  let last = 0;
+  let i = text.indexOf('{@html');
+  while (i !== -1) {
+    const end = scanExprEnd(text, i);
+    if (end < 0) break; // unterminated: literal through the end
+    const m = /^@html\s+([\s\S]+)$/.exec(text.slice(i + 1, end));
+    if (m) {
+      const lit = text.slice(last, i);
+      if (lit) code += `${acc} += ${JSON.stringify(lit)};\n`;
+      code += `${acc} += String(${m[1].trim()} ?? '');\n`;
+      last = end + 1;
+    }
+    i = text.indexOf('{@html', end + 1);
+  }
+  if (last === 0) return emitChunk(text, acc, closes, scope);
+  const tail = text.slice(last);
+  if (tail) code += `${acc} += ${JSON.stringify(tail)};\n`;
+  return code;
 }
 
 /**
@@ -4243,7 +5087,7 @@ import { scanContentDir, renderMarkdown, buildRss } from "../cli/content";
 /**
  * in public/) become a sorted srcset on the URL-kept <img>. Zero-dependency
  * by design - the variants themselves are plain files, generated by whatever
- * resizer the app prefers (Eoboext ships tools/make-variants.mjs). Author-set
+ * resizer the app prefers (Oboext ships tools/make-variants.mjs). Author-set
  * srcset/sizes always win; no variants means no attribute, byte-identical.
  */
 function listImageVariants(publicDir: string, url: string): Array<{ url: string; width: number }> {
@@ -4391,15 +5235,48 @@ const __slotDefault = (children, fallback) => {
   return fallback || '';
 };`;
 
-function generateSSR(script: string, templateFn: string, stateDeclsCode: string, exports = '', headFn = '', props: Array<{ name: string; def: string | null }> = [], namedSlots = false, imports = '', isComponent = false, guard = '', hasActions = false, dataDeclsCode = '', hoistedConsts = ''): string {
+/**
+ * R259 (BUG.md BE suggestion 1): the registration helper an inlined {#each}
+ * handler evaluates at render time, emitted inside `render()` so it closes
+ * over THIS document's `closes` array. The array is shared by every
+ * layout/page/component instance of one render and is fresh per document (the
+ * adopt-by-index contract runs the same sequence on server and client), so
+ * the key is unique per row and per instance, and the attribute value the
+ * dispatch reads names the closure BOTH halves registered. Both halves emit
+ * it: the SSR module evaluates the expression while building the html too.
+ */
+const RH_REG_CODE = `
+// R259: an inline handler inside {#each} registers HERE, inside the render
+// closure - the arrow captures the row's \`__s\` (the item), which module
+// scope never had (BUG.md BE). The key is prefix + this document's shared
+// closes-array counter: one array per document render, shared by every
+// layout/page/component instance, so rows and instances never collide and
+// the FIRST render's sequence matches the server's (adopt-by-index contract)
+// - which is the key wire()'s direct listener captures at bind time. A
+// closure mints once and re-evaluations (wire's attribute pass) reuse the
+// minted key, so nothing re-mints and the registry does not grow per pass.
+const __rhreg = (prefix, fn) => {
+  if (typeof fn === 'function' && fn.__rhk) return fn.__rhk;
+  const n = (closes.__rhn = (closes.__rhn || 0) + 1) - 1;
+  const k = prefix + n;
+  handlers[k] = fn;
+  if (typeof fn === 'function') fn.__rhk = k;
+  return k;
+};
+`;
+
+function generateSSR(script: string, templateFn: string, stateDeclsCode: string, exports = '', headFn = '', props: Array<{ name: string; def: string | null }> = [], namedSlots = false, imports = '', isComponent = false, guard = '', hasActions = false, dataDeclsCode = '', hoistedConsts = '', inlineEach = false): string {
   // The head block renders to a clean html string (no markers) and is wrapped in an h marker pair: renderPage extracts it for <head> injection.
   const headCode = headFn
     ? `
 const __head = () => { let __hd = ''; ${headFn} return __hd; };
 __html += headMark(closes, __head);`
     : '';
-  const actionState = hasActions ? `
+  // R259: an inlined handler body may write state ($setState('k', v)); the
+  // expression evaluates on the server too, so the alias has to exist there.
+  const actionState = (hasActions || inlineEach) ? `
 const $setState = (key, value) => setState(key, value);` : '';
+  const rhReg = inlineEach ? RH_REG_CODE : '';
   return `
 ${RUNTIME_IMPORTS}
 
@@ -4415,10 +5292,12 @@ export ${isComponent ? 'function' : 'async function'} render(closes, children, _
   ${props.length > 0 ? 'const __p = __props || {};' : ''}
   ${namedSlots ? 'const __sl = __slots || {};' : ''}
   ${propsCode(props)}
+  ${props.length > 0 ? `const __rvlive = (k, v) => { const g = __p['__live-' + k]; return typeof g === 'function' ? g() : v; };` : ''}
   ${script}
   ${stateDeclsCode}
   ${dataDeclsCode}
   ${hoistedConsts}
+  ${rhReg}
 
   ${isComponent ? '' : 'applyStateDeltas();'}
   const __root = (__c, children) => { let h = ''; ${templateFn} return h; };
@@ -4440,14 +5319,30 @@ function generateClient(
   imports = '',
   isComponent = false,
   dataDeclsCode = '',
-  hoistedConsts = ''
+  hoistedConsts = '',
+  inlineEach = false
 ): string {
-  const handlerRegistry = eventBindings.length > 0
-    ? `Object.assign(handlers, { ${eventBindings.map((b) => b.fn).join(', ')} });`
+  // The same handler bound in several places (a close button reused by two
+  // modals, a toolbar action on both the rich and raw editors) would emit its
+  // registry entry once per binding - duplicate keys in one object literal,
+  // which esbuild reports and the last-wins semantics makes a silent trap.
+  // The entry is `name` or `name: (e) => ...`; identical strings are the same
+  // handler, so the first occurrence carries the registration.
+  const seenHandlers = new Set<string>();
+  const uniqueBindings = eventBindings.filter((b) => {
+    if (seenHandlers.has(b.fn)) return false;
+    seenHandlers.add(b.fn);
+    return true;
+  });
+  const handlerRegistry = uniqueBindings.length > 0
+    ? `Object.assign(handlers, { ${uniqueBindings.map((b) => b.fn).join(', ')} });`
     : '';
-  const clientSetState = eventBindings.length > 0
+  // R259: an inlined {#each} handler may write state too, and its registry
+  // entry is created inside render() - the alias has to exist either way.
+  const clientSetState = (uniqueBindings.length > 0 || inlineEach)
     ? `const $setState = (key, value) => setState(key, value);`
     : '';
+  const rhReg = inlineEach ? RH_REG_CODE : '';
   const headCode = headFn
     ? `
 const __head = () => { let __hd = ''; ${headFn} return __hd; };
@@ -4467,11 +5362,13 @@ export ${isComponent ? 'function' : 'async function'} render(closes, children, _
   ${props.length > 0 ? 'const __p = __props || {};' : ''}
   ${namedSlots ? 'const __sl = __slots || {};' : ''}
   ${propsCode(props)}
+  ${props.length > 0 ? `const __rvlive = (k, v) => { const g = __p['__live-' + k]; return typeof g === 'function' ? g() : v; };` : ''}
   ${script}
   ${stateDeclsCode}
   ${dataDeclsCode}
   ${hoistedConsts}
   ${handlerRegistry}
+  ${rhReg}
   const __root = (__c, children) => { let h = ''; ${templateFn} return h; };
   let __html = ${isComponent ? '' : 'await '}__root(closes, children);${headCode}
   return __html;
@@ -4598,7 +5495,14 @@ for (const el of document.querySelectorAll('[data-rosezm]')) {
 const __writtenContent = new Map<string, string>();
 let __writtenFor: string | null = null;
 
-export async function buildProject(root: string, outDir: string, opts: { minify?: boolean; incremental?: boolean } = {}): Promise<{ routes: RouteInfo[]; bundle: string; config: rosezmConfig }> {
+export async function buildProject(rootArg: string, outDirArg: string, opts: { minify?: boolean; incremental?: boolean } = {}): Promise<{ routes: RouteInfo[]; bundle: string; config: rosezmConfig }> {
+  // R240: the scans below return paths joined onto `root`, and every import is
+  // resolved with `path.resolve` (absolute). A RELATIVE root therefore produced
+  // relative registry keys and absolute lookups - a guaranteed miss, and the
+  // build failed with "no .rose file at <a file that exists>". The CLI hid it by
+  // passing `path.resolve(argv[3])`; any other caller hit it. Normalise once.
+  const root = path.resolve(rootArg);
+  const outDir = path.resolve(outDirArg);
   const minify = opts.minify !== false;
   const incremental = opts.incremental === true;
   await fs.promises.mkdir(outDir, { recursive: true });
@@ -4618,6 +5522,7 @@ export async function buildProject(root: string, outDir: string, opts: { minify?
   }
   const infos = files.map((f) => ({ ...getRouteInfo(f, root) }));
   const config = await loadConfig(root);
+  __watchList = (config.watch ?? []).map((w) => path.isAbsolute(w) ? w : path.join(root, w));
   const plugins = config.plugins;
   const scopeKeys = files.map((f, i) => {
     const base = infos[i].isComponent ? path.join(root, 'src') : path.join(root, 'src', 'pages');
@@ -4637,6 +5542,29 @@ export async function buildProject(root: string, outDir: string, opts: { minify?
     files.map((f, i) => compileComponentMemo(f, path.join(root, 'public'), scopeKeys[i], infos[i].isApi, plugins, registry))
   );
   await esbuildWarm;
+  // The convention, stated where it is decided: the table carries exactly the
+  // rosezm_PUBLIC_* names that ARE SET. A read of any other name is undefined
+  // on both halves (never a fall-through to the server's whole process env),
+  // which is the leak guard - but a name that simply has not been set looks
+  // identical, so the two cases get different messages instead of one shrug.
+  {
+    const exposed = new Set(publicEnvEntries().map(([k]) => k));
+    const warned: string[] = [];
+    const seen = new Set<string>();
+    for (let i = 0; i < compiled.length; i++) {
+      for (const name of [...envReadsOf(compiled[i].ssr), ...envReadsOf(compiled[i].client)]) {
+        if (exposed.has(name) || seen.has(name)) continue;
+        seen.add(name);
+        const where = `${path.relative(root, files[i]).replace(/\\/g, '/')} reads import.meta.env.${name}`;
+        warned.push(name.startsWith(PUBLIC_ENV_PREFIX)
+          ? `  ${where}\n    -> it has the public prefix but is not set in this build's environment (an unset public var is undefined in the bundle; the server render does not fall back to it)`
+          : `  ${where}\n    -> only ${PUBLIC_ENV_PREFIX}* is exposed to the client; rename it to ${PUBLIC_ENV_PREFIX}${name} if it is public config, or keep it server-only (it stays undefined here, in dev and in the bundle)`);
+      }
+    }
+    if (warned.length > 0) {
+      console.warn(`rosezm warning: import.meta.env.<name> carries only ${PUBLIC_ENV_PREFIX}* variables:\n${warned.join('\n')}`);
+    }
+  }
   const importsOf = new Map<number, number[]>();
   files.forEach((_, i) => {
     const list: number[] = [];
@@ -4784,6 +5712,11 @@ export const hasResponseHooks = hooks.some((p) => p.onResponse);
     }
     return path.join(here, '..', 'cli', 'prod-server.ts');
   })();
+  // R257: the createRequire shim, injected into a bundle that really calls
+  // require() (a CJS dependency doing a dynamic require of a node builtin).
+  // It stays OUT of a bundle that never calls require(), so that bundle keeps
+  // the edge-loadable shape the framework's Cloudflare adapter depends on.
+  const REQUIRE_SHIM = "import { createRequire as __cr } from 'node:module'; import { fileURLToPath as __f2p } from 'node:url'; import { dirname as __dn } from 'node:path'; const require = __cr(import.meta.url); const __filename = __f2p(import.meta.url); const __dirname = __dn(__filename);";
   // prod.mjs is the serverless/Vercel entry - the dev server and `rosezm serve`
   // run server.js, so a dev hot-rebuild never needs it.
   const prodBuild: Promise<esbuild.BuildResult> = incremental
@@ -4796,13 +5729,14 @@ export const hasResponseHooks = hooks.some((p) => p.onResponse);
       platform: 'node',
       write: true,
       banner: {
-        js: "import { createRequire } from 'node:module'; import { fileURLToPath as __f2p } from 'node:url'; import { dirname as __dn } from 'node:path'; const require = createRequire(import.meta.url); const __filename = __f2p(import.meta.url); const __dirname = __dn(__filename);"
+        js: REQUIRE_SHIM
       },
       ...TS_LOADER,
       ...(minify ? { minify: true, keepNames: true } : {}),
     }, incremental);
   runtimeBuild.catch(() => {});
   prodBuild.catch(() => {});
+
 
   const compWrites: Promise<void>[] = [];
   const writeIfChanged = (name: string, content: string): void => {
@@ -5030,7 +5964,7 @@ import { renderMarkdown } from './content-md.ts';
 ${appUsesAuth ? "import crypto from 'node:crypto';" : "// no route references __rosezmAuth: the node:crypto auth helpers are omitted, keeping the bundle edge-loadable"}
 ${appUsesNet ? "import * as __rosezmDgram from 'node:dgram';\nimport * as __rosezmNet from 'node:net';" : "// no route opens a network listener ($udp/$tcp/$listen): the node:dgram/node:net imports are omitted, keeping the bundle edge-loadable"}
 ${appUsesWs ? "import * as __rosezmHttp from 'node:http';\nimport * as __rosezmCrypto from 'node:crypto';" : "// no route opens a WebSocket server ($websocket): the node:http/node:crypto imports are omitted, keeping the bundle edge-loadable"}
-import { setState, persistState, clearRequestState, isolateRender, serializeState, resetRequestContext, installContextStore, setRequestQuery, getRequestQuery, isLocale, setLocales, localeList, localeDir, setStoreTransport, applyStorePatch, ActionError, StateDelta, setStateDelta, esc, __startNetwork, __stopNetwork, $udp, $tcp, $listen, $websocket, $mqtt } from './runtime.js';
+import { setState, persistState, clearRequestState, isolateRender, serializeState, resetRequestContext, installContextStore, setRequestQuery, getRequestQuery, getContext, isLocale, setLocales, localeList, localeDir, setStoreTransport, applyStorePatch, ActionError, StateDelta, setStateDelta, esc, __startNetwork, __stopNetwork, $udp, $tcp, $listen, $websocket, $mqtt } from './runtime.js';
 export { __startNetwork, __stopNetwork };
 ${runtimePlugins.length > 0
     ? `import { hooks as __pluginHooks, hasRequestHooks as __hasRequestHooks, hasResponseHooks as __hasResponseHooks } from './plugins.js';`
@@ -5155,8 +6089,13 @@ export const revalidate = [
 ];
 
 // Per-request render memo (export const cache = N): a dynamic route's whole renderPage result is memoized for N seconds.
+// R256: a page that reads getContext() holds per-request state (the middleware
+// put the caller's identity there), so its render must not be memoized: the
+// second request in the window replayed the FIRST request's whole page -
+// another user's context, in the same slot. The revalidate list above
+// already refuses such a page; the memo did not, and now it does too.
 export const routeCaches = [
-  ${pages.filter(({ i }) => compiled[i].cache !== undefined).map(({ info, i }) => `{ pattern: '${info.pattern}', seconds: ${compiled[i].cache} }`).join(',\n  ')}
+  ${pages.filter(({ i }) => compiled[i].cache !== undefined && !compiled[i].usesContext).map(({ info, i }) => `{ pattern: '${info.pattern}', seconds: ${compiled[i].cache} }`).join(',\n  ')}
 ];
 
 // Hot-cache key dimensions (export const hotVary = ['x-locale']): the shared
@@ -5549,7 +6488,7 @@ export function docAttrs(pathname) {
 
 // Paint a fallback page (404/500) and serialize its state.
 async function renderFallback(pathname, render, noJs = false) {
-  // Split mode: the not-found entry's render is a loader object — resolve it through getRender (which memoizes the composed function) exactly like.
+  // Split mode: the not-found entry's render is a loader object 閳?resolve it through getRender (which memoizes the composed function) exactly like.
   let fn = render;
   if (typeof fn !== 'function' && fn && typeof fn.load === 'function') {
     
@@ -5653,14 +6592,14 @@ function extractHead(rendered) {
 }
 
 // Form: the submitted FormData of a progressive-enhancement POST.
-export async function renderPage(pathname, form) {
+export async function renderPage(pathname, form, options) {
   // Renders DO overlap in one process: prod-server warms every route in the background at startup.
-  return isolateRender(() => renderPageIsolated(pathname, form));
+  return isolateRender(() => renderPageIsolated(pathname, form, options));
 }
 
-async function renderPageIsolated(pathname, form) {
+async function renderPageIsolated(pathname, form, options) {
   clearRequestState();
-  // Cold-start readiness gate (Eoboext #8): await the app's published DB-ready promise before any $data() read.
+  // Cold-start readiness gate (Oboext #8): await the app's published DB-ready promise before any $data() read.
   const appReady = globalThis.__rosezmAppReady;
   if (appReady) await appReady;
   const route = routeClass(pathname).route;
@@ -5728,7 +6667,7 @@ async function renderPageIsolated(pathname, form) {
         }
         
         console.error('rosezm: render failed for', pathname, err instanceof Error ? err.message : err);
-        // F10: in dev the response body carries the real error — message, file:line and the fix hint.
+        // F10: in dev the response body carries the real error 閳?message, file:line and the fix hint.
         let devDetail = '';
         if (process.env.rosezm_DEV === '1' && err) {
           const msg = esc(err instanceof Error ? err.message : String(err));
@@ -5752,7 +6691,10 @@ async function renderPageIsolated(pathname, form) {
         return { html: '<h1>500</h1><p>Something went wrong rendering this page.</p>' + devDetail, state: '{}', head: [], status: 500, ...docAttrs(pathname) };
       }
       // __route tells the bootstrap which route this document was rendered for.
-    const noJs = route.csr === false;
+    // A zero-JS route ships no state script - but a NATIVE client asking for the
+    // JSON half of the render (the /__rosezm/data channel) still needs the values
+    // its $data produced, so the withState option asks for them explicitly.
+    const noJs = route.csr === false && !(options && options.withState);
     let state = '{}';
     if (!noJs || actionStatus !== 0) {
       const s = serializeState();
@@ -5791,14 +6733,54 @@ function toResponse(out) {
 export async function handleApi(method, pathname, request) {
   for (const route of apiRoutes) {
     if (matchRoute(route.pattern, pathname)) {
-      const fn = route.handlers[method];
+      // HEAD answers like GET with the body dropped by the host, which is the
+      // HTTP contract every static server here already honors. It used to 405
+      // on every route that only exported GET - the one method a health
+      // check, an uptime monitor or a head-of-request probe actually sends.
+      const verb = method === 'HEAD' && !route.handlers.HEAD ? 'GET' : method;
+      // hasOwn, not a bare index: the handlers table is an object literal, so a
+      // request line naming constructor, toString or valueOf used to find
+      // Object.prototype's member and CALL it as the handler - a 200 whose
+      // body was the prototype's return value, or a TypeError from the
+      // dispatch. Not reachable through Node's HTTP parser (it rejects those
+      // methods), but the edge adapter and rosezm/test pass the method through.
+      const fn = Object.prototype.hasOwnProperty.call(route.handlers, verb) ? route.handlers[verb] : null;
       if (!fn) {
         return new Response(JSON.stringify({ error: 'method not allowed' }), {
           status: 405,
           headers: { 'content-type': 'application/json', allow: Object.keys(route.handlers).join(', ') },
         });
       }
+      // A dynamic segment's value reaches the handler through the request
+      // context: getContext().params.id for pages/api/posts/[id].rose. The
+      // pattern MATCHED before, but the captured value went nowhere - the
+      // docs promised "dynamic segments work", and a handler that cannot
+      // read its own param is a 200-shaped lie. The bag is per-request
+      // (the servers run each request in its own context scope), so this
+      // cannot leak across requests.
       try {
+        const patternParts = route.pattern.split('/');
+        const pathParts = pathname.split('/');
+        const params = {};
+        for (let i = 0; i < patternParts.length && i < pathParts.length; i++) {
+          const seg = patternParts[i];
+          if (seg.startsWith(':')) params[seg.slice(1)] = decodeURIComponent(pathParts[i]);
+          else if (seg.startsWith('*')) params[seg.replace(/^\\*+/, '')] = pathParts.slice(i).map(decodeURIComponent);
+        }
+        // The bag must describe THIS request: a host without a context store
+        // (the edge adapter, rosezm/test) reuses one module-level object, so a
+        // static route used to inherit the previous request's params - a
+        // /api/posts/42 call made /api/health report an id it was never sent.
+        // Assigning (rather than only when non-empty) drops the stale value.
+        getContext().params = params;
+        getContext().url = pathname + (new URL(request.url).search || '');
+      } catch { /* a malformed segment must not kill the dispatch */ }
+      try {
+        // HEAD runs the GET handler and returns its Response untouched: the
+        // host drops the body, and the headers a HEAD must report (the app's
+        // own, plus the framework ETag the exit derives from the bytes) stay
+        // exactly those of the GET. Returning an empty body here instead would
+        // hand the caller a response with no validator at all.
         return toResponse(await fn(request));
       } catch (err) {
         
@@ -5833,7 +6815,7 @@ export async function renderPageStream(pathname, write, shellOpen, clientTag) {
 
 async function renderPageStreamIsolated(pathname, write, shellOpen, clientTag) {
   clearRequestState();
-  // Cold-start readiness gate (Eoboext #8): same contract as renderPage — await the app's published DB-ready promise before streaming the shell.
+  // Cold-start readiness gate (Oboext #8): same contract as renderPage 閳?await the app's published DB-ready promise before streaming the shell.
   const appReady = globalThis.__rosezmAppReady;
   if (appReady) await appReady;
   const route = routeClass(pathname).route;
@@ -5856,7 +6838,7 @@ async function renderPageStreamIsolated(pathname, write, shellOpen, clientTag) {
         html = routeClass(pathname).nonce ? extractHead(await route.render([], '')).html : await route.render([], '');
       } catch (err) {
         console.error('rosezm: render failed for', pathname, err instanceof Error ? err.message : err);
-        // F10: dev carries the real error in the body here too — the shell
+        // F10: dev carries the real error in the body here too 閳?the shell
         let devDetail = '';
         if (process.env.rosezm_DEV === '1' && err) {
           const msg = esc(err instanceof Error ? err.message : String(err));
@@ -5928,7 +6910,16 @@ export { installContextStore };
       "  return out;",
       "}",
     ].join("\n") + "\n";
-    await fs.promises.writeFile(path.join(outDirTs, "routes.ts"), srcLines);
+    // 内容不变则跳过写入：mtime 不动就不会产生 watch 事件，dev 的 rebuild
+    // 不会由自己的产物再次触发（Windows 云盘回灌下尤其致命）。
+    const routesPath = path.join(outDirTs, "routes.ts");
+    try {
+      if (await fs.promises.readFile(routesPath, "utf8") !== srcLines) {
+        await fs.promises.writeFile(routesPath, srcLines);
+      }
+    } catch {
+      await fs.promises.writeFile(routesPath, srcLines);
+    }
   } catch { /* types are a convenience: never fail the build over them */ }
 
   await fs.promises.writeFile(path.join(buildDir, 'server-entry.js'), serverEntry);
@@ -5940,10 +6931,17 @@ export { installContextStore };
     format: 'esm',
     platform: 'node',
     write: true,
+    // R257: the createRequire shim is injected AFTER the bundle, and only when
+    // the bundle really calls require(). It was unconditional, so every server.js
+    // imported node:module/node:url/node:path - and the framework's own
+    // Cloudflare adapter statically imports dist/server.js (deploy/cloudflare),
+    // so workerd could no longer load the bundle at all. A bundle with no
+    // require() call (the Postgres example's is one) stays edge-loadable.
     ...TS_LOADER,
     ...(minify ? { minify: true, keepNames: true } : {}),
   }, incremental);
   bundleBuilds.catch(() => {}); // an esbuild failure in the window before the await below must surface there, not as a fatal unhandled rejection
+
   const allClientImports = compiled
     .map((_, i) => ({ i }))
     .filter(({ i }) => !infos[i].isApi && !infos[i].isMiddleware && reachable.has(i))
@@ -6607,6 +7605,28 @@ export const navError = ${errIdx >= 0 ? `{ render: ${compose(errIdx)} }` : 'null
         ...TS_LOADER,
       }, incremental);
   await Promise.all([bundleBuilds, clientBuild, prodBuild]);
+  // R257: the createRequire shim goes into a bundle that really calls
+  // require() (a CJS dependency doing a dynamic require of a node builtin).
+  // It used to be an unconditional esbuild banner, so every server.js imported
+  // node:module/node:url/node:path - and the framework's own Cloudflare
+  // adapter statically imports dist/server.js (deploy/cloudflare), whose
+  // contract is a bundle with zero Node built-in imports. A bundle without a
+  // require() call (the Postgres example's is one) keeps that shape; one that
+  // needs it gets the shim, because a Node server without it throws
+  // "Dynamic require of \"events\" is not supported" (CarModster, 2026-10-26).
+  for (const f of [path.join(outDir, 'server.js'), path.join(outDir, 'prod.mjs')]) {
+    try {
+      if (!fs.existsSync(f)) continue;
+      const src = await fs.promises.readFile(f, 'utf8');
+      if (src.startsWith(REQUIRE_SHIM)) continue;
+      // esbuild rewrites a dynamic require into its own __require helper (a
+      // bare require( call only shows up once a global require exists), so the
+      // helper is what says "this bundle needs the shim".
+      if (/Dynamic require of/.test(src) || /(?<![\w$])require\s*\(/.test(src)) {
+        await fs.promises.writeFile(f, REQUIRE_SHIM + src, 'utf8');
+      }
+    } catch { /* a failed bundle surfaces through its own build */ }
+  }
 
   // mount.js shares the document's runtime module: its import carries the same
   // content-hash URL the shell emits, so a host page using both loads the
