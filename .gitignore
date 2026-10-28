@@ -11,6 +11,7 @@ dist-cli/
 rosezm-server
 rosezm-server-go
 rosezm-server-go.exe
+/rosezm.exe
 
 # deps
 node_modules/
@@ -31,5 +32,10 @@ tmp/
 .vfy/
 # captured sessions / local credentials
 cookies.txt
-.rosezm-build/
-.rosezm-dev/
+
+# universal export output (rosezm export <target>)
+**/.rosezm-export/
+/.rosezm-build/
+/.rosezm-dev/
+**/.rosezm-build/
+**/.rosezm-dev/
