@@ -7,12 +7,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { promisify } from 'node:util';
-import { createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { fileURLToPath } from 'node:url';
 import { createEdgeHandler } from './edge.ts';
 import { requestOrigin } from './origin.ts';
 import { hotVaryValues } from './hot-vary.js';
+import { ifNoneMatch, responseEtag } from './validator.js';
 import { onShutdown, runShutdownHooks } from './shutdown.ts';
 
 // Brotli quality for ON-THE-FLY compression. Baked .br siblings keep quality 11 (see the build) - those are the headline number.
@@ -45,12 +45,14 @@ function resolveStaticRoots(): string[] {
     add(path.join(dist, '..'));
     add(path.join(dist, '..', '..'));
     add(path.resolve(dist, '..', 'public'));
-    add(path.resolve(dist, '..', 'eoboext'));
   }
   
-  add(path.join(dist, 'eoboext'));
-  add(path.resolve(dist, '..', 'eoboext'));
-  add(path.resolve(process.cwd(), 'eoboext'));
+  // The framework never names an app: a static root is the project root
+  // beside dist, or a public/ directory in any of the usual places.
+  add(path.join(dist, '..'));
+  add(path.join(dist, 'public'));
+  add(path.resolve(dist, '..', 'public'));
+  add(path.resolve(process.cwd(), 'public'));
   extraRoots = [...seen];
   return extraRoots;
 }
@@ -365,7 +367,11 @@ async function refetchHot(pathname: string, cookieHeader: string, dims: string[]
   hotCache.set(key, {
     raw,
     headers: head,
-    etag: `W/"${raw.length}-${fnv(cookieHeader)}"`,
+    // AM (BUG.md): the warm render stores the same validator the request path
+    // would have derived from these bytes - a length-based one let two
+    // equal-length representations share a tag, so a client holding the older
+    // tag revalidated into 304 and kept stale bytes for the whole TTL.
+    etag: responseEtag(response, raw),
     fetchedAt: Date.now(),
     status: response.status,
   });
@@ -419,7 +425,7 @@ async function tryHot(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // not vary by it. Merge it back in here.
   addVary(res, 'Accept-Encoding');
   res.setHeader('ETag', entry.etag);
-  if (req.headers['if-none-match'] === entry.etag) {
+  if (ifNoneMatch(req.headers['if-none-match'], entry.etag)) {
     res.statusCode = 304;
     res.end();
     writeAccessLine(req, res, 0);
@@ -615,7 +621,7 @@ function serveStatic(req: http.IncomingMessage, res: http.ServerResponse, pathna
         ? 'public, max-age=31536000, immutable'
         : 'public, max-age=3600',
   );
-  if (req.headers['if-none-match'] === entry.etag) {
+  if (ifNoneMatch(req.headers['if-none-match'], entry.etag)) {
     res.statusCode = 304;
     res.end();
     writeAccessLine(req, res, 0);
@@ -728,30 +734,44 @@ const server = http.createServer(async (req, res) => {
     const htmlDoc = (response.headers.get('content-type') ?? '').startsWith('text/html');
     const accept = String(req.headers['accept-encoding'] ?? '');
     const raw = response.body ? Buffer.from(await response.arrayBuffer()) : null;
-    if (raw && htmlDoc) {
-      const etag = 'W/"' + createHash('sha1').update(raw).digest('base64url').slice(0, 24) + '"';
+    if (raw) {
+      // AM (BUG.md): the validator is no longer HTML-only. A feed, a sitemap,
+      // a manifest and a JSON API are documents a client revalidates too - an
+      // RSS reader polling every five minutes used to re-transfer the whole
+      // body every time because the response it cached carried no validator.
+      // It is also content-derived rather than length-derived: an anonymous
+      // read's cookie is empty, so `len-fnv(cookie)` only moved with the byte
+      // count and handed two equal-length, different-content representations
+      // the same tag - a false 304 that kept a client on stale bytes until the
+      // length happened to change. An app that publishes its own ETag keeps it.
+      const etag = responseEtag(response, raw);
       // RFC 9110: a 304 must carry the validators a 200 would have carried.
       res.setHeader('ETag', etag);
-      if (req.method === 'GET' && req.headers['if-none-match'] === etag) {
+      if (req.method === 'GET' && ifNoneMatch(req.headers['if-none-match'], etag)) {
         res.statusCode = 304;
         res.end();
         writeAccessLine(req, res, 0);
         return;
       }
-      const memo: { raw: Buffer; br?: Buffer; gzip?: Buffer } = { raw };
-      const enc = pickEncoding(raw, accept);
-      const body = enc ? await encodedBodyAsync(memo, enc) : raw;
-      if (enc) {
-        res.setHeader('Content-Encoding', enc);
-        res.setHeader('Content-Length', String(body.length));
+      // Only an HTML document is compressed here: the rest are the small
+      // machine-read documents (a robots.txt, a JSON payload an agent polls)
+      // where the compress-on-miss cost outweighs the bytes saved.
+      if (htmlDoc) {
+        const memo: { raw: Buffer; br?: Buffer; gzip?: Buffer } = { raw };
+        const enc = pickEncoding(raw, accept);
+        const body = enc ? await encodedBodyAsync(memo, enc) : raw;
+        if (enc) {
+          res.setHeader('Content-Encoding', enc);
+          res.setHeader('Content-Length', String(body.length));
+        }
+        if (req.method === 'GET') fillHot(hotTarget, cookieHeader, dims, names, response, memo, etag, reqGen);
+        res.end(body);
+        writeAccessLine(req, res, body.length);
+      } else {
+        if (req.method === 'GET') fillHot(hotTarget, cookieHeader, dims, names, response, { raw }, etag, reqGen);
+        res.end(raw);
+        writeAccessLine(req, res, raw.length);
       }
-      if (req.method === 'GET') fillHot(hotTarget, cookieHeader, dims, names, response, memo, etag, reqGen);
-      res.end(body);
-      writeAccessLine(req, res, body.length);
-    } else if (raw) {
-      if (req.method === 'GET') fillHot(hotTarget, cookieHeader, dims, names, response, { raw }, `W/"${raw.length}-${fnv(cookieHeader)}"`, reqGen);
-      res.end(raw);
-      writeAccessLine(req, res, raw.length);
     } else {
       res.end();
       writeAccessLine(req, res, 0);

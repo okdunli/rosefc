@@ -183,6 +183,41 @@ export async function createEdgeHandler(
       const mw = await mod.runMiddleware(request);
       if (mw) return hookCtx ? mod.runResponseHooks(hookCtx, mw) : mw;
     }
+    // 0.2.0: the native data channel. A mini program / mobile client cannot
+    // execute the render, so it asks for the JSON half of one - the state the
+    // page's $data produced. Middleware already ran above (a wall short-
+    // circuited before this point), so a gated route never leaks through it.
+    if (pathname === '/__rosezm/data' && request.method === 'GET') {
+      const target = searchParams.get('path') || '/';
+      try {
+        // The gate is per-page: judge the target path, not the channel URL.
+        if (mod.middleware) {
+          const mw = await mod.runMiddleware(new Request(new URL(target, request.url), { method: 'GET', headers: request.headers }));
+          if (mw) {
+            const headers = new Headers(mw.headers);
+            headers.set('access-control-allow-origin', '*');
+            return new Response(await mw.arrayBuffer(), { status: mw.status, headers });
+          }
+        }
+        mod.setQuery?.(Object.fromEntries(new URL('http://x' + target).searchParams));
+        const page = await (mod as any).renderPage(target, undefined, { withState: true });
+        let state: unknown = {};
+        try { state = JSON.parse(page?.state || '{}'); } catch { state = {}; }
+        return new Response(JSON.stringify({ path: target, status: page?.status ?? 200, state }), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+            'access-control-allow-origin': '*',
+            'cache-control': 'no-store',
+          },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: String((err as Error)?.message ?? err).slice(0, 200) }), {
+          status: 500,
+          headers: { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' },
+        });
+      }
+    }
     if (mod.isApi(pathname)) {
       if (request.method !== 'GET') {
         const fn = (mod as any).invalidateRenderCache;
@@ -231,6 +266,15 @@ export async function createEdgeHandler(
       ? await (mod as any).renderPageCached(pathname, cookieHeader, qs, dims)
       : await mod.renderPage(pathname, form));
     const nonce = mod.cspNonce?.(pathname) ? mintNonce() : '';
+    // A page that called redirect() returns { redirect, status } with no html;
+    // the prod edge entry must honor it or the document 500s (dev/preview route
+    // through a different handler that already does).
+    if ((page as { redirect?: string }).redirect) {
+      const target = (page as { redirect: string }).redirect;
+      const loc = new URL(target, request.url);
+      const body = `<!DOCTYPE html><title>Redirecting</title><p>Redirecting to <a href="${target}">${target}</a>.</p>`;
+      return new Response(body, { status: (page as { status?: number }).status ?? 302, headers: { 'content-type': 'text/html; charset=utf-8', location: loc.pathname + loc.search } });
+    }
     let html = buildShell(page.html, page.state, clientFor(pathname), page.head, styles, page.csr !== false, page.lang, page.dir, nonce, page.shell !== false);
     if (request.headers.get('x-pjax')) html = pjaxFragment(html);
     const buffered = new Response(html, {

@@ -23,6 +23,28 @@ export function setBundleMode(mode: string): void {
 }
 
 /**
+ * Extra connect-src sources from the app's rosezm.config.js
+ * (`export const csp = { connectSrc: 'https:' }`). The framework default is
+ * 'self' - a closed network. Apps whose client talks to an API host (a cloud
+ * gateway, a user-configured LLM endpoint) widen it here; the value is
+ * appended verbatim after 'self'.
+ */
+let extraConnectSrc = '';
+let extraImgSrc = '';
+export function setExtraCsp(connectSrc: string, imgSrc: string): void {
+  extraConnectSrc = connectSrc.trim();
+  extraImgSrc = imgSrc.trim();
+  cspCache = null;
+}
+
+function cspTail(): string {
+  let tail = CSP_TAIL;
+  if (extraConnectSrc !== '') tail = tail.replace("connect-src 'self'", `connect-src 'self' ${extraConnectSrc}`);
+  if (extraImgSrc !== '') tail = tail.replace("img-src 'self' data: https://fastly.picsum.photos", `img-src 'self' data: https://fastly.picsum.photos ${extraImgSrc}`);
+  return tail;
+}
+
+/**
  * The inline bundle source for a document.
  *
  * - inline mode: dist/client.js (every route's code, inlined into every
@@ -359,7 +381,7 @@ export function mintNonce(): string {
 export function securityHeaders(client: string | null, nonce = ''): Record<string, string> {
   const headers: Record<string, string> = { ...BASELINE_SECURITY_HEADERS };
   if (nonce) {
-    headers['Content-Security-Policy'] = `script-src 'nonce-${nonce}' 'strict-dynamic'; ${CSP_TAIL}`;
+    headers['Content-Security-Policy'] = `script-src 'nonce-${nonce}' 'strict-dynamic'; ${cspTail()}`;
     return headers;
   }
   if (!cspCache || cspCache.for !== client || cspCache.v !== (client ? '' : getClientVersion())) {
@@ -373,7 +395,7 @@ export function securityHeaders(client: string | null, nonce = ''): Record<strin
     cspCache = {
       for: client,
       v: client ? '' : getClientVersion(),
-      value: `script-src ${scriptSrc}; ${CSP_TAIL}`,
+      value: `script-src ${scriptSrc}; ${cspTail()}`,
     };
   }
   headers['Content-Security-Policy'] = cspCache.value;
@@ -394,6 +416,11 @@ const STYLES = `
     .rf { margin-top: 2rem; color: #888; font-size: 0.85rem; }
     ::view-transition-old(root), ::view-transition-new(root) { animation-duration: .18s; }
   `;
+
+/** The shell's own global stylesheet, exported for the native exporters: the
+ *  mini-program emitter filters it (no `<body>` there) instead of re-inventing
+ *  a base theme, so an exported app keeps the layout it was designed with. */
+export const SHELL_STYLES = STYLES;
 
 const STYLES_MIN = STYLES.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^"']+/g, (m) =>
   m[0] === '"' || m[0] === "'" ? m : m.replace(/\s+/g, ' ').replace(/\s*([:;{},])\s*/g, '$1').trim()
@@ -418,7 +445,7 @@ const STYLES_MIN = STYLES.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^"']+/g,
  * any other managed element instead of leaking the previous route's CSS
  * into every route visited after it.
  *
- * Bug report 2026-10-13 (Eoboext): a `<link>` keyed by its bare `rel` meant the
+ * Bug report 2026-10-13 (Oboext): a `<link>` keyed by its bare `rel` meant the
  * SECOND link of any same-rel group was silently dropped - hreflang alternates,
  * multi-size icons, font preloads, several feeds all lost every member but the
  * first. A rel-only key now carries the link's target (`href`, or `type`/`as`
