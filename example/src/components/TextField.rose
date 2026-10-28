@@ -1,0 +1,11 @@
+<script>
+ // A component with a TWO-WAY prop: the call site writes
+  // `<TextField bind:value={name} />` and the parent's state flows in while
+  // the user's edits flow back out. The component renders the value; the
+  // write-back is the framework's component-prop contract (the compiler
+  // rewrites the call-site bind into the prop plus its change handler).
+  export let value = '';
+  export let placeholder = 'type here';
+</script>
+
+<input value={value} placeholder={placeholder} />

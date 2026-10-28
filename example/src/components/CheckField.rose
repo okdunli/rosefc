@@ -1,0 +1,15 @@
+<script>
+ // A component with TWO-WAY checkbox and group props: the call site writes
+ // `<CheckField bind:checked={subscribed} bind:group={colors} />` - the value
+ // rides in through the prop, the edit rides out through onCheckedChange /
+ // onGroupChange. One component-prop contract on web and on every export
+ // target (inputBoundProps infers the same two callbacks from these inputs).
+ export let checked = false;
+ export let group = [];
+</script>
+
+<div class="check-field">
+  <label><input class="cf-on" type="checkbox" bind:checked={checked}> Subscribed (component)</label>
+  <label><input class="cf-red" type="checkbox" value="red" bind:group={group}> Red (component)</label>
+  <label><input class="cf-blue" type="checkbox" value="blue" bind:group={group}> Blue (component)</label>
+</div>

@@ -1,0 +1,16 @@
+<script>
+ // A component with BOTH slot kinds. The default <slot /> renders the
+  // caller's children in the caller's scope; the named slot "foot" takes
+  // scoped props (note) and its content renders with them in scope - the
+  // parent fills it with an element carrying slot="foot". Every export
+  // target mirrors the same contract (src/export/ir.ts collectSlots /
+  // splitSlotChildren), so one component reaches all platforms.
+  export let title = 'card';
+  export let tone = 'neutral';
+</script>
+
+<section class="card">
+  <h3>{title} ({tone})</h3>
+  <slot />
+  <footer><slot name="foot" note={tone} /></footer>
+</section>
