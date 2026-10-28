@@ -1,5 +1,6 @@
 
 /// <reference lib="dom" />
+/// <reference types="node" />
 type Getter<T> = () => T;
 
 /** A store shared by every request in this process (and, with a transport, every worker). */
