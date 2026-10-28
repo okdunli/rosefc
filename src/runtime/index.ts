@@ -91,7 +91,7 @@ export function state<T>(key: string, initial: T): [() => T, (v: T) => void] {
 
   const setter = (v: T) => {
     // F36: a function value is a functional update - it receives the current value and returns the next one ($setState('n', (x) => x + 1)).
-    const next = (typeof v === 'function' ? (v as (cur: T) => T)(e.value) : v) as T;
+    const next = (typeof v === 'function' ? (v as (cur: unknown) => T)(e.value) : v) as T;
     // A write of the value the signal already holds changes nothing: skip the
     // fan-out. Object.is, not ==, so NaN writes are (correctly) still news and
     // -0/+0 writes stay distinguishable. Skipping is what keeps {#key}'s
@@ -404,11 +404,19 @@ interface EachRow {
   disp?: Cleanup;
   norm?: string;
 }
-const EACH_REUSE_FORBID = /data-(?:on|use|bind-this|transition|animate)|data-rosezm-c|data-rv-island/;
+// A row may only be reused when its rendered html is byte-identical - and even
+// then, a row carrying wiring that cannot survive node reuse must be rebuilt.
+// `data-on-*` (event handlers) is the dangerous one: an inline arrow captures
+// the row's scope, so a reused node would keep calling the PREVIOUS item's
+// closure. The trailing hyphen matters: a bare `data-on` is an ordinary state
+// attribute (apps use it for active-row styling), its value is part of the html
+// the reuse check compares, and it carries no closure - forbidding it forced a
+// full rebuild of every such list on any selection change.
+const EACH_REUSE_FORBID = /data-on-|data-use|data-bind-this|data-transition|data-animate|data-rosezm-c|data-rv-island/;
 const EACH_HTML_NORM = (h: string): string => h.replace(/\u27e6\/?[a-z]+:\d+\u27e7/g, '').replace(/data-b\d+/g, 'data-b');
 const normHtml = (row: EachRow): string => (row.norm ??= EACH_HTML_NORM(row.html));
 
-export function eachMark(closes: Close[], items: Close, fn: (s: unknown, c: Close[]) => unknown, key?: (s: unknown, vi: number) => unknown): string {
+export function eachMark(closes: Close[], items: Close, fn: (s: unknown, c: Close[], vi: number) => unknown, key?: (s: unknown, vi: number) => unknown): string {
   const i = closes.push(() => {
     const list = items() as unknown[];
     return untrack(() => list.map((v, vi) => {
@@ -986,7 +994,7 @@ export function wire(root: Node, closes: Array<unknown>, scope?: unknown): Clean
     created.push(() => setState(key, null));
   });
 
-  const trans = (holder as Element).querySelectorAll('[data-transition]');
+  const trans = (holder as Element).querySelectorAll<HTMLElement>('[data-transition]');
   if (trans.length > 0) {
     trans.forEach((el) => {
       if (islandSkip && el.closest('[data-rv-island]')) return;
@@ -1080,7 +1088,7 @@ export function wire(root: Node, closes: Array<unknown>, scope?: unknown): Clean
     });
   }
 
-  const anim = (holder as Element).querySelectorAll('[data-animate]');
+  const anim = (holder as Element).querySelectorAll<HTMLElement>('[data-animate]');
   if (anim.length > 0) {
     anim.forEach((el) => {
       if (islandSkip && el.closest('[data-rv-island]')) return;
@@ -1151,7 +1159,7 @@ export function wire(root: Node, closes: Array<unknown>, scope?: unknown): Clean
                   }, duration / 4);
                 }, duration / 4);
               }, duration / 4);
-            }, duration / 4);
+            });
           });
         } else if (name === 'scale') {
           el.style.transform = 'scale(0.5)';
@@ -1592,30 +1600,75 @@ export async function isolateRender<T>(fn: () => Promise<T>): Promise<T> {
 const renderMutexCell = sharedCell<Promise<void>>('__rosezm_renderMutex', Promise.resolve());
 
 let requestQuery: Record<string, string> = {};
+/** R248: the request-scoped query slot in the context-store bag. */
+const REQUEST_QUERY = Symbol('requestQuery');
+/** R249: the in-flight prefetch's query, beside it in the same bag. */
+const PREFETCH_OVERRIDE = Symbol('prefetchOverride');
 let prefetchOverride: Record<string, string> | null = null;
 
 export function $query(): Record<string, string> {
-  if (prefetchOverride) return prefetchOverride;
-  if (typeof location === 'undefined') return requestQuery;
+  const prefetch = getPrefetchOverride();
+  if (prefetch) return prefetch;
+  // R248: server-side reads the request-scoped bag, not the module-level one.
+  if (typeof location === 'undefined') return getRequestQuery();
   const q: Record<string, string> = {};
   new URLSearchParams(location.search).forEach((v, k) => { q[k] = v; });
   return q;
 }
 
-/** The per-request query object - the servers call this before every render. */
+/** The per-request query object - the servers call this before every render.
+ *  R248: under a context store it lives IN that request's scope. It used to be a
+ *  module-level bag, so two concurrent requests in one process read each other's
+ *  query - `/api/slow?say=a` and `?say=f` both saw `f`. That is a real cross-user
+ *  leak (a search term or a token in the query string), not a cosmetic one. */
 export function setRequestQuery(q: Record<string, string>): void {
+  if (contextStore) {
+    const scoped = contextStore.getStore() as Record<symbol, unknown> | undefined;
+    if (scoped) {
+      scoped[REQUEST_QUERY] = q;
+      return;
+    }
+  }
   requestQuery = q;
 }
 
 /** Read the current per-request query (the SWR background refresh snapshots it so a
  *  concurrent request's setRequestQuery cannot leak the wrong query into a cached refresh). */
 export function getRequestQuery(): Record<string, string> {
+  if (contextStore) {
+    const scoped = contextStore.getStore() as Record<symbol, unknown> | undefined;
+    const q = scoped?.[REQUEST_QUERY];
+    if (q) return q as Record<string, string>;
+  }
   return requestQuery;
 }
 
-/** The query of the route a prefetch is rendering, or null outside one. */
+/** The query of the route a prefetch is rendering, or null outside one.
+ *  R249: request-scoped for the same reason as the query itself. This used to be
+ *  a module-level variable set before an `await` and cleared after, so two
+ *  concurrent prefetches overwrote each other: the `?q=cats` render read
+ *  `undefined` because the `?q=dogs` render had already nulled it. The HTML that
+ *  went into the cache was built with the wrong query and served as correct. */
 export function setPrefetchOverride(q: Record<string, string> | null): void {
+  if (contextStore) {
+    const scoped = contextStore.getStore() as Record<symbol, unknown> | undefined;
+    if (scoped) {
+      if (q) scoped[PREFETCH_OVERRIDE] = q;
+      else delete scoped[PREFETCH_OVERRIDE];
+      return;
+    }
+  }
   prefetchOverride = q;
+}
+
+/** The prefetch query in the current scope, or null. */
+function getPrefetchOverride(): Record<string, string> | null {
+  if (contextStore) {
+    const scoped = contextStore.getStore() as Record<symbol, unknown> | undefined;
+    const q = scoped?.[PREFETCH_OVERRIDE];
+    if (q) return q as Record<string, string>;
+  }
+  return prefetchOverride;
 }
 
 let requestContext: Record<string, unknown> = {};
@@ -1662,7 +1715,9 @@ type RenderMaps = { data: Map<string, Promise<unknown>>; signals: Map<string, Si
 const fallbackRenderMaps: RenderMaps = shared('__rosezm_fallbackRenderMaps', () => ({ data: new Map(), signals: signalMap, seeded: seededKeys }));
 
 function renderMaps(): RenderMaps {
-  const scoped = contextStore?.getStore();
+  // The store's map-of-maps is typed Record<string, unknown> but carries symbol
+  // keys (the RENDER_MAPS / DIRTY / ENV slots) - reach them through the index.
+  const scoped = contextStore?.getStore() as Record<symbol, unknown> | undefined;
   if (!scoped) return fallbackRenderMaps;
   let m = scoped[RENDER_MAPS] as RenderMaps | undefined;
   if (!m) {
@@ -2819,7 +2874,10 @@ export function $boundaryFallback(err: unknown): string {
   return '<p>This section failed to render.</p>';
 }
 
-export type StateDeltaOp = 'append' | 'prepend' | 'merge';
+// The runtime's own spellings: 'a' = append, 'p' = prepend, 'm' = merge. The
+// switch in `apply` compares against these, so long names would fall through
+// to merge - the union must say what the runtime honors.
+export type StateDeltaOp = 'a' | 'p' | 'm';
 
 export class StateDelta {
   constructor(public op: StateDeltaOp, public value: unknown) {}
