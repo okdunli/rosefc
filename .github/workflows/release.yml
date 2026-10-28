@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+# The release is gated on CI: a tag alone does not publish anything. The
+# test job runs the same suites as the CI workflow, and the release job
+# waits for it - so a red build never produces a release.
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: CLI test suite
+        # SAFE_DELETE_ENABLED=0: the dev safety shim blocks bulk deletes with a
+        # confirmation prompt that has no stdin in CI.
+        run: node tests/test-cli.mjs
+        env:
+          SAFE_DELETE_ENABLED: "0"
+          CI: "true"
+
+      - name: Example build + client pipeline tests
+        run: npm test
+        env:
+          SAFE_DELETE_ENABLED: "0"
+
+      - name: Universal export tests
+        # Exports the demo to a mini-program project and EXECUTES the generated
+        # page JS in a sandbox; no platform SDK is needed.
+        run: npx tsx tests/test-export.ts
+        env:
+          SAFE_DELETE_ENABLED: "0"
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # the notes need every tag and the commits between them
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node tools/release-notes.mjs "$GITHUB_REF_NAME" > notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          # every release so far ships as a pre-release
+          prerelease: true
