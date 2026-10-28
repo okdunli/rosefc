@@ -1,5 +1,4 @@
 <script>
-  import { $cookies } from './runtime.js';
   import type { DatabaseSync } from 'node:sqlite';
 
   // The blog's JSON api. GET is public; POST and DELETE need the session

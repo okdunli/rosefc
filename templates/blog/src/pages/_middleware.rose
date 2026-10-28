@@ -1,5 +1,4 @@
 <script>
-  import { $cookies } from './runtime.js';
   import type { DatabaseSync } from 'node:sqlite';
 
   // The middleware runs before every request - pages, POSTs and api calls

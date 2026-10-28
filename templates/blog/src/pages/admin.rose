@@ -31,10 +31,10 @@
     const form = e.target as HTMLFormElement;
     const res = await fetch('/api/login', { method: 'POST', body: new FormData(form) });
     if (res.ok) {
-      signedIn(true);
-      error('');
+      $setState('signedIn', true);
+      $setState('error', '');
     } else {
-      error('wrong user or password');
+      $setState('error', 'wrong user or password');
     }
   }
 
@@ -43,11 +43,11 @@
     const form = e.target as HTMLFormElement;
     const res = await fetch('/api/posts', { method: 'POST', body: new FormData(form) });
     if (res.ok) {
-      error('');
+      $setState('error', '');
       form.reset();
       await refresh();
     } else {
-      error(await res.text());
+      $setState('error', await res.text());
     }
   }
 </script>

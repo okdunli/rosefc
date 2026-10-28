@@ -1,5 +1,4 @@
 <script>
-  import { $sessionCookie } from './runtime.js';
   import type { DatabaseSync } from 'node:sqlite';
 
   // Login: POST user=ada pass=lovelace -> 200 + Set-Cookie: session=1.

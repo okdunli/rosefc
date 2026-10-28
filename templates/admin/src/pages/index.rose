@@ -25,19 +25,19 @@
     e.preventDefault();
     const form = e.target as HTMLFormElement;
     const res = await fetch('/api/login', { method: 'POST', body: new FormData(form) });
-    if (res.ok) { signedIn(true); error(''); } else { error('wrong user or password'); }
+    if (res.ok) { $setState('signedIn', true); $setState('error', ''); } else { $setState('error', 'wrong user or password'); }
   }
 
   async function create(e: SubmitEvent) {
     e.preventDefault();
     const form = e.target as HTMLFormElement;
     const res = await fetch('/api/items', { method: 'POST', body: new FormData(form) });
-    if (res.ok) { error(''); form.reset(); await refresh(); } else { error(await res.text()); }
+    if (res.ok) { $setState('error', ''); form.reset(); await refresh(); } else { $setState('error', await res.text()); }
   }
 
   async function remove(id: number) {
     const res = await fetch('/api/items?id=' + id, { method: 'DELETE' });
-    if (res.ok) await refresh(); else { error(await res.text()); }
+    if (res.ok) await refresh(); else { $setState('error', await res.text()); }
   }
 
   // Sign out is a DELETE, which a native form cannot send - so it is the
@@ -45,7 +45,7 @@
   // and the README says so plainly.
   async function logout() {
     await fetch('/api/login', { method: 'DELETE' });
-    signedIn(false);
+    $setState('signedIn', false);
     await refresh();
   }
 </script>
