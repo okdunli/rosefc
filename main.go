@@ -1,20 +1,9 @@
-
-
-
-
-
-
-
-
-
 // Static routes are served from the embedded prerendered HTML (one request
 
 // brotli bytes `rosezm build` precompressed (dist/<file>.br) - zero
 // per-request compression CPU - with weak ETags so repeat visits cost a
 
 // detects the route mismatch and client-renders the requested route, so
-
-
 
 // /metrics answers the Prometheus text format, and UPSTREAM=<url> turns the
 
@@ -41,11 +30,11 @@ import (
 	"time"
 )
 
-
+// all: carries dotfiles a project puts in public/ (.well-known, .nojekyll) -
+// plain dist would silently drop them from the shipped binary.
+//
+//go:embed all:dist
 var dist embed.FS
-
-
-
 
 // CPU burn and allocation churn for output that can never change.
 // Brotli needs no cache at all: `rosezm build` writes dist/<file>.br next
@@ -55,7 +44,7 @@ var dist embed.FS
 var (
 	fileCache sync.Map // name -> []byte (nil when missing)
 	gzipCache sync.Map // name -> []byte
-	etagCache sync.Map 
+	etagCache sync.Map
 )
 
 func readDist(name string) ([]byte, bool) {
@@ -76,8 +65,6 @@ func readDist(name string) ([]byte, bool) {
 // forever (see gzipCache), so the extra CPU is paid once per file while every
 // gzip client - the ones that do not send Accept-Encoding: br - gets ~200
 
-
-
 func gzipBytes(body []byte) []byte {
 	var buf bytes.Buffer
 	gz, _ := gzip.NewWriterLevel(&buf, gzip.BestCompression)
@@ -85,10 +72,6 @@ func gzipBytes(body []byte) []byte {
 	_ = gz.Close()
 	return buf.Bytes()
 }
-
-
-
-
 
 func etagOf(body []byte) string {
 	h := fnv.New32a()
@@ -130,13 +113,10 @@ func writeBody(w http.ResponseWriter, r *http.Request, name string, body []byte,
 
 // serveFile writes the embedded file to w - build-precompressed brotli when
 
-
-
 func serveFile(w http.ResponseWriter, r *http.Request, name string) bool {
 	// Precompression siblings are internal build artifacts (innovation #28):
 	// a direct request for dist/<file>.br must not answer raw brotli bytes
-	
-	
+
 	if base, ok := strings.CutSuffix(name, ".br"); ok {
 		if _, ok := readDist(base); ok {
 			return false
@@ -169,22 +149,22 @@ func serveFile(w http.ResponseWriter, r *http.Request, name string) bool {
 }
 
 var mimeTypes = map[string]string{
-	".html": "text/html; charset=utf-8",
-	".js":   "text/javascript; charset=utf-8",
-	".mjs":  "text/javascript; charset=utf-8",
-	".css":  "text/css; charset=utf-8",
-	".json": "application/json; charset=utf-8",
-	".svg":  "image/svg+xml",
-	".png":  "image/png",
-	".jpg":  "image/jpeg",
-	".jpeg": "image/jpeg",
-	".gif":  "image/gif",
-	".webp": "image/webp",
-	".ico":  "image/x-icon",
-	".woff": "font/woff",
+	".html":  "text/html; charset=utf-8",
+	".js":    "text/javascript; charset=utf-8",
+	".mjs":   "text/javascript; charset=utf-8",
+	".css":   "text/css; charset=utf-8",
+	".json":  "application/json; charset=utf-8",
+	".svg":   "image/svg+xml",
+	".png":   "image/png",
+	".jpg":   "image/jpeg",
+	".jpeg":  "image/jpeg",
+	".gif":   "image/gif",
+	".webp":  "image/webp",
+	".ico":   "image/x-icon",
+	".woff":  "font/woff",
 	".woff2": "font/woff2",
-	".txt":  "text/plain; charset=utf-8",
-	".map":  "application/json; charset=utf-8",
+	".txt":   "text/plain; charset=utf-8",
+	".map":   "application/json; charset=utf-8",
 }
 
 func mimeOf(name string) string {
@@ -193,10 +173,6 @@ func mimeOf(name string) string {
 	}
 	return "application/octet-stream"
 }
-
-
-
-
 
 type headerRule struct {
 	Pattern string            `json:"pattern"`
@@ -213,7 +189,7 @@ var routeHeaders headerConfig
 func loadRouteHeaders() {
 	b, err := dist.ReadFile("dist/headers.json")
 	if err != nil {
-		return 
+		return
 	}
 	_ = json.Unmarshal(b, &routeHeaders)
 }
@@ -237,7 +213,6 @@ func matchPattern(pattern, pathname string) bool {
 	return true
 }
 
-
 // headers, in file order: a later route wins on conflict, so a route
 
 // HTTP header names are case-insensitive, and map iteration order is
@@ -245,7 +220,7 @@ func matchPattern(pattern, pathname string) bool {
 // The merged map is cached per pathname: routeHeaders is immutable after
 
 // never change - this is one map lookup per request instead of a merge.
-var headerCache sync.Map 
+var headerCache sync.Map
 
 func headersFor(pathname string) map[string]string {
 	if v, ok := headerCache.Load(pathname); ok {
@@ -270,15 +245,7 @@ func headersFor(pathname string) map[string]string {
 	return out
 }
 
-
-
-
-
 // Everything below is stdlib: one ResponseWriter wrapper, atomic counters,
-
-
-
-
 
 // neither the status code nor the byte count, and the access log needs both.
 type statusWriter struct {
@@ -305,16 +272,13 @@ var (
 	reqCount  atomic.Int64
 	inFlight  atomic.Int64
 	bootTime  = time.Now()
-	accessLog = log.New(os.Stdout, "", 0) 
+	accessLog = log.New(os.Stdout, "", 0)
 )
 
 func countStatus(code int) {
 	v, _ := reqTotal.LoadOrStore(code, &atomic.Uint64{})
 	v.(*atomic.Uint64).Add(1)
 }
-
-
-
 
 func observe(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -342,7 +306,6 @@ func observe(next http.HandlerFunc) http.HandlerFunc {
 
 // metricsHandler answers the Prometheus text exposition format (v0.0.4):
 
-
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	var b strings.Builder
@@ -368,20 +331,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(b.String()))
 }
 
-
-
-
-
-
-
-
-
-
 //	UPSTREAM=http://dynamic:3000 ./rosezm-server
-
-
-
-
 
 // unbaked APIs - so the pure-static deploy keeps its contract byte for byte.
 
@@ -399,7 +349,7 @@ func setupUpstream() {
 	upstreamProxy = httputil.NewSingleHostReverseProxy(target)
 	upstreamProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		// The error trail: a dead backend must be visible in the logs, not
-		
+
 		log.Printf("rosezm error: upstream %s failed for %s %s: %v", u, r.Method, r.URL.Path, err)
 		http.Error(w, "upstream unavailable", http.StatusBadGateway)
 	}
@@ -408,7 +358,7 @@ func setupUpstream() {
 
 func proxyUpstream(w http.ResponseWriter, r *http.Request) {
 	if sw, ok := w.(*statusWriter); ok {
-		sw.proxied = true 
+		sw.proxied = true
 	}
 	upstreamProxy.ServeHTTP(w, r)
 }
@@ -416,12 +366,12 @@ func proxyUpstream(w http.ResponseWriter, r *http.Request) {
 func handler(w http.ResponseWriter, r *http.Request) {
 	// /metrics is this binary's own endpoint (innovation #34): it must be
 	// answered before the file candidates, or the SPA fallback would hand
-	
+
 	if r.URL.Path == "/metrics" {
 		metricsHandler(w, r)
 		return
 	}
-	
+
 	// server action or a form submit goes to the Node/edge backend.
 	if upstreamProxy != nil && r.Method != http.MethodGet && r.Method != http.MethodHead {
 		proxyUpstream(w, r)
@@ -435,7 +385,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	if p == "." || p == "/" {
 		p = "/index.html"
 	}
-	
+
 	// (dist/api/<route>.json, written at build time by `prerender = true`)
 	candidates := []string{"dist" + p, "dist" + p + "/index.html", "dist" + p + ".html", "dist" + p + ".json"}
 	for _, c := range candidates {
@@ -443,11 +393,10 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	
+
 	// hits an unbaked route must not receive HTML. Live handlers run on the
 	// Node/edge server; this binary only carries GET bodies baked at build -
-	
-	
+
 	if p == "/api" || strings.HasPrefix(p, "/api/") {
 		if upstreamProxy != nil {
 			proxyUpstream(w, r)

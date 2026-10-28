@@ -28,21 +28,32 @@ const entries = [
   ['src/cli/test.ts', `${OUT}/test.mjs`, false],
   ['src/runtime/index.ts', `${OUT}/runtime.mjs`, false],
   ['src/compiler/index.ts', `${OUT}/compiler.mjs`, false],
+  ['src/export/index.ts', `${OUT}/export.mjs`, false],
 ];
 
 for (const [entry, outfile, isBin] of entries) {
-  await build({
-    entryPoints: [entry],
-    outfile,
-    bundle: true,
-    platform: 'node',
-    format: 'esm',
-    target: 'node22',
-    external: ['esbuild'],
-    minify: true,
-    banner: isBin ? { js: '#!/usr/bin/env node' } : {},
-    logLevel: 'warning',
-  });
+  try {
+    await build({
+      entryPoints: [entry],
+      outfile,
+      bundle: true,
+      platform: 'node',
+      format: 'esm',
+      target: 'node22',
+      external: ['esbuild'],
+      minify: true,
+      banner: isBin ? { js: '#!/usr/bin/env node' } : {},
+      logLevel: 'warning',
+    });
+  } catch (err) {
+    // BUG.md AN: an unbalanced template literal (a stray backtick in a `///`
+    // comment inside a generated-code template) surfaces as "Unexpected end of
+    // file" hundreds of lines from the real line. Name every error's file:line
+    // so the build fails where the bug is, not where the parser gave up.
+    const lines = (err?.errors ?? []).map((e) => `  ${e.location ? `${e.location.file}:${e.location.line}:${e.location.column} ` : ''}${e.text}`);
+    console.error(`\npack failed at ${entry}:\n${lines.join('\n') || `  ${err?.message ?? err}`}`);
+    process.exit(1);
+  }
   const { size } = fs.statSync(outfile);
   console.log(`packed ${outfile.padEnd(22)} ${(size / 1024).toFixed(1).padStart(6)} KB  <- ${entry}`);
 }
