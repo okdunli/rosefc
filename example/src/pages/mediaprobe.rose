@@ -1,0 +1,19 @@
+<script>
+  let pct = $state(35);
+</script>
+
+<style>
+.wrap { padding: 16px; }
+.bar { width: 200px; height: 8px; background: #eee; color: #e91e63; }
+.vid { width: 320px; border-radius: 8px; }
+.aud { width: 280px; }
+</style>
+
+<template>
+<main class="wrap">
+  <h2>Media probe</h2>
+  <progress class="bar" value={pct()} max="100"></progress>
+  <video class="vid" src="/media/demo.mp4" controls></video>
+  <audio class="aud" src="/media/demo.mp3" controls></audio>
+</main>
+</template>

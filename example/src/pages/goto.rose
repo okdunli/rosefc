@@ -1,0 +1,7 @@
+<page>
+<script>
+  // A page that issues an HTTP redirect from inside its render - the prod edge
+  // entry must honor the { redirect, status } result (AO fix) instead of 500ing.
+  redirect('/about', 302);
+</script>
+</page>

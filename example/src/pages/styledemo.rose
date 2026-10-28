@@ -1,0 +1,22 @@
+<script>
+  let on = $state(true);
+</script>
+
+<style>
+.card { background: #fff0f5; border: 2px solid #e91e63; border-radius: 12px; padding: 16px; }
+.title { color: #c2185b; font-size: 20px; font-weight: bold; }
+.row { display: flex; gap: 8px; align-items: center; }
+.btn { background: #e91e63; color: white; padding: 8px 16px; border-radius: 6px; }
+</style>
+
+<template>
+<main>
+  <div class="card">
+    <h2 class="title">Styled demo</h2>
+    <div class="row">
+      <button class="btn" on:click={() => on = !on}>Toggle</button>
+      <span>{on ? 'on' : 'off'}</span>
+    </div>
+  </div>
+</main>
+</template>
