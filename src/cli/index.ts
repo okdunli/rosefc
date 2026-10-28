@@ -1,4 +1,3 @@
-
 // rosezm CLI - simplest possible SSR + static server
 import * as fs from 'fs';
 import * as path from 'path';
@@ -12,7 +11,7 @@ import { AsyncLocalStorage } from 'async_hooks';
 import { Worker } from 'worker_threads';
 import { buildProject, scanRoseFiles, scanComponentFiles, scriptOf, extractExports, loadPlugins, loadConfig, RoseError, errorInfo, codeFrame, type RouteInfo } from '../compiler/index.js';
 import { prunePrerendered, rmTreeParallel } from '../compiler/rm-fast.js';
-import { getHtmlShell, getClientSource, getStyles, shellOpen, clientScriptTag, securityHeaders, mintNonce, setBundleMode } from './shell.js';
+import { getHtmlShell, getClientSource, getStyles, shellOpen, clientScriptTag, securityHeaders, mintNonce, setBundleMode, setExtraCsp } from './shell.js';
 import { generatePWA, injectPwaHead, type PwaOptions } from '../pwa.js';
 import { AI_PROMPT } from './prompt.js';
 import { Readable } from 'stream';
@@ -20,6 +19,7 @@ import { createEdgeHandler } from './edge.js';
 import { runShutdownHooks } from './shutdown.js';
 import { requestOrigin } from './origin.js';
 import { hotVaryValues } from './hot-vary.js';
+import { ifNoneMatch, responseEtag } from './validator.js';
 
 import type * as ts from 'typescript';
 
@@ -120,7 +120,7 @@ async function sendHtml(req: any, res: any, status: number, html: string, extraH
   // header is set BEFORE the match - a client that gets a 304 without its ETag
   // cannot tell which representation it just revalidated.
   res.setHeader('ETag', etag);
-  if (req.headers['if-none-match'] === etag) {
+  if (ifNoneMatch(req.headers['if-none-match'], etag)) {
     res.statusCode = 304;
     res.end();
     return;
@@ -135,10 +135,21 @@ async function sendHtml(req: any, res: any, status: number, html: string, extraH
 }
 
 
+// Hop-by-hop and framing headers describe ONE connection's encoding, not the
+// representation: Node derives them itself when the body is written, and
+// copying the app's own values over that decision desynchronizes the wire.
+// An api handler that returned `content-length: 999` for an 11-byte body made
+// every client (and every proxy) wait for 988 bytes that never arrive; a
+// `transfer-encoding: chunked` next to a `content-length` is a request-
+// smuggling shape, and Node leaves both in the response while it re-frames the
+// body as one blob.
+const FRAMING_HEADERS = new Set(['content-length', 'transfer-encoding', 'connection', 'keep-alive']);
+
 function writeWebHeaders(web: any, res: any): void {
   const cookies = web.headers.getSetCookie?.() ?? [];
   web.headers.forEach((v: string, k: string) => {
     if (cookies.length && k.toLowerCase() === 'set-cookie') return;
+    if (FRAMING_HEADERS.has(k.toLowerCase())) return;
     res.setHeader(k, v);
     
   });
@@ -146,7 +157,8 @@ function writeWebHeaders(web: any, res: any): void {
 }
 
 
-async function sendWebResponse(web: any, res: any): Promise<void> {
+async function sendWebResponse(req: any, web: any, res: any): Promise<void> {
+  const raw = Buffer.from(await web.arrayBuffer());
   writeWebHeaders(web, res);
   // Same dimension the streamed and buffered page branches declare: the worker
   // that fronts `rosezm serve` adds it to every dynamic response, so a
@@ -154,7 +166,24 @@ async function sendWebResponse(web: any, res: any): Promise<void> {
   // sees only the app's own Vary dimensions.
   addVary(res, 'Accept-Encoding');
   res.statusCode = web.status;
-  res.end(Buffer.from(await web.arrayBuffer()));
+  // AM (BUG.md): a short-circuit used to be the one exit in this server with no
+  // validator at all - a 302 from middleware, a JSON error from an auth guard,
+  // a static file the app served itself - every poll re-transferred the whole
+  // body. The tag is content-derived (never length-derived, which let two
+  // equal-length representations share one validator and revalidate into a
+  // false 304), and an app that published its own ETag keeps it. An empty body
+  // gets no validator: 204/304 short-circuits have nothing to hash.
+  if (raw.length > 0) {
+    const etag = responseEtag(web, raw);
+    // RFC 9110: a 304 must carry the validators a 200 would have carried.
+    res.setHeader('ETag', etag);
+    if (req && req.method === 'GET' && ifNoneMatch(req.headers['if-none-match'], etag)) {
+      res.statusCode = 304;
+      res.end();
+      return;
+    }
+  }
+  res.end(raw);
 }
 
 // Send a rendered page document - through onResponse first .
@@ -308,6 +337,7 @@ async function build(): Promise<void> {
   // marker file makes the module kind explicit for every consumer.
   await writeIfChanged(path.join(OUT_DIR, 'package.json'), '{"type":"module"}\n');
   setBundleMode(bundle);
+  setExtraCsp(config.csp?.connectSrc ?? '', config.csp?.imgSrc ?? '');
   // Dev serves documents on demand (renderPage per request) so a save only has
   // to recompile, never re-render every route - the prerender/writeBrotli/analyze
   // passes are pure waste in the edit loop and, here, also dodge a sandbox that
@@ -891,7 +921,10 @@ function webHeadersToNode(web: any): Record<string, any> {
 }
 
 // --- dev-only live reload + state bridge --- The dev server rebuilds on change; without a signal the browser keeps showing the previous document.
-const DEV_BRIDGE = `<script>(function(){var es=new EventSource('/__rosezm_reload');es.onmessage=function(m){if(m.data!=='rebuild')return;es.close();var s=window.__rosezm?window.__rosezm.state():null;if(s)fetch('/__rosezm_state',{method:'POST',body:s,headers:{'content-type':'application/json'}}).catch(function(){});setTimeout(function(){location.reload()},40)}})()</script>`;
+// `EventSource` is guarded the same way the runtime's store channel guards it: a browser always has it, but a non-browser embed (jsdom in the
+// e2e suite, an older webview) does not, and an unguarded `new EventSource` throws a ReferenceError that takes the whole inline bundle
+// down with it - including the page content that already rendered.
+const DEV_BRIDGE = `<script>(function(){if(typeof EventSource==='undefined')return;var es=new EventSource('/__rosezm_reload');es.onmessage=function(m){if(m.data!=='rebuild')return;es.close();var s=window.__rosezm?window.__rosezm.state():null;if(s)fetch('/__rosezm_state',{method:'POST',body:s,headers:{'content-type':'application/json'}}).catch(function(){});setTimeout(function(){location.reload()},40)}})()</script>`;
 
 let devResume: string | null = null;
 const devClients = new Set<any>();
@@ -1021,7 +1054,12 @@ function devWrap(inner: (req: any, res: any) => void): (req: any, res: any) => v
       if (at < 0) return chunk;
       
       injected = true;
-      const resume = seed ? `<script>window.__rosezm_resume=${seed.replace(/<\/script>/g, '')}</script>` : '';
+      // The seed is JSON TEXT; the shell reads it back with
+      // JSON.parse(window.__rosezm_resume), so it must arrive as a STRING.
+      // Injecting it bare made the assignment an object literal and the
+      // parse threw "[object Object] is not valid JSON" - which killed the
+      // whole boot script on every hot reload that carried state.
+      const resume = seed ? `<script>window.__rosezm_resume=${JSON.stringify(seed).replace(/<\/script>/g, '')}</script>` : '';
       const out = s.slice(0, at + 6) + resume + DEV_BRIDGE + s.slice(at + 6);
       return Buffer.isBuffer(chunk) ? Buffer.from(out, 'utf8') : out;
     };
@@ -1087,6 +1125,11 @@ function serveStatic(dir: string, isr = false, dev = false): (req: any, res: any
     ready.then(async (ssrModule: any) => {
       installContextStore(ssrModule);
       return requestAls.run({}, async () => {
+        // The body-bearing callbacks below fire from the socket's 'end'
+        // event, which Node triggers OUTSIDE this scope: capture the store
+        // so they can re-enter it, or the auth context the middleware sets
+        // is invisible and every authenticated POST answers 401.
+        const requestStore = requestAls.getStore();
 // Runtime hooks: onRequest runs after the origin guard and BEFORE middleware and routing.
       const hookCtx = ssrModule.hasRequestHooks === true || ssrModule.hasResponseHooks === true
         ? await hookContext(req)
@@ -1095,7 +1138,7 @@ function serveStatic(dir: string, isr = false, dev = false): (req: any, res: any
         const short = await ssrModule.runRequestHooks(hookCtx);
         if (short) {
           
-          await sendWebResponse(await ssrModule.runResponseHooks(hookCtx, short), res);
+          await sendWebResponse(req, await ssrModule.runResponseHooks(hookCtx, short), res);
           return;
         }
       }
@@ -1105,43 +1148,159 @@ function serveStatic(dir: string, isr = false, dev = false): (req: any, res: any
       if (!isPagePost && ssrModule.middleware) {
         const mw = await ssrModule.runMiddleware(req);
         if (mw) {
-          await sendWebResponse(hookCtx ? await ssrModule.runResponseHooks(hookCtx, mw) : mw, res);
+          await sendWebResponse(req, hookCtx ? await ssrModule.runResponseHooks(hookCtx, mw) : mw, res);
           return;
         }
+      }
+      // 0.2.0: the native data channel. An exported mini program / mobile client
+      // cannot execute the render, so it asks for the JSON half of one: the state
+      // a page's $data produced. Middleware ran just above, so a walled route is
+      // never leaked through this door.
+      if (pathnameOf(req.url) === '/__rosezm/data' && req.method === 'GET') {
+        let target = '/';
+        try {
+          target = new URL(req.url || '/', 'http://localhost').searchParams.get('path') || '/';
+        } catch { /* a malformed url asks for the home page */ }
+        // The channel is handed a PATH, and both the wall and the renderer have
+        // to judge the SAME string the document request would. They did not:
+        // ?path=/vault was walled, ?path=/vault/ was not - the middleware
+        // compares pathname === '/vault', while matchRoute strips the trailing
+        // slash and rendered the gated page anyway. A one-character bypass of
+        // every middleware wall (and of every shallow API guard), fixed by
+        // canonicalizing before either sees it: dot segments resolved, leading
+        // slashes collapsed, one trailing slash dropped.
+        const split = target.indexOf('?');
+        const targetPath = dataChannelPath(split < 0 ? target : target.slice(0, split));
+        const targetQuery = split < 0 ? '' : target.slice(split);
+        const targetUrl = targetPath + targetQuery;
+        res.setHeader('content-type', 'application/json; charset=utf-8');
+        res.setHeader('access-control-allow-origin', '*');
+        res.setHeader('cache-control', 'no-store');
+        try {
+          // The wall must judge the TARGET, not the channel URL: the middleware
+          // routes on the pathname it is given, and a gated page has to answer
+          // its gate here exactly as it does for a document request.
+          if (ssrModule.middleware) {
+            const mw = await ssrModule.runMiddleware({ url: targetUrl, method: 'GET', headers: req.headers });
+            if (mw) {
+              // Every header the gate set travels - not just location. A wall
+              // that refreshes a session (`$sessionCookie` + a redirect) sent
+              // its Set-Cookie through the document path and silently lost it
+              // here, so a native client kept presenting the stale cookie and
+              // stayed walled. The channel's own JSON content type only
+              // applies when the gate did not declare one.
+              writeWebHeaders(mw, res);
+              res.statusCode = mw.status;
+              if (!mw.headers.get('content-type')) res.setHeader('content-type', 'application/json; charset=utf-8');
+              res.end(Buffer.from(await mw.arrayBuffer()));
+              return;
+            }
+          }
+          // renderPage takes a pathname: passing '/search?q=rose' matched no
+          // route and answered a JSON 404 envelope. The query still reaches the
+          // render through setQuery, exactly as it does for a document.
+          ssrModule.setQuery?.(queryOf(targetUrl));
+          const page = await ssrModule.renderPage(targetPath, undefined, { withState: true });
+          let state: unknown = {};
+          try { state = JSON.parse(page?.state || '{}'); } catch { state = {}; }
+          res.statusCode = 200;
+          res.end(JSON.stringify({ path: targetUrl, status: page?.status ?? 200, state }));
+        } catch (err) {
+          res.statusCode = 500;
+          res.end(JSON.stringify({ error: String(err instanceof Error ? err.message : err).slice(0, 200) }));
+        }
+        return;
       }
       // API routes (pages/api/*.rose) dispatch FIRST: the /api namespace answers JSON.
       const apiPath = pathnameOf(req.url);
       if (ssrModule.isApi(apiPath)) {
-        readBody(req, res, async (body) => {
+        readBody(req, res, async (body) => requestAls.run(requestStore ?? {}, async () => {
           try {
             const headers: Record<string, string> = {};
             for (const [k, v] of Object.entries(req.headers)) {
               if (v !== undefined) headers[k] = Array.isArray(v) ? v.join(', ') : String(v);
             }
+            // GET and HEAD may legally carry a body (RFC 9110 does not forbid
+            // it; curl -X GET --data and some SDKs send one), but the WHATWG
+            // Request constructor REFUSES to build them with one - and that
+            // throw landed in the catch below as a 500 for a request the route
+            // never saw. The handler reads `request` only when it wants the
+            // body, so a GET/HEAD is built bodyless; the method itself is what
+            // decides, not the bytes on the wire.
+            const reqMethod = req.method || 'GET';
+            const wantsBody = reqMethod !== 'GET' && reqMethod !== 'HEAD';
             const request = new Request(`http://${req.headers.host || 'localhost'}${req.url}`, {
-              method: req.method || 'GET',
+              method: reqMethod,
               headers,
-              body: body.length > 0 ? body : undefined,
+              body: wantsBody && body.length > 0 ? body : undefined,
             });
             ssrModule.setQuery?.(queryOf(req.url));
             if ((req.method || 'GET') !== 'GET') ssrModule.invalidateRenderCache?.();
-            let apiRes = await ssrModule.handleApi(req.method || 'GET', apiPath, request);
-            if (hookCtx) apiRes = await ssrModule.runResponseHooks(hookCtx, apiRes);
+            let apiRes = await ssrModule.handleApi(reqMethod, apiPath, request);
+            // AM (BUG.md): the JSON half of an app is the most-polled dynamic
+            // document there is, and it used to be the one buffered exit with no
+            // validator at all. Content-derived, app's own ETag wins, GET-only 304.
+            //
+            // The body is buffered BEFORE the response hooks run, and a hook
+            // gets a fresh Response over those same bytes: a hook that reads the
+            // body (a signing or inspection plugin does exactly that) otherwise
+            // leaves it unusable, arrayBuffer() throws "Body has already been
+            // read", and a perfectly good 200 became a 500. If the hook returned
+            // a Response whose body it consumed, the buffered bytes are what it
+            // inspected - the same fallback sendPage uses for documents.
+            const apiRaw = Buffer.from(await apiRes.arrayBuffer());
+            if (hookCtx) {
+              const hooked = await ssrModule.runResponseHooks(
+                hookCtx,
+                new Response(apiRaw, { status: apiRes.status, headers: apiRes.headers }),
+              );
+              apiRes = hooked;
+              if (!hooked.bodyUsed) {
+                const hookedRaw = Buffer.from(await hooked.arrayBuffer());
+                writeWebHeaders(apiRes, res);
+                res.statusCode = apiRes.status;
+                if (hookedRaw.length > 0) {
+                  const apiEtag = responseEtag(apiRes, hookedRaw);
+                  res.setHeader('ETag', apiEtag);
+                  if ((reqMethod === 'GET' || reqMethod === 'HEAD') && ifNoneMatch(req.headers['if-none-match'], apiEtag)) {
+                    res.statusCode = 304;
+                    res.end();
+                    return;
+                  }
+                }
+                res.end(hookedRaw);
+                return;
+              }
+            }
             writeWebHeaders(apiRes, res);
             res.statusCode = apiRes.status;
-            res.end(Buffer.from(await apiRes.arrayBuffer()));
+            if (apiRaw.length > 0) {
+              const apiEtag = responseEtag(apiRes, apiRaw);
+              res.setHeader('ETag', apiEtag);
+              if ((reqMethod === 'GET' || reqMethod === 'HEAD') && ifNoneMatch(req.headers['if-none-match'], apiEtag)) {
+                res.statusCode = 304;
+                res.end();
+                return;
+              }
+            }
+            res.end(apiRaw);
           } catch (err) {
             console.error(`rosezm: ${req.method} ${req.url} api handler failed:`, err instanceof Error ? err.stack ?? err.message : String(err));
+            // A throw after the headers went out (a bad header value, a body
+            // stream that died mid-write) cannot become a 500: the status line
+            // is already on the wire. Destroy the socket instead of appending
+            // an error body to a half-written response.
+            if (res.headersSent) { res.destroy(); return; }
             res.statusCode = 500;
             res.setHeader('Content-Type', 'application/json');
             res.end('{"error":"api handler failed"}');
           }
-        });
+        }));
         return;
       }
 
       if (req.method === 'POST') {
-        readBody(req, res, async (body) => {
+        readBody(req, res, async (body) => requestAls.run(requestStore ?? {}, async () => {
           try {
             const form = await new Response(body, {
               headers: { 'content-type': req.headers['content-type'] || 'application/x-www-form-urlencoded' },
@@ -1149,7 +1308,7 @@ function serveStatic(dir: string, isr = false, dev = false): (req: any, res: any
             if (ssrModule.middleware) {
               const mw = await ssrModule.runMiddleware(req, form);
               if (mw) {
-                await sendWebResponse(hookCtx ? await ssrModule.runResponseHooks(hookCtx, mw) : mw, res);
+                await sendWebResponse(req, hookCtx ? await ssrModule.runResponseHooks(hookCtx, mw) : mw, res);
                 return;
               }
             }
@@ -1164,7 +1323,7 @@ function serveStatic(dir: string, isr = false, dev = false): (req: any, res: any
               res.end('Bad request');
             }
           }
-        });
+        }));
         return;
       }
 
@@ -1234,7 +1393,7 @@ function serveStatic(dir: string, isr = false, dev = false): (req: any, res: any
         // Vary must not drop the negotiated-encoding dimension (and vice
         // versa) - the body below is chosen by Accept-Encoding.
         addVary(res, 'Accept-Encoding');
-        if (req.headers['if-none-match'] === entry.etag) {
+        if (ifNoneMatch(req.headers['if-none-match'], entry.etag)) {
           res.statusCode = 304;
           res.end();
           return;
@@ -1262,7 +1421,11 @@ function serveStatic(dir: string, isr = false, dev = false): (req: any, res: any
       // validator takes the buffered path below - one render, a real 304 when
       // the bytes match, a 200 with the same ETag when they do not. The first
       // (unconditional) visit keeps the streamed shell.
-      const conditional = typeof req.headers['if-none-match'] === 'string';
+      // A repeated header line arrives as an array, and ifNoneMatch reads the
+      // whole list - a client that named two candidates must not be streamed
+      // past the one it can revalidate against.
+      const inm = req.headers['if-none-match'];
+      const conditional = Array.isArray(inm) ? inm.length > 0 : typeof inm === 'string' && inm.length > 0;
       if (!dev && !conditional && !broken.has(safe2) && !ssrModule.isBuffered?.(safe2) && ssrModule.canStream(safe2) && !ssrModule.isNoJs(safe2)) {
         const enc = pickEncoding(req);
         let status = 200;
@@ -1361,6 +1524,28 @@ function queryOf(url: string | undefined): Record<string, string> {
     new URL(url || '/', 'http://localhost').searchParams.forEach((v, k) => { if (!(k in q)) q[k] = v; });
   } catch { /* an unparsable url carries no query */ }
   return q;
+}
+
+/**
+ * One canonical pathname for the data channel, so the middleware's wall and
+ * the router see the same string. A passed `path` is attacker-controlled, and
+ * every normalization step below is one a browser or proxy may have applied to
+ * the document URL but the channel's `?path=` value never goes through: the
+ * leading-slash run is collapsed first (two of them made `new URL` read
+ * `//vault` as a HOST, resolving the path to `/`), `.`/`..` are then resolved
+ * by the URL parser, and a trailing slash is dropped exactly as matchRoute
+ * drops it. Without this, `?path=/vault/` skipped a `pathname === '/vault'`
+ * wall and still rendered the gated page.
+ */
+function dataChannelPath(target: string): string {
+  let p: string;
+  try {
+    p = new URL('/' + target.replace(/^\/+/, ''), 'http://localhost').pathname;
+  } catch {
+    p = target.split('?')[0];
+  }
+  if (!p.startsWith('/')) p = '/' + p;
+  return p.replace(/\/+$/, '') || '/';
 }
 
 function listenFree(server: any, port: number, onReady: (port: number) => void): void {
@@ -1464,7 +1649,11 @@ async function dev(): Promise<void> {
     // prune/prerender window serves stale documents. node_modules and .git
     // are noise for the same reason.
     if (filename) {
-      const segs = String(filename).replace(/\\/g, '/').split('/');
+      // Windows 云盘（BaiduSync 等）回灌的事件 filename 可能带前导反斜杠或混合分隔符
+      // （实测 '\.rosezm\routes.ts'）；先剥前导分隔符再统一归一，否则排除检查漏判，
+      // rebuild 自己写出的 routes.ts 会再次触发 rebuild —— 自触发死循环。
+      const norm = String(filename).replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase();
+      const segs = norm.split('/').filter(Boolean);
       if (segs.some((s) => s === 'dist' || s === 'node_modules' || s === '.git' || s === '.rosezm' || s === '.rosezm-build' || s === '.rosezm-dev')) return;
     }
     if (devBuild) {
@@ -1480,9 +1669,16 @@ async function dev(): Promise<void> {
       } catch {
         // filename can be null (fs.watch omits it when unavailable): path.extname
         // would throw on null, and an uncaught throw in this callback takes the
-        // whole dev server down.
+        // whole dev server down. statSync 失败还有第三种情况：事件是云盘/编辑器
+        // 对「排除目录」（dist/.rosezm/…）的回灌，文件名带前导分隔符或目录级事件，
+        // stat 找不到文件。这里不做和主路径一样的排除归一检查，delete/rename 的
+        // 回灌事件就会命中 SOURCE_EXT，devDirtyMid 自我延续 —— rebuild 循环的
+        // 另一半根源。
         const name = String(filename ?? '');
-        if (SOURCE_EXT.has(path.extname(name).toLowerCase())) devDirtyMid = true;
+        const norm = name.replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase();
+        const segs = norm.split('/').filter(Boolean);
+        const excluded = segs.some((s) => s === 'dist' || s === 'node_modules' || s === '.git' || s === '.rosezm' || s === '.rosezm-build' || s === '.rosezm-dev');
+        if (!excluded && SOURCE_EXT.has(path.extname(segs[segs.length - 1] ?? '').toLowerCase())) devDirtyMid = true;
       }
       return;
     }
@@ -1549,7 +1745,9 @@ async function serve(): Promise<void> {
  
   let servicePlugins: any[] = [];
   try {
-    servicePlugins = (await loadPlugins(SRC_DIR)).filter((p) => p && p.onServe);
+    const serveConfig = await loadConfig(SRC_DIR);
+    setExtraCsp(serveConfig.csp?.connectSrc ?? '', serveConfig.csp?.imgSrc ?? '');
+    servicePlugins = serveConfig.plugins.filter((p) => p && p.onServe);
   } catch (err) {
     console.error('rosezm: rosezm.config.js failed to load for the serve hooks:', err instanceof Error ? err.message : String(err));
   }
@@ -1643,31 +1841,39 @@ async function serve(): Promise<void> {
         // Accept-Language) and setHeader would drop them.
         addVary(res, 'Accept-Encoding');
         const htmlDoc = (response.headers.get('content-type') ?? '').startsWith('text/html');
-        const enc = htmlDoc && req.method === 'GET' ? pickEncoding(req) : null;
-        if (response.body && enc) {
-          const raw = Buffer.from(await response.arrayBuffer());
-          const etag = 'W/"' + createHash('sha1').update(raw).digest('base64url').slice(0, 24) + '"';
-          // RFC 9110: a 304 must carry the validators a 200 would have carried.
-          res.setHeader('ETag', etag);
-          if (req.headers['if-none-match'] === etag) {
-            res.statusCode = 304;
-            bytesWritten = 0;
-            res.end();
-            access();
-            return;
-          }
-          const body = await compressAsync(enc, raw);
-          res.setHeader('Content-Encoding', enc);
-          res.setHeader('Content-Length', String(body.length));
-          res.end(body);
-          bytesWritten = body.length;
-          access();
-          return;
-        }
+        // AM (BUG.md): the validator no longer lives behind the text/html gate.
+        // A feed, a sitemap, a robots.txt or a JSON API answered by the edge used
+        // to be the machine-read documents that never got a conditional answer,
+        // so every poll re-transferred the whole body. The tag is content-derived
+        // (a length-based one let two equal-length representations share one
+        // validator and revalidate into a false 304), and an app that published
+        // its own ETag keeps it. Compression stays HTML-only: the rest are small,
+        // and compress-on-miss costs more than the bytes it saves.
         if (response.body) {
           const raw = Buffer.from(await response.arrayBuffer());
-          bytesWritten = raw.length;
-          res.end(raw);
+          if (raw.length > 0) {
+            const etag = responseEtag(response, raw);
+            // RFC 9110: a 304 must carry the validators a 200 would have carried.
+            res.setHeader('ETag', etag);
+            if (req.method === 'GET' && ifNoneMatch(req.headers['if-none-match'], etag)) {
+              res.statusCode = 304;
+              bytesWritten = 0;
+              res.end();
+              access();
+              return;
+            }
+          }
+          const enc = htmlDoc && req.method === 'GET' ? pickEncoding(req) : null;
+          if (enc) {
+            const body = await compressAsync(enc, raw);
+            res.setHeader('Content-Encoding', enc);
+            res.setHeader('Content-Length', String(body.length));
+            res.end(body);
+            bytesWritten = body.length;
+          } else {
+            res.end(raw);
+            bytesWritten = raw.length;
+          }
           access();
         } else {
           res.end();
@@ -1909,10 +2115,11 @@ async function check(): Promise<void> {
   }
 
   let tsMod: typeof ts | null = null;
-  // Resolve from the project root only. `rosezm check` must fail loudly when
-  // the checked project has no local TypeScript, instead of borrowing one from
-  // the framework installation.
-  for (const root of [pathToFileURL(path.join(SRC_DIR, 'package.json')).href]) {
+  // Two roots, in order: the framework's own installation (a dev checkout has
+  // typescript next to the compiler), then the project's. A project without
+  // typescript must not silently resolve some unrelated global copy whose
+  // entry file lacks the compiler API - the shape check below rejects those.
+  for (const root of [import.meta.url, pathToFileURL(path.join(SRC_DIR, 'package.json')).href]) {
     try {
       const req = createRequire(root);
       const mod = await import(pathToFileURL(req.resolve('typescript')).href) as typeof ts & { default?: typeof ts };
@@ -1942,9 +2149,24 @@ async function check(): Promise<void> {
     const script = scriptOf(source);
     if (!script) continue;
     const tagLine = source.slice(0, m!.index + '<script>'.length).split('\n').length;
-    const wired = runtimeSource
-      ? script.replace(/['"]\.\/runtime\.js['"]/g, JSON.stringify(runtimeSource.replace(/\\/g, '/')))
-      : script;
+    let wired = scriptOf(source);
+    // Import-path parity with the build (CarModster 2026-10-26): esbuild bundles
+    // every .rose into a FLAT build dir (.rosezm-build/<hash>/comp-N.ssr.js), so a
+    // relative specifier resolves against that flat location - '../../src/server/db'
+    // means <root>/src/server/db from EVERY page, whatever its nesting. This checker
+    // used to resolve the same specifier against the .rose file's own directory, so
+    // any route nested deeper than src/pages/x.rose (api/posts/[id]/like.rose, a
+    // section folder...) disagreed with the build: the build found the module, the
+    // check failed with TS2307 (or vice versa). Rewrite each relative specifier to
+    // the absolute target the BUILD will use - deterministic, both sides agree.
+    const flatDir = path.join(SRC_DIR, '.rosezm-build', 'check-flat');
+    wired = wired.replace(/(from\s*['"])(\.{1,2}(?:\/[^'"]*)+)(['"])/g, (mm, pre: string, spec: string, post: string) => {
+      const abs = path.resolve(flatDir, spec);
+      const cand = [abs, `${abs}.ts`, `${abs}.js`, `${abs}.mjs`, path.join(abs, 'index.ts'), path.join(abs, 'index.js')]
+        .find((p) => fs.existsSync(p));
+      if (!cand) return mm; // unknown target: leave it, TS reports the honest error
+      return pre + cand.replace(/\\/g, '/') + post;
+    });
     // Every .rose compiles to its own module, so a script with no import or
     // export must still check as one: without the marker it lands in the
     // program's shared global scope and its top-level `let`s collide with
@@ -2034,6 +2256,125 @@ async function check(): Promise<void> {
   process.exit(1);
 }
 
+/** `rosezm export <target|all> [dir] [--api <base>] [--out <dir>]`: compile the same
+ *  source tree into a non-web runtime (0.2.0). The contract is that a construct
+ *  which cannot map is WARNED about, never silently dropped. */
+async function exportCmd(): Promise<void> {
+  const { exportProject, isTarget, targetList, TARGETS } = await import('../export/index.js');
+  // argv[0] is the command itself (`export`), argv[1] the target, argv[2] the dir.
+  const rest = process.argv.slice(2);
+  const target = rest[1];
+  if (!target || target.startsWith('-')) {
+    // No target: show the matrix. A CI or an IDE can read the same table with --json.
+    const rows = Object.values(TARGETS).map((info: { name: string; family: string; status: string; summary: string }) => ({ name: info.name, family: info.family, status: info.status, summary: info.summary }));
+    if (asJson) {
+      process.stdout.write(`${JSON.stringify({ ok: true, targets: rows })}\n`);
+      return;
+    }
+    console.log('rosezm export targets:');
+    for (const row of rows) console.log(`  ${row.status === 'ready' ? '✓' : '·'} ${row.name.padEnd(10)} ${row.family.padEnd(13)} ${row.summary}`);
+    console.log('\nUsage: rosezm export <target|all> [dir] [--api <base>] [--out <dir>] [--json]');
+    return;
+  }
+  // `export all` compiles every ready target into one tree - the one command that
+  // shows the whole matrix, and the one CI would call.
+  if (target === 'all') {
+    const dirArgAll = rest[2] && !rest[2].startsWith('-') ? rest[2] : '.';
+    const projectRootAll = path.resolve(dirArgAll);
+    const flagAll = (name: string): string | undefined => {
+      const i = rest.findIndex((a) => a === name || a.startsWith(name + '='));
+      if (i < 0) return undefined;
+      const arg = rest[i];
+      return arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : rest[i + 1];
+    };
+    const outRootAll = flagAll('--out');
+    const apiAll = flagAll('--api');
+    const startedAll = Date.now();
+    const done: string[] = [];
+    const allResults: Array<{ target: string; pages: number; components: number; outDir: string; warnings: number }> = [];
+    for (const info of Object.values(TARGETS)) {
+      if (info.status !== 'ready') continue;
+      const result = await exportProject(info.name, projectRootAll, { apiBase: apiAll, outRoot: outRootAll });
+      allResults.push({ target: info.name, pages: result.pages.length, components: result.components.length, outDir: result.outDir, warnings: result.warnings.length });
+      if (!asJson) console.log(`  ${info.name.padEnd(10)} ${String(result.pages.length).padStart(3)} page(s) -> ${result.outDir}`);
+      done.push(info.name);
+    }
+    if (asJson) {
+      process.stdout.write(`${JSON.stringify({ ok: true, targets: allResults, ms: Date.now() - startedAll })}\n`);
+      return;
+    }
+    const totalWarnings = allResults.reduce((n, entry) => n + entry.warnings, 0);
+    console.log(`rosezm exported ${done.length} targets in ${Date.now() - startedAll}ms: ${done.join(', ')}`);
+    if (totalWarnings) console.log(`  ${totalWarnings} warning(s) across targets - run one target to see them`);
+    return;
+  }
+  if (!isTarget(target)) {
+    console.error(`rosezm export: unknown target "${target}"\n${targetList()}`);
+    process.exit(1);
+  }
+  const dirArg = rest[2] && !rest[2].startsWith('-') ? rest[2] : '.';
+  const projectRoot = path.resolve(dirArg);
+  const flag = (name: string): string | undefined => {
+    const i = rest.findIndex((a) => a === name || a.startsWith(name + '='));
+    if (i < 0) return undefined;
+    const arg = rest[i];
+    return arg.includes('=') ? arg.slice(arg.indexOf('=') + 1) : rest[i + 1];
+  };
+  const apiBase = flag('--api');
+  const outRoot = flag('--out');
+  const info = TARGETS[target];
+  if (info.status !== 'ready') {
+    console.error(`rosezm export: "${target}" (${info.summary}) is planned, not implemented yet.\nShipping targets today:\n${targetList()}`);
+    process.exit(1);
+  }
+  const started = Date.now();
+  const cloudMode = rest.includes("--cloud");
+  const cloudEnvRaw = flag("--cloud-env");
+  const result = await exportProject(target, projectRoot, {
+    apiBase,
+    outRoot: outRoot ? path.resolve(outRoot) : undefined,
+    cloud: cloudMode ? true : undefined,
+    cloudEnv: cloudEnvRaw,
+  });
+  if (asJson) {
+    process.stdout.write(`${JSON.stringify({
+      ok: true,
+      target,
+      outDir: result.outDir,
+      pages: result.pages,
+      components: result.components,
+      warnings: result.warnings,
+      ms: Date.now() - started,
+    })}\n`);
+    return;
+  }
+  const rel = path.relative(process.cwd(), result.outDir) || result.outDir;
+  console.log(`🌹 rosezm v${version()} export ${target} -> ${rel}`);
+  console.log(`  ${result.pages.length} page(s), ${result.components.length} component(s) in ${Date.now() - started}ms`);
+  if (result.pages.length) console.log(`  pages: ${result.pages.join(', ')}`);
+  // Warnings grouped by kind: 38 one-line notes from one page is noise, not
+  // information. --json keeps the full list for a tool.
+  const grouped = new Map<string, number>();
+  for (const warning of result.warnings) {
+    const key = warning
+      .replace(/^[a-z]+: /, '')
+      .replace(/[A-Za-z]:\\[^:]+?\.rose/g, '<file>')
+      .replace(/\b[\w./-]+\.rose\b/g, '<file>')
+      .replace(/load from GET \/__rosezm\/data \([^)]*\)/, 'load from the data channel');
+    grouped.set(key, (grouped.get(key) ?? 0) + 1);
+  }
+  if (grouped.size) {
+    console.log(`  ${result.warnings.length} warning(s) - ${grouped.size} kind(s):`);
+    const entries = [...grouped.entries()].sort((a, b) => b[1] - a[1]);
+    for (const [key, count] of entries.slice(0, 8)) console.log(`    - ${key}${count > 1 ? ` (x${count})` : ''}`);
+    if (entries.length > 8) console.log(`    ... and ${entries.length - 8} more kind(s); pass --json for the full list`);
+  }
+
+  if (!apiBase) {
+    console.log('  note: no --api <base> given, so server actions and $data have no endpoint in the exported app');
+  }
+}
+
 const argv = process.argv.slice(2);
 const cmd = argv[0];
 const asJson = argv.includes('--json');
@@ -2065,5 +2406,6 @@ else if (cmd === 'preview') void preview().catch(reportFailure);
 else if (cmd === 'serve') void serve().catch(reportFailure);
 else if (cmd === 'new') void scaffold().catch(reportFailure);
 else if (cmd === 'check') void check().catch(reportFailure);
+else if (cmd === 'export') void exportCmd().catch(reportFailure);
 else if (cmd === 'prompt') console.log(AI_PROMPT);
-else console.log('Usage: rosezm dev|build|preview|serve|new|check|prompt [dir] [--json] [--static] [--no-minify]   (dir defaults to the current directory; dist/ is written there; --json prints build failures as machine-readable JSON; --static verifies the build is deployable with no server at all; --no-minify keeps server.js/prod.mjs unminified for debugging; `new <name> [--template blog|api|admin|site]` scaffolds a project)');
+else console.log('Usage: rosezm dev|build|preview|serve|new|check|export|prompt [dir] [--json] [--static] [--no-minify]   (dir defaults to the current directory; dist/ is written there; --json prints build failures as machine-readable JSON; --static verifies the build is deployable with no server at all; --no-minify keeps server.js/prod.mjs unminified for debugging; `new <name> [--template blog|api|admin|site]` scaffolds a project; `export <target> [dir] [--api <base>] [--out <dir>]` compiles the same pages into a mini program today, with the native targets on the way)');
