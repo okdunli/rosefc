@@ -1,5 +1,5 @@
 <script>
-  // Regression guard (bug hunt: oboext themed 404): a layout that guards its
+  // Regression guard (bug hunt: Oboext themed 404): a layout that guards its
   // <slot/> with a block emits the page's <head> block INSIDE that block. The
   // nested wire pass must not claim the head markers - only the pass that owns
   // the document <head> may - or every client navigation fell back to the

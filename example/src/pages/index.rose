@@ -44,6 +44,7 @@
 </style>
 
 <div>
+  <img src="/rose.png" alt="Rose" width="48" height="48">
   <h1>Welcome to {name()} 🌹</h1>
   <p>Count: <strong>{count()}</strong></p>
   <button on:click={increment}>Increment</button>

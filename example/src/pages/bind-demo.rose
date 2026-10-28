@@ -1,4 +1,6 @@
 <script>
+  import TextField from '../components/TextField.rose';
+  import CheckField from '../components/CheckField.rose';
   let name = $state('');
   let subscribed = $state(false);
   let plan = $state('free');
@@ -18,6 +20,7 @@
 <div class="bind-demo">
   <h1>Two-way binding demo</h1>
   <input bind:value={name} placeholder="Type your name">
+  <TextField bind:value={name} placeholder="through the component" />
   <p>Hello {name() || 'stranger'}!</p>
   <label>
     <input type="checkbox" bind:checked={subscribed}>
@@ -36,6 +39,7 @@
     <label><input type="checkbox" value="green" bind:group={colors}> Green</label>
   </fieldset>
   <p>Colors: {colors().join(', ') || 'none'}</p>
+  <CheckField bind:checked={subscribed} bind:group={colors} />
   <select bind:value={plan}>
     <option value="free">Free plan</option>
     <option value="pro">Pro plan</option>

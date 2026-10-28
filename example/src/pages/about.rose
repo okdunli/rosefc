@@ -9,6 +9,7 @@
   // its text as a prop. Same compiled shape as a page - no component
   // runtime, no wrapper node.
   import FactCard from '../components/FactCard.rose';
+  import Card from '../components/Card.rose';
 
   let title = $state('About rosezm');
   let facts = $data(async () => {
@@ -80,6 +81,10 @@
     <button on:click={reload}>Refresh data</button>
   </div>
   <p>mount ticks (onMount heartbeat, onCleanup stops it): {ticks()}</p>
+  <Card title="about" tone="green">
+    <p>default slot: the caller's children render here</p>
+    <em slot="foot">the foot sees note: {note}</em>
+  </Card>
   <ul>
     {#each facts() as fact}
       <FactCard fact={fact} />
