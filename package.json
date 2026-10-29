@@ -1,6 +1,6 @@
 {
   "name": "rosezm",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "Modular extensible full-stack framework for web and embedded applications, crafted with extreme romance and polished developer experience.",
   "type": "module",
   "scripts": {
@@ -14,12 +14,15 @@
     "test": "tsx src/cli/index.ts build example && tsx tests/test-client.ts",
     "test:cli": "node tests/test-cli.mjs",
     "test:e2e": "tsx tests/test-e2e.ts",
+    "test:als": "node tests/test-dev-als.mjs",
     "test:edge": "tsx tests/test-edge.ts",
     "test:harness": "tsx tests/test-harness.ts",
     "test:sliced": "tsx tests/test-sliced.ts",
+    "test:export": "tsx tests/test-export.ts",
     "test:go": "tsx src/cli/index.ts build example && node tests/test-go.mjs",
     "test:pack": "node tests/test-pack.mjs",
-    "build:go": "go build -o rosezm-server ."
+    "test:resilience": "tsx tests/test-resilience.ts",
+    "build:go": "node -e \"const fs=require('fs');if(!fs.existsSync('dist')){console.error('build:go: dist/ missing - run npm run build first');process.exit(1)}\" && go build -o rosezm-server ."
   },
   "bin": {
     "rosezm": "dist-cli/rosezm.mjs"
@@ -28,6 +31,7 @@
     "./edge": "./dist-cli/edge.mjs",
     "./runtime": "./dist-cli/runtime.mjs",
     "./compiler": "./dist-cli/compiler.mjs",
+    "./export": "./dist-cli/export.mjs",
     "./test": "./dist-cli/test.mjs"
   },
   "files": [
@@ -55,6 +59,7 @@
     "deploy/docker-compose.yml",
     "deploy/fly.toml",
     "deploy/netlify.toml",
+    "deploy/native",
     "deploy/server.cjs",
     "deploy/vercel.json",
     "LICENSE"
